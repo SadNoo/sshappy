@@ -189,11 +189,17 @@ class SSServer:
                 await self.state.add_alive_ip(user.id, client_ip)
 
         tasks = [asyncio.create_task(uplink()), asyncio.create_task(downlink())]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
-        for task in done:
-            task.result()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if result is None or isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, (ConnectionResetError, BrokenPipeError, OSError, asyncio.TimeoutError)):
+                logger.debug("relay closed from %s: %s", client_ip, result)
+                continue
+            raise result
 
     def is_replay(self, salt: bytes) -> bool:
         now = time.monotonic()
