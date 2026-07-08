@@ -23,6 +23,8 @@ type Config struct {
 	UDPReadBufferBytes   int
 	UDPWriteBufferBytes  int
 	UDPMetricsSeconds    int
+	UDPWorkers           int
+	UDPQueueSize         int
 	TrafficFlushBytes    int64
 }
 
@@ -45,6 +47,8 @@ func LoadConfig() Config {
 		UDPReadBufferBytes:   getenvInt("UDP_READ_BUFFER_BYTES", 4<<20),
 		UDPWriteBufferBytes:  getenvInt("UDP_WRITE_BUFFER_BYTES", 4<<20),
 		UDPMetricsSeconds:    getenvInt("UDP_METRICS_SECONDS", 60),
+		UDPWorkers:           getenvInt("UDP_WORKERS", 0),
+		UDPQueueSize:         getenvInt("UDP_QUEUE_SIZE", 4096),
 		TrafficFlushBytes:    int64(getenvInt("TRAFFIC_FLUSH_BYTES", 1<<20)),
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,14 @@ type Server struct {
 	udpMu           sync.Mutex
 	udpAssociations map[udpAssociationKey]*udpAssociation
 	udpMetrics      udpMetrics
+	udpJobs         chan udpJob
+	udpWorkerOnce   sync.Once
+}
+
+type udpJob struct {
+	inbound    *net.UDPConn
+	data       []byte
+	clientAddr *net.UDPAddr
 }
 
 type udpAssociationKey struct {
@@ -66,10 +75,20 @@ type udpMetrics struct {
 	dropTargetWrite     atomic.Uint64
 	dropResponseEncrypt atomic.Uint64
 	dropResponseWrite   atomic.Uint64
+	dropQueueFull       atomic.Uint64
 }
 
 func NewServer(config Config, state *RuntimeState) *Server {
-	return &Server{config: config, state: state, udpAssociations: make(map[udpAssociationKey]*udpAssociation)}
+	queueSize := config.UDPQueueSize
+	if queueSize <= 0 {
+		queueSize = 4096
+	}
+	return &Server{
+		config:          config,
+		state:           state,
+		udpAssociations: make(map[udpAssociationKey]*udpAssociation),
+		udpJobs:         make(chan udpJob, queueSize),
+	}
 }
 
 func (s *Server) Apply(node NodeInfo, users []User) error {
@@ -130,6 +149,7 @@ func (s *Server) Restart(port int) error {
 	s.mu.Unlock()
 	log.Printf("SS2022 Go TCP server listening on %s", addr)
 	log.Printf("SS2022 Go UDP server listening on %s", addr)
+	s.startUDPWorkers()
 	go s.serveUDP(udpConn)
 	go s.cleanupUDPLoop(udpConn)
 	go s.reportUDPMetricsLoop(udpConn)
@@ -216,8 +236,10 @@ func (s *Server) handleTCP(client net.Conn) {
 	}
 
 	done := make(chan struct{}, 2)
-	var upload, download int64
-	var mu sync.Mutex
+	flushBytes := s.config.TrafficFlushBytes
+	if flushBytes <= 0 {
+		flushBytes = 1 << 20
+	}
 
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -237,10 +259,12 @@ func (s *Server) handleTCP(client net.Conn) {
 				break
 			}
 			localUpload += int64(len(payload))
+			if localUpload >= flushBytes {
+				s.state.AddTraffic(user.ID, localUpload, 0)
+				localUpload = 0
+			}
 		}
-		mu.Lock()
-		upload += localUpload
-		mu.Unlock()
+		s.state.AddTraffic(user.ID, localUpload, 0)
 	}()
 
 	go func() {
@@ -262,26 +286,22 @@ func (s *Server) handleTCP(client net.Conn) {
 					break
 				}
 				localDownload += int64(n)
+				if localDownload >= flushBytes {
+					s.state.AddTraffic(user.ID, 0, localDownload)
+					localDownload = 0
+				}
 			}
 			if err != nil {
 				break
 			}
 		}
-		mu.Lock()
-		download += localDownload
-		mu.Unlock()
+		s.state.AddTraffic(user.ID, 0, localDownload)
 	}()
 
 	<-done
 	_ = client.Close()
 	_ = remote.Close()
 	<-done
-
-	mu.Lock()
-	finalUpload := upload
-	finalDownload := download
-	mu.Unlock()
-	s.state.AddTraffic(user.ID, finalUpload, finalDownload)
 }
 
 func (s *Server) serveUDP(conn *net.UDPConn) {
@@ -295,8 +315,32 @@ func (s *Server) serveUDP(conn *net.UDPConn) {
 		s.udpMetrics.rxBytes.Add(uint64(n))
 		data := make([]byte, n)
 		copy(data, buf[:n])
-		go s.handleUDPDatagram(conn, data, addr)
+		select {
+		case s.udpJobs <- udpJob{inbound: conn, data: data, clientAddr: addr}:
+		default:
+			s.udpMetrics.dropQueueFull.Add(1)
+		}
 	}
+}
+
+func (s *Server) startUDPWorkers() {
+	s.udpWorkerOnce.Do(func() {
+		workers := s.config.UDPWorkers
+		if workers <= 0 {
+			workers = runtime.NumCPU() * 2
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		for i := 0; i < workers; i++ {
+			go func() {
+				for job := range s.udpJobs {
+					s.handleUDPDatagram(job.inbound, job.data, job.clientAddr)
+				}
+			}()
+		}
+		log.Printf("UDP workers started: workers=%d queue=%d", workers, cap(s.udpJobs))
+	})
 }
 
 func (s *Server) handleUDPDatagram(inbound *net.UDPConn, data []byte, clientAddr *net.UDPAddr) {
@@ -503,7 +547,7 @@ func (s *Server) reportUDPMetricsLoop(conn *net.UDPConn) {
 			return
 		}
 		log.Printf(
-			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_target_open=%d drop_target_write=%d drop_response_encrypt=%d drop_response_write=%d associations=%d",
+			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_target_open=%d drop_target_write=%d drop_response_encrypt=%d drop_response_write=%d drop_queue_full=%d associations=%d",
 			s.udpMetrics.rxPackets.Load(),
 			s.udpMetrics.rxBytes.Load(),
 			s.udpMetrics.txPackets.Load(),
@@ -514,6 +558,7 @@ func (s *Server) reportUDPMetricsLoop(conn *net.UDPConn) {
 			s.udpMetrics.dropTargetWrite.Load(),
 			s.udpMetrics.dropResponseEncrypt.Load(),
 			s.udpMetrics.dropResponseWrite.Load(),
+			s.udpMetrics.dropQueueFull.Load(),
 			s.udpAssociationCount(),
 		)
 	}

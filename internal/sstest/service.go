@@ -64,6 +64,7 @@ func Run(ctx context.Context, config Config) error {
 		case <-trafficTicker.C:
 			traffic := state.SnapshotTraffic()
 			if err := db.ReportTraffic(node, traffic); err != nil {
+				state.MergeTraffic(traffic)
 				log.Printf("traffic report failed: %v", err)
 			} else {
 				log.Printf("traffic reported: users=%d", len(traffic))
