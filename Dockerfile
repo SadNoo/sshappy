@@ -11,7 +11,4 @@ COPY sshappy /app/sshappy
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 
-USER nobody
-
 ENTRYPOINT ["sscodex"]
-
