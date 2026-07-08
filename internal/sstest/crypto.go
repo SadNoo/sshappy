@@ -33,14 +33,19 @@ func newAEADStream(key []byte) (*aeadStream, error) {
 	return &aeadStream{aead: aead}, nil
 }
 
-func (s *aeadStream) nonce() []byte {
-	nonce := make([]byte, 12)
+func (s *aeadStream) nonce() [12]byte {
+	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[:8], s.counter)
 	return nonce
 }
 
 func (s *aeadStream) decrypt(data []byte) ([]byte, error) {
-	out, err := s.aead.Open(nil, s.nonce(), data, nil)
+	return s.decryptInto(nil, data)
+}
+
+func (s *aeadStream) decryptInto(dst []byte, data []byte) ([]byte, error) {
+	nonce := s.nonce()
+	out, err := s.aead.Open(dst, nonce[:], data, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +54,12 @@ func (s *aeadStream) decrypt(data []byte) ([]byte, error) {
 }
 
 func (s *aeadStream) encrypt(data []byte) []byte {
-	out := s.aead.Seal(nil, s.nonce(), data, nil)
+	return s.encryptInto(nil, data)
+}
+
+func (s *aeadStream) encryptInto(dst []byte, data []byte) []byte {
+	nonce := s.nonce()
+	out := s.aead.Seal(dst, nonce[:], data, nil)
 	s.counter++
 	return out
 }

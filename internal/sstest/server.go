@@ -2,10 +2,13 @@ package sstest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -107,11 +110,11 @@ func (s *Server) Serve(ctx context.Context) error {
 
 func (s *Server) handleTCP(client net.Conn) {
 	defer client.Close()
+	tuneTCP(client)
 	clientIP := ""
 	if addr, ok := client.RemoteAddr().(*net.TCPAddr); ok {
 		clientIP = addr.IP.String()
 	}
-	deadline := time.Duration(s.config.TCPIdleTimeout) * time.Second
 
 	s.mu.RLock()
 	reg := s.registry
@@ -138,6 +141,7 @@ func (s *Server) handleTCP(client net.Conn) {
 		return
 	}
 	defer remote.Close()
+	tuneTCP(remote)
 
 	_ = client.SetDeadline(time.Time{})
 	_ = remote.SetDeadline(time.Time{})
@@ -157,11 +161,13 @@ func (s *Server) handleTCP(client net.Conn) {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		localUpload := uploadInitial
+		lenCipher := make([]byte, 2+tagLen)
+		payloadCipher := make([]byte, tcpMaxPayloadSize+tagLen)
 		for {
-			_ = client.SetReadDeadline(time.Now().Add(deadline))
-			payload, err := readClientPayload(client, req.Decryptor)
+			payload, nextPayloadCipher, err := readClientPayloadBuffered(client, req.Decryptor, lenCipher, payloadCipher)
+			payloadCipher = nextPayloadCipher
 			if err != nil {
-				if err != io.EOF {
+				if !isExpectedCloseError(err) {
 					log.Printf("debug: uplink closed from %s: %v", clientIP, err)
 				}
 				break
@@ -179,17 +185,17 @@ func (s *Server) handleTCP(client net.Conn) {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, tcpMaxPayloadSize)
+		writeBuf := make([]byte, 0, tcpMaxPayloadSize+2+2*tagLen+saltLen+64)
 		var encryptor *aeadStream
 		var localDownload int64
 		for {
-			_ = remote.SetReadDeadline(time.Now().Add(deadline))
 			n, err := remote.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
 				if encryptor == nil {
-					encryptor, err = writeResponseHeaderAndPayload(client, user.UserKey, req.RequestSalt, chunk)
+					encryptor, writeBuf, err = writeResponseHeaderAndPayload(client, user.UserKey, req.RequestSalt, chunk, writeBuf)
 				} else {
-					err = writeResponsePayload(client, encryptor, chunk)
+					writeBuf, err = writeResponsePayload(client, encryptor, chunk, writeBuf)
 				}
 				if err != nil {
 					break
@@ -217,13 +223,37 @@ func (s *Server) handleTCP(client net.Conn) {
 	s.state.AddTraffic(user.ID, finalUpload, finalDownload)
 }
 
+func tuneTCP(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetNoDelay(true)
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	_ = tcp.SetReadBuffer(1 << 20)
+	_ = tcp.SetWriteBuffer(1 << 20)
+}
+
 func writeFull(conn net.Conn, payload []byte) error {
 	for len(payload) > 0 {
 		n, err := conn.Write(payload)
 		if err != nil {
 			return err
 		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 		payload = payload[n:]
 	}
 	return nil
+}
+
+func isExpectedCloseError(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	text := err.Error()
+	return strings.Contains(text, "use of closed network connection") ||
+		strings.Contains(text, "connection reset by peer")
 }

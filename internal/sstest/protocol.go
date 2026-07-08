@@ -173,14 +173,44 @@ func readClientPayload(conn net.Conn, decryptor *aeadStream) ([]byte, error) {
 	return decryptor.decrypt(payloadCipher)
 }
 
-func writeResponseHeaderAndPayload(conn net.Conn, userKey []byte, requestSalt []byte, payload []byte) (*aeadStream, error) {
+func readClientPayloadBuffered(conn net.Conn, decryptor *aeadStream, lenCipher []byte, payloadCipher []byte) ([]byte, []byte, error) {
+	if _, err := io.ReadFull(conn, lenCipher[:2+tagLen]); err != nil {
+		return nil, payloadCipher, err
+	}
+	lenPlain, err := decryptor.decryptInto(lenCipher[:0], lenCipher[:2+tagLen])
+	if err != nil {
+		return nil, payloadCipher, err
+	}
+	if len(lenPlain) != 2 {
+		return nil, payloadCipher, fmt.Errorf("invalid payload length")
+	}
+	size := int(binary.BigEndian.Uint16(lenPlain))
+	if size > tcpMaxPayloadSize {
+		return nil, payloadCipher, fmt.Errorf("payload too large")
+	}
+	if size == 0 {
+		return nil, payloadCipher, io.EOF
+	}
+	needed := size + tagLen
+	if cap(payloadCipher) < needed {
+		payloadCipher = make([]byte, needed)
+	}
+	payloadCipher = payloadCipher[:needed]
+	if _, err := io.ReadFull(conn, payloadCipher); err != nil {
+		return nil, payloadCipher, err
+	}
+	payload, err := decryptor.decryptInto(payloadCipher[:0], payloadCipher)
+	return payload, payloadCipher, err
+}
+
+func writeResponseHeaderAndPayload(conn net.Conn, userKey []byte, requestSalt []byte, payload []byte, writeBuf []byte) (*aeadStream, []byte, error) {
 	responseSalt := make([]byte, saltLen)
 	if _, err := rand.Read(responseSalt); err != nil {
-		return nil, err
+		return nil, writeBuf, err
 	}
 	encryptor, err := newAEADStream(deriveSessionSubkey(userKey, responseSalt))
 	if err != nil {
-		return nil, err
+		return nil, writeBuf, err
 	}
 	fixed := make([]byte, 0, 1+8+len(requestSalt)+2)
 	fixed = append(fixed, 1)
@@ -191,25 +221,31 @@ func writeResponseHeaderAndPayload(conn net.Conn, userKey []byte, requestSalt []
 	lenBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(lenBuf, uint16(len(payload)))
 	fixed = append(fixed, lenBuf...)
-	if err := writeFull(conn, responseSalt); err != nil {
-		return nil, err
+	needed := saltLen + len(fixed) + tagLen + len(payload) + tagLen
+	if cap(writeBuf) < needed {
+		writeBuf = make([]byte, 0, needed)
 	}
-	if err := writeFull(conn, encryptor.encrypt(fixed)); err != nil {
-		return nil, err
+	writeBuf = writeBuf[:0]
+	writeBuf = append(writeBuf, responseSalt...)
+	writeBuf = encryptor.encryptInto(writeBuf, fixed)
+	writeBuf = encryptor.encryptInto(writeBuf, payload)
+	if err := writeFull(conn, writeBuf); err != nil {
+		return nil, writeBuf, err
 	}
-	if err := writeFull(conn, encryptor.encrypt(payload)); err != nil {
-		return nil, err
-	}
-	return encryptor, nil
+	return encryptor, writeBuf, nil
 }
 
-func writeResponsePayload(conn net.Conn, encryptor *aeadStream, payload []byte) error {
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, uint16(len(payload)))
-	if err := writeFull(conn, encryptor.encrypt(lenBuf)); err != nil {
-		return err
+func writeResponsePayload(conn net.Conn, encryptor *aeadStream, payload []byte, writeBuf []byte) ([]byte, error) {
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(payload)))
+	needed := 2 + tagLen + len(payload) + tagLen
+	if cap(writeBuf) < needed {
+		writeBuf = make([]byte, 0, needed)
 	}
-	return writeFull(conn, encryptor.encrypt(payload))
+	writeBuf = writeBuf[:0]
+	writeBuf = encryptor.encryptInto(writeBuf, lenBuf[:])
+	writeBuf = encryptor.encryptInto(writeBuf, payload)
+	return writeBuf, writeFull(conn, writeBuf)
 }
 
 func isForbiddenPort(user *User, port int) bool {

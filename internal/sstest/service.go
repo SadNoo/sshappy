@@ -39,6 +39,7 @@ func Run(ctx context.Context, config Config) error {
 	defer nodeTicker.Stop()
 	aliveTicker := time.NewTicker(time.Duration(config.AliveIPReportSeconds) * time.Second)
 	defer aliveTicker.Stop()
+	onlineWindow := onlineCountWindow(config)
 
 	for {
 		select {
@@ -68,7 +69,7 @@ func Run(ctx context.Context, config Config) error {
 				log.Printf("traffic reported: users=%d", len(traffic))
 			}
 		case <-nodeTicker.C:
-			online := state.OnlineUserCount()
+			online := state.OnlineUserCount(onlineWindow)
 			if err := db.ReportNodeStatus(node, online); err != nil {
 				log.Printf("node status report failed: %v", err)
 			} else {
@@ -107,7 +108,7 @@ func syncOnce(db *Database, server *Server, state *RuntimeState, config Config, 
 			return node, err
 		}
 		log.Printf("traffic reported: users=%d", len(traffic))
-		online := state.OnlineUserCount()
+		online := state.OnlineUserCount(onlineCountWindow(config))
 		if err := db.ReportNodeStatus(node, online); err != nil {
 			return node, err
 		}
@@ -119,4 +120,15 @@ func syncOnce(db *Database, server *Server, state *RuntimeState, config Config, 
 		log.Printf("alive ips reported: users=%d records=0", len(alive))
 	}
 	return node, nil
+}
+
+func onlineCountWindow(config Config) time.Duration {
+	seconds := config.NodeReportSeconds
+	if config.AliveIPReportSeconds > seconds {
+		seconds = config.AliveIPReportSeconds
+	}
+	if config.SyncIntervalSeconds > seconds {
+		seconds = config.SyncIntervalSeconds
+	}
+	return time.Duration(seconds*2+30) * time.Second
 }
