@@ -19,6 +19,7 @@ type Config struct {
 	AliveIPReportSeconds int
 	TCPConnectTimeout    int
 	TCPIdleTimeout       int
+	UDPIdleTimeout       int
 	TrafficFlushBytes    int64
 }
 
@@ -37,6 +38,7 @@ func LoadConfig() Config {
 		AliveIPReportSeconds: getenvInt("ALIVE_IP_REPORT_SECONDS", 60),
 		TCPConnectTimeout:    getenvInt("TCP_CONNECT_TIMEOUT", 10),
 		TCPIdleTimeout:       getenvInt("TCP_IDLE_TIMEOUT", 300),
+		UDPIdleTimeout:       getenvInt("UDP_IDLE_TIMEOUT", 300),
 		TrafficFlushBytes:    int64(getenvInt("TRAFFIC_FLUSH_BYTES", 1<<20)),
 	}
 }

@@ -18,6 +18,14 @@ type ClientRequest struct {
 	RequestSalt    []byte
 }
 
+type UDPClientPacket struct {
+	User            *User
+	Target          TargetAddress
+	Payload         []byte
+	ClientSessionID uint64
+	PacketID        uint64
+}
+
 func readClientRequest(conn net.Conn, usersByIdentity map[[16]byte]*User, serverKey []byte) (*ClientRequest, error) {
 	salt := make([]byte, saltLen)
 	if _, err := io.ReadFull(conn, salt); err != nil {
@@ -147,6 +155,33 @@ func parseTargetAddress(data []byte, offset int) (TargetAddress, int, error) {
 	return target, offset, nil
 }
 
+func packTargetAddress(target TargetAddress) ([]byte, error) {
+	ip := net.ParseIP(target.Host)
+	if ip4 := ip.To4(); ip4 != nil {
+		out := make([]byte, 1+4+2)
+		out[0] = 1
+		copy(out[1:5], ip4)
+		binary.BigEndian.PutUint16(out[5:7], uint16(target.Port))
+		return out, nil
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		out := make([]byte, 1+16+2)
+		out[0] = 4
+		copy(out[1:17], ip16)
+		binary.BigEndian.PutUint16(out[17:19], uint16(target.Port))
+		return out, nil
+	}
+	if len(target.Host) > 255 {
+		return nil, fmt.Errorf("domain name too long")
+	}
+	out := make([]byte, 1+1+len(target.Host)+2)
+	out[0] = 3
+	out[1] = byte(len(target.Host))
+	copy(out[2:2+len(target.Host)], target.Host)
+	binary.BigEndian.PutUint16(out[len(out)-2:], uint16(target.Port))
+	return out, nil
+}
+
 func readClientPayload(conn net.Conn, decryptor *aeadStream) ([]byte, error) {
 	lenCipher := make([]byte, 2+tagLen)
 	if _, err := io.ReadFull(conn, lenCipher); err != nil {
@@ -246,6 +281,115 @@ func writeResponsePayload(conn net.Conn, encryptor *aeadStream, payload []byte, 
 	writeBuf = encryptor.encryptInto(writeBuf, lenBuf[:])
 	writeBuf = encryptor.encryptInto(writeBuf, payload)
 	return writeBuf, writeFull(conn, writeBuf)
+}
+
+func decryptUDPClientPacket(packet []byte, usersByIdentity map[[16]byte]*User, serverKey []byte) (*UDPClientPacket, error) {
+	minLen := udpHeaderLen + identityHeaderLen + tagLen + 1 + 8 + 2
+	if len(packet) < minLen {
+		return nil, fmt.Errorf("udp packet too short")
+	}
+	header, err := aesECBDecryptBlock(serverKey, packet[:udpHeaderLen])
+	if err != nil {
+		return nil, err
+	}
+	clientSessionID := binary.BigEndian.Uint64(header[:8])
+	packetID := binary.BigEndian.Uint64(header[8:16])
+	eihPlain, err := aesECBDecryptBlock(serverKey, packet[udpHeaderLen:udpHeaderLen+identityHeaderLen])
+	if err != nil {
+		return nil, err
+	}
+	var identity [16]byte
+	for i := range identity {
+		identity[i] = eihPlain[i] ^ header[i]
+	}
+	user := usersByIdentity[identity]
+	if user == nil {
+		return nil, fmt.Errorf("unknown SS2022 udp identity")
+	}
+	var sessionIDBytes [8]byte
+	binary.BigEndian.PutUint64(sessionIDBytes[:], clientSessionID)
+	block, err := newAESGCM(deriveSessionSubkey(user.UserKey, sessionIDBytes[:]))
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := block.Open(nil, header[4:16], packet[udpHeaderLen+identityHeaderLen:], nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(plaintext) < 1+8+2 {
+		return nil, fmt.Errorf("udp plaintext too short")
+	}
+	offset := 0
+	if plaintext[offset] != udpClientType {
+		return nil, fmt.Errorf("invalid udp client packet type")
+	}
+	offset++
+	timestamp := int64(binary.BigEndian.Uint64(plaintext[offset : offset+8]))
+	offset += 8
+	if abs64(time.Now().Unix()-timestamp) > 30 {
+		return nil, fmt.Errorf("udp packet timestamp outside allowed window")
+	}
+	paddingLen := int(binary.BigEndian.Uint16(plaintext[offset : offset+2]))
+	offset += 2
+	if len(plaintext) < offset+paddingLen {
+		return nil, fmt.Errorf("short udp padding")
+	}
+	offset += paddingLen
+	target, offset, err := parseTargetAddress(plaintext, offset)
+	if err != nil {
+		return nil, err
+	}
+	return &UDPClientPacket{
+		User:            user,
+		Target:          target,
+		Payload:         plaintext[offset:],
+		ClientSessionID: clientSessionID,
+		PacketID:        packetID,
+	}, nil
+}
+
+func encryptUDPServerPacket(user *User, target TargetAddress, payload []byte, clientSessionID uint64, packetID uint64, serverSessionID uint64) ([]byte, error) {
+	header := make([]byte, udpHeaderLen)
+	binary.BigEndian.PutUint64(header[:8], serverSessionID)
+	binary.BigEndian.PutUint64(header[8:16], packetID)
+	packedTarget, err := packTargetAddress(target)
+	if err != nil {
+		return nil, err
+	}
+	plaintext := make([]byte, 0, 1+8+8+2+len(packedTarget)+len(payload))
+	plaintext = append(plaintext, udpServerType)
+	var tmp [8]byte
+	binary.BigEndian.PutUint64(tmp[:], uint64(time.Now().Unix()))
+	plaintext = append(plaintext, tmp[:]...)
+	binary.BigEndian.PutUint64(tmp[:], clientSessionID)
+	plaintext = append(plaintext, tmp[:]...)
+	plaintext = append(plaintext, 0, 0)
+	plaintext = append(plaintext, packedTarget...)
+	plaintext = append(plaintext, payload...)
+
+	var sessionIDBytes [8]byte
+	binary.BigEndian.PutUint64(sessionIDBytes[:], serverSessionID)
+	block, err := newAESGCM(deriveSessionSubkey(user.UserKey, sessionIDBytes[:]))
+	if err != nil {
+		return nil, err
+	}
+	encrypted := block.Seal(nil, header[4:16], plaintext, nil)
+	encryptedHeader, err := aesECBEncryptBlock(user.UserKey, header)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(encryptedHeader)+len(encrypted))
+	out = append(out, encryptedHeader...)
+	out = append(out, encrypted...)
+	return out, nil
+}
+
+func makeUDPServerSessionID() uint64 {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint64(raw[:])
 }
 
 func isForbiddenPort(user *User, port int) bool {

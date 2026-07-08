@@ -7,6 +7,10 @@ const (
 	tagLen            = 16
 	identityHeaderLen = 16
 	tcpMaxPayloadSize = 0xffff
+	udpMaxPacketSize  = 65536
+	udpHeaderLen      = 16
+	udpClientType     = 0
+	udpServerType     = 1
 )
 
 type NodeInfo struct {
