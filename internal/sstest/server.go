@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,7 @@ type Server struct {
 	port            int
 	udpMu           sync.Mutex
 	udpAssociations map[udpAssociationKey]*udpAssociation
+	udpMetrics      udpMetrics
 }
 
 type udpAssociationKey struct {
@@ -41,15 +43,29 @@ type udpAssociationKey struct {
 }
 
 type udpAssociation struct {
+	mu              sync.Mutex
 	key             udpAssociationKey
 	target          TargetAddress
 	user            *User
 	clientAddr      *net.UDPAddr
 	clientSessionID uint64
 	serverSessionID uint64
-	packetID        uint64
+	pendingPacketID []uint64
 	conn            *net.UDPConn
 	lastSeen        time.Time
+}
+
+type udpMetrics struct {
+	rxPackets           atomic.Uint64
+	rxBytes             atomic.Uint64
+	txPackets           atomic.Uint64
+	txBytes             atomic.Uint64
+	dropDecrypt         atomic.Uint64
+	dropForbidden       atomic.Uint64
+	dropTargetOpen      atomic.Uint64
+	dropTargetWrite     atomic.Uint64
+	dropResponseEncrypt atomic.Uint64
+	dropResponseWrite   atomic.Uint64
 }
 
 func NewServer(config Config, state *RuntimeState) *Server {
@@ -106,6 +122,7 @@ func (s *Server) Restart(port int) error {
 		_ = ln.Close()
 		return err
 	}
+	tuneUDP(udpConn, s.config)
 	s.mu.Lock()
 	s.listener = ln
 	s.udpConn = udpConn
@@ -114,6 +131,8 @@ func (s *Server) Restart(port int) error {
 	log.Printf("SS2022 Go TCP server listening on %s", addr)
 	log.Printf("SS2022 Go UDP server listening on %s", addr)
 	go s.serveUDP(udpConn)
+	go s.cleanupUDPLoop(udpConn)
+	go s.reportUDPMetricsLoop(udpConn)
 	return nil
 }
 
@@ -272,6 +291,8 @@ func (s *Server) serveUDP(conn *net.UDPConn) {
 		if err != nil {
 			return
 		}
+		s.udpMetrics.rxPackets.Add(1)
+		s.udpMetrics.rxBytes.Add(uint64(n))
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		go s.handleUDPDatagram(conn, data, addr)
@@ -289,6 +310,7 @@ func (s *Server) handleUDPDatagram(inbound *net.UDPConn, data []byte, clientAddr
 	clientIP := clientAddr.IP.String()
 	packet, err := decryptUDPClientPacket(data, reg.usersByIdentity, reg.node.ServerKey)
 	if err != nil {
+		s.udpMetrics.dropDecrypt.Add(1)
 		if !isExpectedCloseError(err) {
 			log.Printf("debug: udp packet dropped from %s: %v", clientIP, err)
 		}
@@ -296,6 +318,7 @@ func (s *Server) handleUDPDatagram(inbound *net.UDPConn, data []byte, clientAddr
 	}
 	user := packet.User
 	if isDisconnectIP(user, clientIP) || isForbiddenPort(user, packet.Target.Port) || isForbiddenHost(user, packet.Target.Host) {
+		s.udpMetrics.dropForbidden.Add(1)
 		return
 	}
 	s.state.AddAliveIP(user.ID, clientIP)
@@ -303,15 +326,15 @@ func (s *Server) handleUDPDatagram(inbound *net.UDPConn, data []byte, clientAddr
 
 	assoc, err := s.getUDPAssociation(packet, clientAddr)
 	if err != nil {
+		s.udpMetrics.dropTargetOpen.Add(1)
 		log.Printf("debug: udp target open failed from %s: %v", clientIP, err)
 		return
 	}
-	assoc.packetID = packet.PacketID
-	assoc.lastSeen = time.Now()
+	assoc.enqueuePacket(packet.PacketID)
 	if _, err := assoc.conn.Write(packet.Payload); err != nil && !isExpectedCloseError(err) {
+		s.udpMetrics.dropTargetWrite.Add(1)
 		log.Printf("debug: udp target write failed from %s: %v", clientIP, err)
 	}
-	s.cleanupUDPAssociations()
 }
 
 func (s *Server) getUDPAssociation(packet *UDPClientPacket, clientAddr *net.UDPAddr) (*udpAssociation, error) {
@@ -337,6 +360,7 @@ func (s *Server) getUDPAssociation(packet *UDPClientPacket, clientAddr *net.UDPA
 	if err != nil {
 		return nil, err
 	}
+	tuneUDP(conn, s.config)
 	assoc := &udpAssociation{
 		key:             key,
 		target:          packet.Target,
@@ -344,7 +368,7 @@ func (s *Server) getUDPAssociation(packet *UDPClientPacket, clientAddr *net.UDPA
 		clientAddr:      clientAddr,
 		clientSessionID: packet.ClientSessionID,
 		serverSessionID: makeUDPServerSessionID(),
-		packetID:        packet.PacketID,
+		pendingPacketID: make([]uint64, 0, 8),
 		conn:            conn,
 		lastSeen:        time.Now(),
 	}
@@ -381,16 +405,20 @@ func (s *Server) handleUDPResponse(assoc *udpAssociation, payload []byte) {
 	if inbound == nil {
 		return
 	}
-	assoc.lastSeen = time.Now()
-	response, err := encryptUDPServerPacket(assoc.user, assoc.target, payload, assoc.clientSessionID, assoc.packetID, assoc.serverSessionID)
+	packetID := assoc.nextPacketID()
+	response, err := encryptUDPServerPacket(assoc.user, assoc.target, payload, assoc.clientSessionID, packetID, assoc.serverSessionID)
 	if err != nil {
+		s.udpMetrics.dropResponseEncrypt.Add(1)
 		log.Printf("debug: udp response encrypt failed: %v", err)
 		return
 	}
 	if _, err := inbound.WriteToUDP(response, assoc.clientAddr); err != nil && !isExpectedCloseError(err) {
+		s.udpMetrics.dropResponseWrite.Add(1)
 		log.Printf("debug: udp response write failed: %v", err)
 		return
 	}
+	s.udpMetrics.txPackets.Add(1)
+	s.udpMetrics.txBytes.Add(uint64(len(payload)))
 	s.state.AddTraffic(assoc.user.ID, 0, int64(len(payload)))
 	s.state.AddAliveIP(assoc.user.ID, assoc.clientAddr.IP.String())
 }
@@ -400,7 +428,7 @@ func (s *Server) cleanupUDPAssociations() {
 	s.udpMu.Lock()
 	defer s.udpMu.Unlock()
 	for key, assoc := range s.udpAssociations {
-		if assoc.lastSeen.Before(cutoff) {
+		if assoc.lastSeenBefore(cutoff) {
 			_ = assoc.conn.Close()
 			delete(s.udpAssociations, key)
 		}
@@ -416,6 +444,87 @@ func (s *Server) closeUDPAssociations() {
 	}
 }
 
+func (a *udpAssociation) enqueuePacket(packetID uint64) {
+	a.mu.Lock()
+	a.pendingPacketID = append(a.pendingPacketID, packetID)
+	a.lastSeen = time.Now()
+	a.mu.Unlock()
+}
+
+func (a *udpAssociation) nextPacketID() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastSeen = time.Now()
+	if len(a.pendingPacketID) == 0 {
+		return 0
+	}
+	packetID := a.pendingPacketID[0]
+	copy(a.pendingPacketID, a.pendingPacketID[1:])
+	a.pendingPacketID = a.pendingPacketID[:len(a.pendingPacketID)-1]
+	return packetID
+}
+
+func (a *udpAssociation) lastSeenBefore(cutoff time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastSeen.Before(cutoff)
+}
+
+func (s *Server) cleanupUDPLoop(conn *net.UDPConn) {
+	interval := time.Duration(s.config.UDPIdleTimeout/2) * time.Second
+	if interval < 30*time.Second {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.RLock()
+		current := s.udpConn
+		s.mu.RUnlock()
+		if current != conn {
+			return
+		}
+		s.cleanupUDPAssociations()
+	}
+}
+
+func (s *Server) reportUDPMetricsLoop(conn *net.UDPConn) {
+	interval := time.Duration(s.config.UDPMetricsSeconds) * time.Second
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.RLock()
+		current := s.udpConn
+		s.mu.RUnlock()
+		if current != conn {
+			return
+		}
+		log.Printf(
+			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_target_open=%d drop_target_write=%d drop_response_encrypt=%d drop_response_write=%d associations=%d",
+			s.udpMetrics.rxPackets.Load(),
+			s.udpMetrics.rxBytes.Load(),
+			s.udpMetrics.txPackets.Load(),
+			s.udpMetrics.txBytes.Load(),
+			s.udpMetrics.dropDecrypt.Load(),
+			s.udpMetrics.dropForbidden.Load(),
+			s.udpMetrics.dropTargetOpen.Load(),
+			s.udpMetrics.dropTargetWrite.Load(),
+			s.udpMetrics.dropResponseEncrypt.Load(),
+			s.udpMetrics.dropResponseWrite.Load(),
+			s.udpAssociationCount(),
+		)
+	}
+}
+
+func (s *Server) udpAssociationCount() int {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	return len(s.udpAssociations)
+}
+
 func tuneTCP(conn net.Conn) {
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -426,6 +535,15 @@ func tuneTCP(conn net.Conn) {
 	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	_ = tcp.SetReadBuffer(1 << 20)
 	_ = tcp.SetWriteBuffer(1 << 20)
+}
+
+func tuneUDP(conn *net.UDPConn, config Config) {
+	if config.UDPReadBufferBytes > 0 {
+		_ = conn.SetReadBuffer(config.UDPReadBufferBytes)
+	}
+	if config.UDPWriteBufferBytes > 0 {
+		_ = conn.SetWriteBuffer(config.UDPWriteBufferBytes)
+	}
 }
 
 func writeFull(conn net.Conn, payload []byte) error {

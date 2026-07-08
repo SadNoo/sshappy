@@ -85,6 +85,21 @@ func TestUDPServerPacketRoundTrips(t *testing.T) {
 	}
 }
 
+func TestUDPAssociationPacketIDsAreFIFO(t *testing.T) {
+	assoc := &udpAssociation{
+		pendingPacketID: make([]uint64, 0, 2),
+		lastSeen:        time.Now(),
+	}
+	assoc.enqueuePacket(11)
+	assoc.enqueuePacket(12)
+	if got := assoc.nextPacketID(); got != 11 {
+		t.Fatalf("first packet id = %d", got)
+	}
+	if got := assoc.nextPacketID(); got != 12 {
+		t.Fatalf("second packet id = %d", got)
+	}
+}
+
 func udpTestUser(userKey []byte) *User {
 	return &User{
 		ID:           7,
