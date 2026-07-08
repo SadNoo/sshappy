@@ -27,6 +27,7 @@ class Service:
             listen_host=self.config.listen_host,
             connect_timeout=self.config.tcp_connect_timeout,
             idle_timeout=self.config.tcp_idle_timeout,
+            udp_idle_timeout=self.config.udp_idle_timeout,
             state=self.state,
         )
         self.node = None

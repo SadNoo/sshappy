@@ -31,6 +31,6 @@ def load_config() -> RuntimeConfig:
         alive_ip_report_seconds=getenv_int("ALIVE_IP_REPORT_SECONDS", 60),
         tcp_connect_timeout=getenv_int("TCP_CONNECT_TIMEOUT", 10),
         tcp_idle_timeout=getenv_int("TCP_IDLE_TIMEOUT", 300),
+        udp_idle_timeout=getenv_int("UDP_IDLE_TIMEOUT", 300),
         log_level=getenv("LOG_LEVEL", "INFO").upper(),
     )
-

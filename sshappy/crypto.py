@@ -13,6 +13,11 @@ def aes_ecb_decrypt_block(key: bytes, block: bytes) -> bytes:
     return decryptor.update(block) + decryptor.finalize()
 
 
+def aes_ecb_encrypt_block(key: bytes, block: bytes) -> bytes:
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(block) + encryptor.finalize()
+
+
 def nonce(counter: int) -> bytes:
     return counter.to_bytes(12, "little")
 
@@ -42,4 +47,3 @@ def pack_length(length: int) -> bytes:
 
 def unpack_length(data: bytes) -> int:
     return struct.unpack("!H", data)[0]
-

@@ -9,6 +9,7 @@ SALT_LEN = 32
 TAG_LEN = 16
 IDENTITY_HEADER_LEN = 16
 TCP_MAX_PAYLOAD_SIZE = 0xFFFF
+UDP_MAX_PACKET_SIZE = 65536
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class RuntimeConfig:
     alive_ip_report_seconds: int
     tcp_connect_timeout: int
     tcp_idle_timeout: int
+    udp_idle_timeout: int
     log_level: str
 
 
