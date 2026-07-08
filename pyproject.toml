@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshappy"
+version = "1.0.0"
+description = "SSPanel-Uim SS2022 single-port backend with per-user billing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "blake3>=1.0.4",
+  "cryptography>=42.0.0",
+  "PyMySQL>=1.1.0",
+]
+
+[project.scripts]
+sscodex = "sshappy.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

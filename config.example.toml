@@ -1,0 +1,21 @@
+# Example only. Production secrets must be passed through environment variables.
+
+[database]
+host = "127.0.0.1"
+port = 3306
+name = "sspanel"
+user = "sspanel_user"
+password = "change-me"
+
+[node]
+id = 14
+listen_host = "0.0.0.0"
+
+[runtime]
+sync_interval_seconds = 60
+traffic_report_seconds = 60
+node_report_seconds = 60
+alive_ip_report_seconds = 60
+tcp_connect_timeout = 10
+tcp_idle_timeout = 300
+
