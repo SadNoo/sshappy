@@ -26,6 +26,7 @@ from .protocol import (
 from .state import RuntimeState
 
 logger = logging.getLogger(__name__)
+TRAFFIC_FLUSH_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -156,8 +157,27 @@ class SSServer:
         user = request.user
         await self.state.add_alive_ip(user.id, client_ip)
         encryptor = None
+        upload_pending = 0
+        download_pending = 0
+
+        async def flush_upload(force: bool = False) -> None:
+            nonlocal upload_pending
+            if upload_pending <= 0 or (not force and upload_pending < TRAFFIC_FLUSH_BYTES):
+                return
+            amount = upload_pending
+            upload_pending = 0
+            await self.state.add_traffic(user.id, upload=amount)
+
+        async def flush_download(force: bool = False) -> None:
+            nonlocal download_pending
+            if download_pending <= 0 or (not force and download_pending < TRAFFIC_FLUSH_BYTES):
+                return
+            amount = download_pending
+            download_pending = 0
+            await self.state.add_traffic(user.id, download=amount)
 
         async def uplink() -> None:
+            nonlocal upload_pending
             while True:
                 payload = await asyncio.wait_for(
                     read_client_payload(client_reader, request.decryptor),
@@ -167,11 +187,11 @@ class SSServer:
                     return
                 remote_writer.write(payload)
                 await remote_writer.drain()
-                await self.state.add_traffic(user.id, upload=len(payload))
-                await self.state.add_alive_ip(user.id, client_ip)
+                upload_pending += len(payload)
+                await flush_upload()
 
         async def downlink() -> None:
-            nonlocal encryptor
+            nonlocal encryptor, download_pending
             while True:
                 payload = await asyncio.wait_for(remote_reader.read(TCP_MAX_PAYLOAD_SIZE), timeout=self.idle_timeout)
                 if not payload:
@@ -185,8 +205,8 @@ class SSServer:
                     )
                 else:
                     await write_response_payload(client_writer, encryptor, payload)
-                await self.state.add_traffic(user.id, download=len(payload))
-                await self.state.add_alive_ip(user.id, client_ip)
+                download_pending += len(payload)
+                await flush_download()
 
         tasks = [asyncio.create_task(uplink()), asyncio.create_task(downlink())]
         _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -200,6 +220,8 @@ class SSServer:
                 logger.debug("relay closed from %s: %s", client_ip, result)
                 continue
             raise result
+        await flush_upload(force=True)
+        await flush_download(force=True)
 
     def is_replay(self, salt: bytes) -> bool:
         now = time.monotonic()
