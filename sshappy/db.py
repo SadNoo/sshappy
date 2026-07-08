@@ -176,7 +176,7 @@ class Database:
                 (node.id, online_users, now),
             )
             cur.execute(
-                "INSERT INTO ss_node_info (node_id, uptime, load, log_time) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO ss_node_info (node_id, uptime, `load`, log_time) VALUES (%s, %s, %s, %s)",
                 (node.id, uptime, load, now),
             )
             cur.execute(
