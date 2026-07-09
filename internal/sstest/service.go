@@ -16,6 +16,12 @@ func Run(ctx context.Context, config Config) error {
 	if config.UDPMTU < 1280 || config.UDPMTU > 65535 {
 		return fmt.Errorf("UDP_MTU must be between 1280 and 65535, got %d", config.UDPMTU)
 	}
+	if config.UDPRelayBatchSize < 1 || config.UDPRelayBatchSize > 1024 {
+		return fmt.Errorf("UDP_RELAY_BATCH_SIZE must be between 1 and 1024, got %d", config.UDPRelayBatchSize)
+	}
+	if config.UDPServerBatchSize < 1 || config.UDPServerBatchSize > 1024 {
+		return fmt.Errorf("UDP_SERVER_RECV_BATCH_SIZE must be between 1 and 1024, got %d", config.UDPServerBatchSize)
+	}
 	db, err := OpenDatabase(config)
 	if err != nil {
 		return err

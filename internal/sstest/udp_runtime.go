@@ -1,13 +1,10 @@
 package sstest
 
 import (
-	"context"
 	"crypto/sha256"
-	"errors"
 	"log"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -50,6 +47,8 @@ type udpSession struct {
 	closeOnce  sync.Once
 	upload     atomic.Int64
 	download   atomic.Int64
+	lastActive atomic.Int64
+	batch      udpSessionBatch
 }
 
 type udpClientAddr struct {
@@ -76,6 +75,14 @@ type udpRuntimeMetrics struct {
 	dropTargetWrite atomic.Uint64
 	dropPack        atomic.Uint64
 	dropClientWrite atomic.Uint64
+	kernelDropIn    atomic.Uint64
+	kernelDropOut   atomic.Uint64
+	serverRecvCalls atomic.Uint64
+	serverRecvMax   atomic.Uint64
+	relayRecvCalls  atomic.Uint64
+	relayRecvMax    atomic.Uint64
+	relaySendCalls  atomic.Uint64
+	relaySendMax    atomic.Uint64
 }
 
 func newUDPRuntime(config Config, state *RuntimeState) *udpRuntime {
@@ -125,23 +132,6 @@ func (r *udpRuntime) configure(node NodeInfo, users []User) error {
 	r.protocol.ReplaceUserLookupMap(userLookup)
 	r.users = usersByName
 	return nil
-}
-
-func (r *udpRuntime) serve(inbound *net.UDPConn) {
-	for {
-		queued := r.getPacket()
-		recvBuf := queued.buf[udpPacketHeadroom : len(queued.buf)-32]
-		n, clientAddr, err := inbound.ReadFromUDPAddrPort(recvBuf)
-		if err != nil {
-			r.putPacket(queued)
-			return
-		}
-		r.metrics.rxPackets.Add(1)
-		r.metrics.rxBytes.Add(uint64(n))
-		if !r.dispatch(inbound, queued, clientAddr, n) {
-			r.putPacket(queued)
-		}
-	}
 }
 
 func (r *udpRuntime) dispatch(inbound *net.UDPConn, queued *udpQueuedPacket, clientAddr netip.AddrPort, packetLen int) bool {
@@ -217,7 +207,9 @@ func (r *udpRuntime) dispatch(inbound *net.UDPConn, queued *udpQueuedPacket, cli
 	}
 
 	previousAddr := session.clientAddr.Load()
-	session.clientAddr.Store(&udpClientAddr{addr: clientAddr})
+	if previousAddr == nil || previousAddr.addr != clientAddr {
+		session.clientAddr.Store(&udpClientAddr{addr: clientAddr})
+	}
 	enqueued := false
 	select {
 	case <-session.done:
@@ -266,105 +258,16 @@ func (r *udpRuntime) newSessionLocked(
 		done:     make(chan struct{}),
 	}
 	session.clientAddr.Store(&udpClientAddr{})
+	session.lastActive.Store(time.Now().UnixNano())
+	if err := configureUDPSessionBatch(session); err != nil {
+		_ = outbound.Close()
+		return nil, err
+	}
 	r.sessions[id] = session
 	_ = outbound.SetReadDeadline(time.Now().Add(r.idleTimeout()))
 	go r.relayUplink(session)
 	go r.relayDownlink(session)
 	return session, nil
-}
-
-func (r *udpRuntime) relayUplink(session *udpSession) {
-	resolved := make(map[string]netip.AddrPort)
-	defer func() {
-		for {
-			select {
-			case queued := <-session.send:
-				r.putPacket(queued)
-			default:
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-session.done:
-			return
-		case queued := <-session.send:
-			targetKey := queued.target.String()
-			targetAddr, ok := resolved[targetKey]
-			if !ok {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.config.TCPConnectTimeout)*time.Second)
-				var err error
-				targetAddr, err = queued.target.ResolveIPPort(ctx, "ip")
-				cancel()
-				if err != nil {
-					r.metrics.dropResolve.Add(1)
-					r.putPacket(queued)
-					continue
-				}
-				resolved[targetKey] = targetAddr
-			}
-			_, err := session.outbound.WriteToUDPAddrPort(
-				queued.buf[queued.start:queued.start+queued.length],
-				targetAddr,
-			)
-			if err != nil {
-				if !isExpectedCloseError(err) {
-					r.metrics.dropTargetWrite.Add(1)
-				}
-				r.putPacket(queued)
-				continue
-			}
-			session.upload.Add(int64(queued.length))
-			_ = session.outbound.SetReadDeadline(time.Now().Add(r.idleTimeout()))
-			r.putPacket(queued)
-		}
-	}
-}
-
-func (r *udpRuntime) relayDownlink(session *udpSession) {
-	defer r.closeSession(session)
-	buf := make([]byte, r.packetCapacity)
-	recvBuf := buf[udpPacketHeadroom : len(buf)-32]
-
-	for {
-		n, sourceAddr, err := session.outbound.ReadFromUDPAddrPort(recvBuf)
-		if err != nil {
-			if !errors.Is(err, os.ErrDeadlineExceeded) && !isExpectedCloseError(err) {
-				log.Printf("debug: udp target read failed: %v", err)
-			}
-			return
-		}
-		client := session.clientAddr.Load()
-		if client == nil || !client.addr.IsValid() {
-			continue
-		}
-		maxPacketSize := zerocopy.MaxPacketSizeForAddr(r.udpMTU(), client.addr.Addr())
-		packetStart, packetLen, err := session.packer.PackInPlace(
-			buf,
-			sourceAddr,
-			udpPacketHeadroom,
-			n,
-			maxPacketSize,
-		)
-		if err != nil {
-			r.metrics.dropPack.Add(1)
-			continue
-		}
-		if _, err := session.inbound.WriteToUDPAddrPort(
-			buf[packetStart:packetStart+packetLen],
-			client.addr,
-		); err != nil {
-			if !isExpectedCloseError(err) {
-				r.metrics.dropClientWrite.Add(1)
-			}
-			continue
-		}
-		r.metrics.txPackets.Add(1)
-		r.metrics.txBytes.Add(uint64(n))
-		session.download.Add(int64(n))
-	}
 }
 
 func (r *udpRuntime) closeSession(session *udpSession) {
@@ -438,7 +341,7 @@ func (r *udpRuntime) reportMetrics(inbound *net.UDPConn, current func() *net.UDP
 		sessionCount := len(r.sessions)
 		r.mu.Unlock()
 		log.Printf(
-			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_session_open=%d drop_queue_full=%d drop_resolve=%d drop_target_write=%d drop_pack=%d drop_client_write=%d sessions=%d",
+			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_session_open=%d drop_queue_full=%d drop_resolve=%d drop_target_write=%d drop_pack=%d drop_client_write=%d kernel_drop_in=%d kernel_drop_out=%d server_recv_calls=%d server_recv_max=%d relay_recv_calls=%d relay_recv_max=%d relay_send_calls=%d relay_send_max=%d sessions=%d",
 			r.metrics.rxPackets.Load(),
 			r.metrics.rxBytes.Load(),
 			r.metrics.txPackets.Load(),
@@ -451,6 +354,14 @@ func (r *udpRuntime) reportMetrics(inbound *net.UDPConn, current func() *net.UDP
 			r.metrics.dropTargetWrite.Load(),
 			r.metrics.dropPack.Load(),
 			r.metrics.dropClientWrite.Load(),
+			r.metrics.kernelDropIn.Load(),
+			r.metrics.kernelDropOut.Load(),
+			r.metrics.serverRecvCalls.Load(),
+			r.metrics.serverRecvMax.Load(),
+			r.metrics.relayRecvCalls.Load(),
+			r.metrics.relayRecvMax.Load(),
+			r.metrics.relaySendCalls.Load(),
+			r.metrics.relaySendMax.Load(),
 			sessionCount,
 		)
 	}
@@ -477,4 +388,12 @@ func (r *udpRuntime) idleTimeout() time.Duration {
 
 func (r *udpRuntime) udpMTU() int {
 	return r.config.UDPMTU
+}
+
+func updateAtomicMax(value *atomic.Uint64, candidate uint64) {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }

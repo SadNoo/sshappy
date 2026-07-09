@@ -26,6 +26,8 @@ type Config struct {
 	UDPWriteBufferBytes  int
 	UDPMetricsSeconds    int
 	UDPQueueSize         int
+	UDPRelayBatchSize    int
+	UDPServerBatchSize   int
 	TrafficFlushBytes    int64
 }
 
@@ -51,6 +53,8 @@ func LoadConfig() Config {
 		UDPWriteBufferBytes:  getenvInt("UDP_WRITE_BUFFER_BYTES", 4<<20),
 		UDPMetricsSeconds:    getenvInt("UDP_METRICS_SECONDS", 60),
 		UDPQueueSize:         getenvInt("UDP_QUEUE_SIZE", 4096),
+		UDPRelayBatchSize:    getenvInt("UDP_RELAY_BATCH_SIZE", 8),
+		UDPServerBatchSize:   getenvInt("UDP_SERVER_RECV_BATCH_SIZE", 64),
 		TrafficFlushBytes:    int64(getenvInt("TRAFFIC_FLUSH_BYTES", 1<<20)),
 	}
 }

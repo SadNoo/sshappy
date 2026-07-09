@@ -81,7 +81,7 @@ func TestUDPRuntimeBurstRoundTrip(t *testing.T) {
 	_ = clientConn.SetReadBuffer(4 << 20)
 	_ = clientConn.SetWriteBuffer(4 << 20)
 
-	const packetCount = 200
+	const packetCount = 400
 	received := make(chan uint64, packetCount)
 	readErr := make(chan error, 1)
 	go func() {
@@ -135,7 +135,7 @@ func TestUDPRuntimeBurstRoundTrip(t *testing.T) {
 		select {
 		case err := <-readErr:
 			t.Fatalf(
-				"%v: received=%d rx=%d tx=%d decrypt=%d queue=%d target_write=%d pack=%d client_write=%d",
+				"%v: received=%d rx=%d tx=%d decrypt=%d queue=%d target_write=%d pack=%d client_write=%d kernel_in=%d kernel_out=%d",
 				err,
 				len(seen),
 				runtime.metrics.rxPackets.Load(),
@@ -145,6 +145,8 @@ func TestUDPRuntimeBurstRoundTrip(t *testing.T) {
 				runtime.metrics.dropTargetWrite.Load(),
 				runtime.metrics.dropPack.Load(),
 				runtime.metrics.dropClientWrite.Load(),
+				runtime.metrics.kernelDropIn.Load(),
+				runtime.metrics.kernelDropOut.Load(),
 			)
 		case value := <-received:
 			seen[value] = struct{}{}
@@ -158,6 +160,12 @@ func TestUDPRuntimeBurstRoundTrip(t *testing.T) {
 		runtime.metrics.dropPack.Load() +
 		runtime.metrics.dropClientWrite.Load(); drops != 0 {
 		t.Fatalf("runtime drops = %d", drops)
+	}
+	if maxBatch := runtime.metrics.serverRecvMax.Load(); maxBatch <= 1 {
+		t.Fatalf("server receive batching was not exercised: max_batch=%d", maxBatch)
+	}
+	if calls := runtime.metrics.serverRecvCalls.Load(); calls >= packetCount {
+		t.Fatalf("server receive syscall count = %d, packets = %d", calls, packetCount)
 	}
 }
 

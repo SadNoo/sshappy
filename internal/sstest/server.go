@@ -100,12 +100,19 @@ func (s *Server) Restart(port int) error {
 	log.Printf("SS2022 Go TCP server listening on %s", addr)
 	log.Printf("SS2022 Go UDP server listening on %s", addr)
 	log.Printf(
-		"SS2022 UDP configured: mtu=%d padding=NoPadding queue=%d read_buffer=%d write_buffer=%d",
+		"SS2022 UDP configured: mtu=%d padding=NoPadding queue=%d relay_batch=%d server_recv_batch=%d requested_read_buffer=%d requested_write_buffer=%d",
 		s.config.UDPMTU,
 		s.config.UDPQueueSize,
+		s.config.UDPRelayBatchSize,
+		s.config.UDPServerBatchSize,
 		s.config.UDPReadBufferBytes,
 		s.config.UDPWriteBufferBytes,
 	)
+	if readBuffer, writeBuffer, err := udpSocketBufferSizes(udpConn); err != nil {
+		log.Printf("debug: inspect UDP listener buffers failed: %v", err)
+	} else {
+		log.Printf("SS2022 UDP listener buffers effective: read=%d write=%d", readBuffer, writeBuffer)
+	}
 	go s.udp.serve(udpConn)
 	go s.udp.reportMetrics(udpConn, s.currentUDPConn)
 	go s.udp.flushTraffic(udpConn, s.currentUDPConn)
