@@ -367,6 +367,8 @@ type ServerConfig struct {
 	tlsCertStore      *tlscerts.Store
 	listenConfigCache conn.ListenConfigCache
 	collector         stats.Collector
+	runtimeCollector  stats.Collector
+	runtimeObserver   RuntimeObserver
 	router            *router.Router
 	logger            *zap.Logger
 	index             int
@@ -446,7 +448,11 @@ func (sc *ServerConfig) Initialize(tlsCertStore *tlscerts.Store, listenConfigCac
 
 	sc.tlsCertStore = tlsCertStore
 	sc.listenConfigCache = listenConfigCache
-	sc.collector = statsConfig.Collector()
+	if sc.runtimeCollector != nil {
+		sc.collector = sc.runtimeCollector
+	} else {
+		sc.collector = statsConfig.Collector()
+	}
 	sc.router = router
 	sc.logger = logger
 	sc.index = index
@@ -563,7 +569,7 @@ func (sc *ServerConfig) TCPRelay() (*TCPRelay, error) {
 		}
 	}
 
-	return NewTCPRelay(sc.index, sc.Name, listeners, server, sc.collector, sc.router, sc.logger), nil
+	return NewTCPRelay(sc.index, sc.Name, listeners, server, sc.collector, sc.runtimeObserver, sc.router, sc.logger), nil
 }
 
 // UDPRelay creates a UDP relay service from the ServerConfig.
@@ -643,7 +649,7 @@ func (sc *ServerConfig) UDPRelay(logger *zap.Logger, maxClientPackerHeadroom zer
 	case "direct", "none", "plain", "socks5":
 		return NewUDPNATRelay(sc.Name, sc.index, sc.MTU, packetBufHeadroom.Front, packetBufRecvSize, packetBufSize, listeners, natServer, sc.collector, sc.router, sc.logger), nil
 	case "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm":
-		return NewUDPSessionRelay(sc.Name, sc.index, sc.MTU, packetBufHeadroom.Front, packetBufRecvSize, packetBufSize, listeners, sessionServer, sc.collector, sc.router, sc.logger), nil
+		return NewUDPSessionRelay(sc.Name, sc.index, sc.MTU, packetBufHeadroom.Front, packetBufRecvSize, packetBufSize, listeners, sessionServer, sc.collector, sc.runtimeObserver, sc.router, sc.logger), nil
 	case "tproxy":
 		return NewUDPTransparentRelay(sc.Name, sc.index, sc.MTU, packetBufHeadroom.Front, packetBufRecvSize, packetBufSize, listeners, transparentConnListenConfig, sc.collector, sc.router, sc.logger)
 	default:

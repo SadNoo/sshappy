@@ -96,6 +96,7 @@ type UDPSessionRelay struct {
 	listeners              []udpRelayServerConn
 	server                 zerocopy.UDPSessionServer
 	collector              stats.Collector
+	observer               RuntimeObserver
 	router                 *router.Router
 	logger                 *zap.Logger
 	queuedPacketPool       sync.Pool
@@ -111,6 +112,7 @@ func NewUDPSessionRelay(
 	listeners []udpRelayServerConn,
 	server zerocopy.UDPSessionServer,
 	collector stats.Collector,
+	observer RuntimeObserver,
 	router *router.Router,
 	logger *zap.Logger,
 ) *UDPSessionRelay {
@@ -123,6 +125,7 @@ func NewUDPSessionRelay(
 		listeners:              listeners,
 		server:                 server,
 		collector:              collector,
+		observer:               observer,
 		router:                 router,
 		logger:                 logger,
 		queuedPacketPool: sync.Pool{
@@ -269,6 +272,11 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 			s.mu.Unlock()
 			continue
 		}
+		if s.observer != nil && !s.observer.Accept("udp", entry.username, queuedPacket.clientAddrPort, queuedPacket.targetAddr) {
+			s.putQueuedPacket(queuedPacket)
+			s.mu.Unlock()
+			continue
+		}
 
 		packetsReceived++
 		payloadBytesReceived += uint64(queuedPacket.length)
@@ -281,6 +289,9 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 		if updateClientAddrPort {
 			entry.clientAddrPortCache = queuedPacket.clientAddrPort
+			if s.observer != nil {
+				s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
+			}
 		}
 
 		if updateClientPktinfo {
@@ -535,6 +546,8 @@ func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, u
 				zap.Int("packetLength", packetLength),
 				zap.Error(err),
 			)
+		} else {
+			s.collector.CollectUDPSessionUplink(uplink.username, 1, uint64(queuedPacket.length))
 		}
 
 		err = uplink.natConn.SetReadDeadline(time.Now().Add(uplink.natTimeout))
@@ -563,7 +576,6 @@ func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, u
 		zap.Uint64("payloadBytesSent", payloadBytesSent),
 	)
 
-	s.collector.CollectUDPSessionUplink(uplink.username, packetsSent, payloadBytesSent)
 }
 
 func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownlinkGeneric) {
@@ -665,6 +677,8 @@ func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownli
 				zap.Int("packetLength", packetLength),
 				zap.Error(err),
 			)
+		} else {
+			s.collector.CollectUDPSessionDownlink(downlink.username, 1, uint64(payloadLength))
 		}
 
 		packetsSent++
@@ -679,7 +693,6 @@ func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownli
 		zap.Uint64("payloadBytesSent", payloadBytesSent),
 	)
 
-	s.collector.CollectUDPSessionDownlink(downlink.username, packetsSent, payloadBytesSent)
 }
 
 // getQueuedPacket retrieves a queued packet from the pool.

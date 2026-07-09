@@ -47,6 +47,7 @@ type TCPRelay struct {
 	acceptWg    sync.WaitGroup
 	server      netio.StreamServer
 	collector   stats.Collector
+	observer    RuntimeObserver
 	router      *router.Router
 	logger      *zap.Logger
 }
@@ -57,6 +58,7 @@ func NewTCPRelay(
 	listeners []tcpRelayListener,
 	server netio.StreamServer,
 	collector stats.Collector,
+	observer RuntimeObserver,
 	router *router.Router,
 	logger *zap.Logger,
 ) *TCPRelay {
@@ -66,6 +68,7 @@ func NewTCPRelay(
 		listeners:   listeners,
 		server:      server,
 		collector:   collector,
+		observer:    observer,
 		router:      router,
 		logger:      logger,
 	}
@@ -143,6 +146,13 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		}
 		logger.Warn("Failed to complete handshake with client", zap.Error(err))
 		return
+	}
+	if s.observer != nil && !s.observer.Accept("tcp", req.Username, clientAddrPort, req.Addr) {
+		logger.Debug("Rejected TCP connection by runtime policy", zap.String("username", req.Username))
+		return
+	}
+	if s.observer != nil {
+		s.observer.Observe("tcp", req.Username, clientAddrPort)
 	}
 
 	// Convert target address to string once for log messages.

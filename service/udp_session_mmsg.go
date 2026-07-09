@@ -211,6 +211,10 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 				s.putQueuedPacket(queuedPacket)
 				continue
 			}
+			if s.observer != nil && !s.observer.Accept("udp", entry.username, queuedPacket.clientAddrPort, queuedPacket.targetAddr) {
+				s.putQueuedPacket(queuedPacket)
+				continue
+			}
 
 			payloadBytesReceived += uint64(queuedPacket.length)
 
@@ -222,6 +226,9 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 
 			if updateClientAddrPort {
 				entry.clientAddrPortCache = queuedPacket.clientAddrPort
+				if s.observer != nil {
+					s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
+				}
 			}
 
 			if updateClientPktinfo {
@@ -526,8 +533,16 @@ main:
 		}
 
 		for start := 0; start < count; {
+			batchStart := start
 			n, err := uplink.natConn.WriteMsgs(msgvec[start:count], 0)
 			start += n
+			if n > 0 {
+				var sentBytes uint64
+				for _, packet := range qpvec[batchStart:start] {
+					sentBytes += uint64(packet.length)
+				}
+				s.collector.CollectUDPSessionUplink(uplink.username, uint64(n), sentBytes)
+			}
 			if err != nil {
 				uplink.logger.Warn("Failed to batch write packets to natConn",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
@@ -580,7 +595,6 @@ main:
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
 
-	s.collector.CollectUDPSessionUplink(uplink.username, packetsSent, payloadBytesSent)
 }
 
 func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownlinkMmsg) {
@@ -609,6 +623,7 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 	bufvec := make([][]byte, downlink.relayBatchSize)
 	riovec := make([]unix.Iovec, downlink.relayBatchSize)
 	siovec := make([]unix.Iovec, downlink.relayBatchSize)
+	payloadLengthVec := make([]int, downlink.relayBatchSize)
 	rmsgvec := make([]conn.Mmsghdr, downlink.relayBatchSize)
 	smsgvec := make([]conn.Mmsghdr, downlink.relayBatchSize)
 
@@ -728,6 +743,7 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 
 			siovec[ns].Base = &packetBuf[packetStart]
 			siovec[ns].SetLen(packetLength)
+			payloadLengthVec[ns] = payloadLength
 			ns++
 			payloadBytesSent += uint64(payloadLength)
 		}
@@ -737,8 +753,16 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 		}
 
 		for start := 0; start < ns; {
+			batchStart := start
 			n, err := downlink.serverConn.WriteMsgs(smsgvec[start:ns], 0)
 			start += n
+			if n > 0 {
+				var sentBytes uint64
+				for _, payloadLength := range payloadLengthVec[batchStart:start] {
+					sentBytes += uint64(payloadLength)
+				}
+				s.collector.CollectUDPSessionDownlink(downlink.username, uint64(n), sentBytes)
+			}
 			if err != nil {
 				downlink.logger.Warn("Failed to batch write packets to serverConn",
 					zap.Stringer("clientAddress", clientAddrPort),
@@ -768,5 +792,4 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
 
-	s.collector.CollectUDPSessionDownlink(downlink.username, packetsSent, payloadBytesSent)
 }

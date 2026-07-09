@@ -27,14 +27,15 @@ var errNetworkDisabled = errors.New("this network (tcp or udp) is disabled")
 // Config is the main configuration structure.
 // It may be marshaled as or unmarshaled from JSON.
 type Config struct {
-	Servers      []ServerConfig                   `json:"servers,omitzero"`
-	Clients      []ClientConfig                   `json:"clients,omitzero"`
-	ClientGroups []clientgroups.ClientGroupConfig `json:"clientGroups,omitzero"`
-	DNS          []dns.ResolverConfig             `json:"dns,omitzero"`
-	Router       router.Config                    `json:"router,omitzero"`
-	Stats        stats.Config                     `json:"stats,omitzero"` // obsolete
-	API          api.Config                       `json:"api,omitzero"`
-	TLSCerts     tlscerts.Config                  `json:"certs,omitzero"`
+	Servers       []ServerConfig                   `json:"servers,omitzero"`
+	Clients       []ClientConfig                   `json:"clients,omitzero"`
+	ClientGroups  []clientgroups.ClientGroupConfig `json:"clientGroups,omitzero"`
+	DNS           []dns.ResolverConfig             `json:"dns,omitzero"`
+	Router        router.Config                    `json:"router,omitzero"`
+	Stats         stats.Config                     `json:"stats,omitzero"` // obsolete
+	API           api.Config                       `json:"api,omitzero"`
+	TLSCerts      tlscerts.Config                  `json:"certs,omitzero"`
+	RuntimeAccess bool                             `json:"-"`
 }
 
 // Migrate migrates deprecated fields to their new equivalents
@@ -246,7 +247,7 @@ func (sc *Config) Manager(logger *zap.Logger) (*Manager, error) {
 		statsConfig  stats.Config
 	)
 
-	if sc.API.Enabled {
+	if sc.API.Enabled || sc.RuntimeAccess {
 		serverByName = make(map[string]ssm.Server, len(sc.Servers))
 		serverNames = make([]string, len(sc.Servers))
 		statsConfig.Enabled = true
@@ -294,6 +295,7 @@ func (sc *Config) Manager(logger *zap.Logger) (*Manager, error) {
 		notifyReload: newReloadNotifier(logger, credmgr, tlsCertStore),
 		services:     services,
 		router:       router,
+		serverByName: serverByName,
 		logger:       logger,
 	}, nil
 }
@@ -303,6 +305,7 @@ type Manager struct {
 	notifyReload reloadNotifier
 	services     []shadowsocks.Service
 	router       *router.Router
+	serverByName map[string]ssm.Server
 	logger       *zap.Logger
 }
 
