@@ -19,6 +19,7 @@ type Config struct {
 	AliveIPReportSeconds int
 	TCPConnectTimeout    int
 	TCPIdleTimeout       int
+	TCPMetricsSeconds    int
 	UDPIdleTimeout       int
 	UDPMTU               int
 	UDPReadBufferBytes   int
@@ -43,8 +44,9 @@ func LoadConfig() Config {
 		AliveIPReportSeconds: getenvInt("ALIVE_IP_REPORT_SECONDS", 60),
 		TCPConnectTimeout:    getenvInt("TCP_CONNECT_TIMEOUT", 10),
 		TCPIdleTimeout:       getenvInt("TCP_IDLE_TIMEOUT", 300),
+		TCPMetricsSeconds:    getenvInt("TCP_METRICS_SECONDS", 60),
 		UDPIdleTimeout:       getenvInt("UDP_IDLE_TIMEOUT", 300),
-		UDPMTU:               getenvInt("UDP_MTU", 1500),
+		UDPMTU:               getenvInt("UDP_MTU", 1496),
 		UDPReadBufferBytes:   getenvInt("UDP_READ_BUFFER_BYTES", 4<<20),
 		UDPWriteBufferBytes:  getenvInt("UDP_WRITE_BUFFER_BYTES", 4<<20),
 		UDPMetricsSeconds:    getenvInt("UDP_METRICS_SECONDS", 60),

@@ -79,19 +79,12 @@ type udpRuntimeMetrics struct {
 }
 
 func newUDPRuntime(config Config, state *RuntimeState) *udpRuntime {
-	mtu := config.UDPMTU
-	if mtu < 1280 {
-		mtu = 1500
-	}
-	if mtu > 65535 {
-		mtu = 65535
-	}
 	r := &udpRuntime{
 		config:         config,
 		state:          state,
 		users:          make(map[string]*User),
 		sessions:       make(map[uint64]*udpSession),
-		packetCapacity: udpPacketHeadroom + max(1500, mtu) + 32,
+		packetCapacity: udpPacketHeadroom + config.UDPMTU + 32,
 	}
 	r.packetPool.New = func() any {
 		return &udpQueuedPacket{buf: make([]byte, r.packetCapacity)}
@@ -483,11 +476,5 @@ func (r *udpRuntime) idleTimeout() time.Duration {
 }
 
 func (r *udpRuntime) udpMTU() int {
-	if r.config.UDPMTU < 1280 {
-		return 1500
-	}
-	if r.config.UDPMTU > 65535 {
-		return 65535
-	}
 	return r.config.UDPMTU
 }

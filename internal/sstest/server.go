@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	ssconn "github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/direct"
 	"github.com/database64128/shadowsocks-go/zerocopy"
 )
@@ -26,6 +27,7 @@ type Server struct {
 	port     int
 	udp      *udpRuntime
 	tcp      *tcpRuntime
+	tcpOut   *direct.TCPClient
 }
 
 func NewServer(config Config, state *RuntimeState) *Server {
@@ -34,6 +36,7 @@ func NewServer(config Config, state *RuntimeState) *Server {
 		state:  state,
 		udp:    newUDPRuntime(config, state),
 		tcp:    newTCPRuntime(),
+		tcpOut: direct.NewTCPClient("direct", "tcp", ssconn.DefaultTCPDialer),
 	}
 }
 
@@ -96,6 +99,13 @@ func (s *Server) Restart(port int) error {
 	s.mu.Unlock()
 	log.Printf("SS2022 Go TCP server listening on %s", addr)
 	log.Printf("SS2022 Go UDP server listening on %s", addr)
+	log.Printf(
+		"SS2022 UDP configured: mtu=%d padding=NoPadding queue=%d read_buffer=%d write_buffer=%d",
+		s.config.UDPMTU,
+		s.config.UDPQueueSize,
+		s.config.UDPReadBufferBytes,
+		s.config.UDPWriteBufferBytes,
+	)
 	go s.udp.serve(udpConn)
 	go s.udp.reportMetrics(udpConn, s.currentUDPConn)
 	go s.udp.flushTraffic(udpConn, s.currentUDPConn)
@@ -123,6 +133,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}
 
+	go s.tcp.reportMetrics(ctx, time.Duration(s.config.TCPMetricsSeconds)*time.Second)
 	for {
 		s.mu.RLock()
 		ln := s.listener
@@ -159,35 +170,40 @@ func (s *Server) handleTCP(client net.Conn) {
 		log.Printf("debug: connection closed from %s: %v", clientIP, err)
 		return
 	}
-	if isDisconnectIP(user, clientIP) || isForbiddenPort(user, target.Port) || isForbiddenHost(user, target.Host) {
+	if isDisconnectIP(user, clientIP) ||
+		isForbiddenPort(user, int(target.Port())) ||
+		isForbiddenHost(user, target.Host()) {
 		return
 	}
 	s.state.AddAliveIP(user.ID, clientIP)
+	s.tcp.metrics.accepted.Add(1)
+	s.tcp.metrics.active.Add(1)
+	defer s.tcp.metrics.active.Add(-1)
 
-	remoteConn, err := net.DialTimeout(
-		"tcp",
-		fmt.Sprintf("%s:%d", target.Host, target.Port),
+	dialStartedAt := time.Now()
+	dialContext, cancelDial := context.WithTimeout(
+		context.Background(),
 		time.Duration(s.config.TCPConnectTimeout)*time.Second,
 	)
+	remoteRaw, remoteRW, err := s.tcpOut.Dial(dialContext, target, initialPayload)
+	cancelDial()
+	s.tcp.metrics.dialCount.Add(1)
+	s.tcp.metrics.dialNanos.Add(uint64(time.Since(dialStartedAt)))
 	if err != nil {
+		s.tcp.metrics.dialErrors.Add(1)
 		log.Printf("debug: dial target failed from %s: %v", clientIP, err)
 		return
 	}
-	defer remoteConn.Close()
-	tuneTCP(remoteConn)
-	remote, ok := remoteConn.(*net.TCPConn)
+	s.tcp.metrics.uploadBytes.Add(uint64(len(initialPayload)))
+	defer remoteRaw.Close()
+	remote, ok := remoteRaw.(*net.TCPConn)
 	if !ok {
 		return
 	}
+	tuneTCP(remote)
 
 	_ = client.SetDeadline(time.Time{})
 	_ = remote.SetDeadline(time.Time{})
-
-	if len(initialPayload) > 0 {
-		if err := writeFull(remote, initialPayload); err != nil {
-			return
-		}
-	}
 
 	done := make(chan struct{}, 2)
 	flushBytes := s.config.TrafficFlushBytes
@@ -195,7 +211,6 @@ func (s *Server) handleTCP(client net.Conn) {
 		flushBytes = 1 << 20
 	}
 
-	remoteRW := direct.NewDirectStreamReadWriter(remote)
 	uploadWriter := &trafficWriter{
 		writer:    remoteRW,
 		state:     s.state,
@@ -203,12 +218,14 @@ func (s *Server) handleTCP(client net.Conn) {
 		upload:    true,
 		threshold: flushBytes,
 		pending:   int64(len(initialPayload)),
+		counter:   &s.tcp.metrics.uploadBytes,
 	}
 	downloadWriter := &trafficWriter{
 		writer:    clientRW,
 		state:     s.state,
 		userID:    user.ID,
 		threshold: flushBytes,
+		counter:   &s.tcp.metrics.downloadBytes,
 	}
 
 	go func() {
@@ -216,6 +233,7 @@ func (s *Server) handleTCP(client net.Conn) {
 		uploadWriter.flush()
 		_ = remote.CloseWrite()
 		if err != nil && !isExpectedCloseError(err) {
+			s.tcp.metrics.relayErrors.Add(1)
 			log.Printf("debug: uplink closed from %s: %v", clientIP, err)
 		}
 		done <- struct{}{}
@@ -226,6 +244,7 @@ func (s *Server) handleTCP(client net.Conn) {
 		downloadWriter.flush()
 		_ = tcpClient.CloseWrite()
 		if err != nil && !isExpectedCloseError(err) {
+			s.tcp.metrics.relayErrors.Add(1)
 			log.Printf("debug: downlink closed to %s: %v", clientIP, err)
 		}
 		done <- struct{}{}
@@ -254,20 +273,6 @@ func tuneUDP(conn *net.UDPConn, config Config) {
 	if config.UDPWriteBufferBytes > 0 {
 		_ = conn.SetWriteBuffer(config.UDPWriteBufferBytes)
 	}
-}
-
-func writeFull(conn net.Conn, payload []byte) error {
-	for len(payload) > 0 {
-		n, err := conn.Write(payload)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		payload = payload[n:]
-	}
-	return nil
 }
 
 func isExpectedCloseError(err error) bool {

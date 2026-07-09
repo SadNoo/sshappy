@@ -13,6 +13,9 @@ func Run(ctx context.Context, config Config) error {
 	if config.NodeID <= 0 {
 		return fmt.Errorf("node_id/NODE_ID must be set")
 	}
+	if config.UDPMTU < 1280 || config.UDPMTU > 65535 {
+		return fmt.Errorf("UDP_MTU must be between 1280 and 65535, got %d", config.UDPMTU)
+	}
 	db, err := OpenDatabase(config)
 	if err != nil {
 		return err

@@ -1,10 +1,15 @@
 package sstest
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	ssconn "github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/ss2022"
 	"github.com/database64128/shadowsocks-go/zerocopy"
 )
@@ -14,6 +19,18 @@ type tcpRuntime struct {
 	protocol      *ss2022.TCPServer
 	serverKeyHash [sha256.Size]byte
 	users         map[string]*User
+	metrics       tcpRuntimeMetrics
+}
+
+type tcpRuntimeMetrics struct {
+	accepted      atomic.Uint64
+	active        atomic.Int64
+	dialCount     atomic.Uint64
+	dialErrors    atomic.Uint64
+	dialNanos     atomic.Uint64
+	relayErrors   atomic.Uint64
+	uploadBytes   atomic.Uint64
+	downloadBytes atomic.Uint64
 }
 
 func newTCPRuntime() *tcpRuntime {
@@ -57,7 +74,7 @@ func (r *tcpRuntime) configure(node NodeInfo, users []User) error {
 
 func (r *tcpRuntime) accept(raw zerocopy.DirectReadWriteCloser) (
 	zerocopy.ReadWriter,
-	TargetAddress,
+	ssconn.Addr,
 	[]byte,
 	*User,
 	error,
@@ -67,17 +84,17 @@ func (r *tcpRuntime) accept(raw zerocopy.DirectReadWriteCloser) (
 	protocol := r.protocol
 	users := r.users
 	if protocol == nil {
-		return nil, TargetAddress{}, nil, nil, fmt.Errorf("TCP protocol is not configured")
+		return nil, ssconn.Addr{}, nil, nil, fmt.Errorf("TCP protocol is not configured")
 	}
 	rw, target, payload, username, err := protocol.Accept(raw)
 	if err != nil {
-		return nil, TargetAddress{}, nil, nil, err
+		return nil, ssconn.Addr{}, nil, nil, err
 	}
 	user := users[username]
 	if user == nil {
-		return nil, TargetAddress{}, nil, nil, fmt.Errorf("unknown TCP user")
+		return nil, ssconn.Addr{}, nil, nil, fmt.Errorf("unknown TCP user")
 	}
-	return rw, TargetAddress{Host: target.Host(), Port: int(target.Port())}, payload, user, nil
+	return rw, target, payload, user, nil
 }
 
 type trafficWriter struct {
@@ -87,6 +104,7 @@ type trafficWriter struct {
 	upload    bool
 	threshold int64
 	pending   int64
+	counter   *atomic.Uint64
 }
 
 func (w *trafficWriter) WriterInfo() zerocopy.WriterInfo {
@@ -96,6 +114,9 @@ func (w *trafficWriter) WriterInfo() zerocopy.WriterInfo {
 func (w *trafficWriter) WriteZeroCopy(buf []byte, payloadStart, payloadLen int) (int, error) {
 	n, err := w.writer.WriteZeroCopy(buf, payloadStart, payloadLen)
 	w.pending += int64(n)
+	if w.counter != nil {
+		w.counter.Add(uint64(n))
+	}
 	if w.pending >= w.threshold {
 		w.flush()
 	}
@@ -112,4 +133,34 @@ func (w *trafficWriter) flush() {
 		w.state.AddTraffic(w.userID, 0, w.pending)
 	}
 	w.pending = 0
+}
+
+func (r *tcpRuntime) reportMetrics(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dialCount := r.metrics.dialCount.Load()
+			var averageDialMillis uint64
+			if dialCount > 0 {
+				averageDialMillis = r.metrics.dialNanos.Load() / dialCount / uint64(time.Millisecond)
+			}
+			log.Printf(
+				"tcp metrics: accepted=%d active=%d dial_errors=%d relay_errors=%d upload_bytes=%d download_bytes=%d average_dial_ms=%d",
+				r.metrics.accepted.Load(),
+				r.metrics.active.Load(),
+				r.metrics.dialErrors.Load(),
+				r.metrics.relayErrors.Load(),
+				r.metrics.uploadBytes.Load(),
+				r.metrics.downloadBytes.Load(),
+				averageDialMillis,
+			)
+		}
+	}
 }
