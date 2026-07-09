@@ -8,97 +8,44 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-)
 
-type registry struct {
-	node            NodeInfo
-	usersByIdentity map[[16]byte]*User
-	ready           bool
-}
+	"github.com/database64128/shadowsocks-go/direct"
+	"github.com/database64128/shadowsocks-go/zerocopy"
+)
 
 type Server struct {
 	config Config
 	state  *RuntimeState
 
-	mu              sync.RWMutex
-	registry        registry
-	listener        net.Listener
-	udpConn         *net.UDPConn
-	port            int
-	udpMu           sync.Mutex
-	udpAssociations map[udpAssociationKey]*udpAssociation
-	udpMetrics      udpMetrics
-	udpJobs         chan udpJob
-	udpWorkerOnce   sync.Once
-}
-
-type udpJob struct {
-	inbound    *net.UDPConn
-	data       []byte
-	clientAddr *net.UDPAddr
-}
-
-type udpAssociationKey struct {
-	clientAddr      string
-	userID          int
-	clientSessionID uint64
-	targetHost      string
-	targetPort      int
-}
-
-type udpAssociation struct {
-	mu              sync.Mutex
-	key             udpAssociationKey
-	target          TargetAddress
-	user            *User
-	clientAddr      *net.UDPAddr
-	clientSessionID uint64
-	serverSessionID uint64
-	pendingPacketID []uint64
-	conn            *net.UDPConn
-	lastSeen        time.Time
-}
-
-type udpMetrics struct {
-	rxPackets           atomic.Uint64
-	rxBytes             atomic.Uint64
-	txPackets           atomic.Uint64
-	txBytes             atomic.Uint64
-	dropDecrypt         atomic.Uint64
-	dropForbidden       atomic.Uint64
-	dropTargetOpen      atomic.Uint64
-	dropTargetWrite     atomic.Uint64
-	dropResponseEncrypt atomic.Uint64
-	dropResponseWrite   atomic.Uint64
-	dropQueueFull       atomic.Uint64
+	mu       sync.RWMutex
+	listener net.Listener
+	udpConn  *net.UDPConn
+	port     int
+	udp      *udpRuntime
+	tcp      *tcpRuntime
 }
 
 func NewServer(config Config, state *RuntimeState) *Server {
-	queueSize := config.UDPQueueSize
-	if queueSize <= 0 {
-		queueSize = 4096
-	}
 	return &Server{
-		config:          config,
-		state:           state,
-		udpAssociations: make(map[udpAssociationKey]*udpAssociation),
-		udpJobs:         make(chan udpJob, queueSize),
+		config: config,
+		state:  state,
+		udp:    newUDPRuntime(config, state),
+		tcp:    newTCPRuntime(),
 	}
 }
 
 func (s *Server) Apply(node NodeInfo, users []User) error {
-	usersByIdentity := make(map[[16]byte]*User, len(users))
-	for i := range users {
-		usersByIdentity[users[i].IdentityHash] = &users[i]
+	if err := s.udp.configure(node, users); err != nil {
+		return err
+	}
+	if err := s.tcp.configure(node, users); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
-	s.registry = registry{node: node, usersByIdentity: usersByIdentity, ready: true}
 	needRestart := s.listener == nil || s.port != node.ListenPort
 	s.mu.Unlock()
 
@@ -124,7 +71,7 @@ func (s *Server) Restart(port int) error {
 	if oldUDP != nil {
 		_ = oldUDP.Close()
 	}
-	s.closeUDPAssociations()
+	s.udp.closeAll()
 
 	addr := fmt.Sprintf("%s:%d", s.config.ListenHost, port)
 	ln, err := net.Listen("tcp", addr)
@@ -149,11 +96,16 @@ func (s *Server) Restart(port int) error {
 	s.mu.Unlock()
 	log.Printf("SS2022 Go TCP server listening on %s", addr)
 	log.Printf("SS2022 Go UDP server listening on %s", addr)
-	s.startUDPWorkers()
-	go s.serveUDP(udpConn)
-	go s.cleanupUDPLoop(udpConn)
-	go s.reportUDPMetricsLoop(udpConn)
+	go s.udp.serve(udpConn)
+	go s.udp.reportMetrics(udpConn, s.currentUDPConn)
+	go s.udp.flushTraffic(udpConn, s.currentUDPConn)
 	return nil
+}
+
+func (s *Server) currentUDPConn() *net.UDPConn {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.udpConn
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -192,47 +144,49 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) handleTCP(client net.Conn) {
 	defer client.Close()
 	tuneTCP(client)
+	tcpClient, ok := client.(*net.TCPConn)
+	if !ok {
+		return
+	}
 	clientIP := ""
-	if addr, ok := client.RemoteAddr().(*net.TCPAddr); ok {
+	if addr, ok := tcpClient.RemoteAddr().(*net.TCPAddr); ok {
 		clientIP = addr.IP.String()
 	}
 
-	s.mu.RLock()
-	reg := s.registry
-	s.mu.RUnlock()
-	if !reg.ready {
-		return
-	}
-
 	_ = client.SetDeadline(time.Now().Add(time.Duration(s.config.TCPConnectTimeout) * time.Second))
-	req, err := readClientRequest(client, reg.usersByIdentity, reg.node.ServerKey)
+	clientRW, target, initialPayload, user, err := s.tcp.accept(tcpClient)
 	if err != nil {
 		log.Printf("debug: connection closed from %s: %v", clientIP, err)
 		return
 	}
-	user := req.User
-	if isDisconnectIP(user, clientIP) || isForbiddenPort(user, req.Target.Port) || isForbiddenHost(user, req.Target.Host) {
+	if isDisconnectIP(user, clientIP) || isForbiddenPort(user, target.Port) || isForbiddenHost(user, target.Host) {
 		return
 	}
 	s.state.AddAliveIP(user.ID, clientIP)
 
-	remote, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", req.Target.Host, req.Target.Port), time.Duration(s.config.TCPConnectTimeout)*time.Second)
+	remoteConn, err := net.DialTimeout(
+		"tcp",
+		fmt.Sprintf("%s:%d", target.Host, target.Port),
+		time.Duration(s.config.TCPConnectTimeout)*time.Second,
+	)
 	if err != nil {
 		log.Printf("debug: dial target failed from %s: %v", clientIP, err)
 		return
 	}
-	defer remote.Close()
-	tuneTCP(remote)
+	defer remoteConn.Close()
+	tuneTCP(remoteConn)
+	remote, ok := remoteConn.(*net.TCPConn)
+	if !ok {
+		return
+	}
 
 	_ = client.SetDeadline(time.Time{})
 	_ = remote.SetDeadline(time.Time{})
 
-	var uploadInitial int64
-	if len(req.InitialPayload) > 0 {
-		if err := writeFull(remote, req.InitialPayload); err != nil {
+	if len(initialPayload) > 0 {
+		if err := writeFull(remote, initialPayload); err != nil {
 			return
 		}
-		uploadInitial = int64(len(req.InitialPayload))
 	}
 
 	done := make(chan struct{}, 2)
@@ -241,333 +195,44 @@ func (s *Server) handleTCP(client net.Conn) {
 		flushBytes = 1 << 20
 	}
 
+	remoteRW := direct.NewDirectStreamReadWriter(remote)
+	uploadWriter := &trafficWriter{
+		writer:    remoteRW,
+		state:     s.state,
+		userID:    user.ID,
+		upload:    true,
+		threshold: flushBytes,
+		pending:   int64(len(initialPayload)),
+	}
+	downloadWriter := &trafficWriter{
+		writer:    clientRW,
+		state:     s.state,
+		userID:    user.ID,
+		threshold: flushBytes,
+	}
+
 	go func() {
-		defer func() { done <- struct{}{} }()
-		localUpload := uploadInitial
-		lenCipher := make([]byte, 2+tagLen)
-		payloadCipher := make([]byte, tcpMaxPayloadSize+tagLen)
-		for {
-			payload, nextPayloadCipher, err := readClientPayloadBuffered(client, req.Decryptor, lenCipher, payloadCipher)
-			payloadCipher = nextPayloadCipher
-			if err != nil {
-				if !isExpectedCloseError(err) {
-					log.Printf("debug: uplink closed from %s: %v", clientIP, err)
-				}
-				break
-			}
-			if err := writeFull(remote, payload); err != nil {
-				break
-			}
-			localUpload += int64(len(payload))
-			if localUpload >= flushBytes {
-				s.state.AddTraffic(user.ID, localUpload, 0)
-				localUpload = 0
-			}
+		_, err := zerocopy.Relay(uploadWriter, clientRW)
+		uploadWriter.flush()
+		_ = remote.CloseWrite()
+		if err != nil && !isExpectedCloseError(err) {
+			log.Printf("debug: uplink closed from %s: %v", clientIP, err)
 		}
-		s.state.AddTraffic(user.ID, localUpload, 0)
+		done <- struct{}{}
 	}()
 
 	go func() {
-		defer func() { done <- struct{}{} }()
-		buf := make([]byte, tcpMaxPayloadSize)
-		writeBuf := make([]byte, 0, tcpMaxPayloadSize+2+2*tagLen+saltLen+64)
-		var encryptor *aeadStream
-		var localDownload int64
-		for {
-			n, err := remote.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				if encryptor == nil {
-					encryptor, writeBuf, err = writeResponseHeaderAndPayload(client, user.UserKey, req.RequestSalt, chunk, writeBuf)
-				} else {
-					writeBuf, err = writeResponsePayload(client, encryptor, chunk, writeBuf)
-				}
-				if err != nil {
-					break
-				}
-				localDownload += int64(n)
-				if localDownload >= flushBytes {
-					s.state.AddTraffic(user.ID, 0, localDownload)
-					localDownload = 0
-				}
-			}
-			if err != nil {
-				break
-			}
+		_, err := zerocopy.Relay(downloadWriter, remoteRW)
+		downloadWriter.flush()
+		_ = tcpClient.CloseWrite()
+		if err != nil && !isExpectedCloseError(err) {
+			log.Printf("debug: downlink closed to %s: %v", clientIP, err)
 		}
-		s.state.AddTraffic(user.ID, 0, localDownload)
+		done <- struct{}{}
 	}()
 
 	<-done
-	_ = client.Close()
-	_ = remote.Close()
 	<-done
-}
-
-func (s *Server) serveUDP(conn *net.UDPConn) {
-	buf := make([]byte, udpMaxPacketSize)
-	for {
-		n, addr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			return
-		}
-		s.udpMetrics.rxPackets.Add(1)
-		s.udpMetrics.rxBytes.Add(uint64(n))
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		select {
-		case s.udpJobs <- udpJob{inbound: conn, data: data, clientAddr: addr}:
-		default:
-			s.udpMetrics.dropQueueFull.Add(1)
-		}
-	}
-}
-
-func (s *Server) startUDPWorkers() {
-	s.udpWorkerOnce.Do(func() {
-		workers := s.config.UDPWorkers
-		if workers <= 0 {
-			workers = runtime.NumCPU() * 2
-		}
-		if workers < 1 {
-			workers = 1
-		}
-		for i := 0; i < workers; i++ {
-			go func() {
-				for job := range s.udpJobs {
-					s.handleUDPDatagram(job.inbound, job.data, job.clientAddr)
-				}
-			}()
-		}
-		log.Printf("UDP workers started: workers=%d queue=%d", workers, cap(s.udpJobs))
-	})
-}
-
-func (s *Server) handleUDPDatagram(inbound *net.UDPConn, data []byte, clientAddr *net.UDPAddr) {
-	s.mu.RLock()
-	reg := s.registry
-	currentInbound := s.udpConn
-	s.mu.RUnlock()
-	if !reg.ready || inbound != currentInbound {
-		return
-	}
-	clientIP := clientAddr.IP.String()
-	packet, err := decryptUDPClientPacket(data, reg.usersByIdentity, reg.node.ServerKey)
-	if err != nil {
-		s.udpMetrics.dropDecrypt.Add(1)
-		if !isExpectedCloseError(err) {
-			log.Printf("debug: udp packet dropped from %s: %v", clientIP, err)
-		}
-		return
-	}
-	user := packet.User
-	if isDisconnectIP(user, clientIP) || isForbiddenPort(user, packet.Target.Port) || isForbiddenHost(user, packet.Target.Host) {
-		s.udpMetrics.dropForbidden.Add(1)
-		return
-	}
-	s.state.AddAliveIP(user.ID, clientIP)
-	s.state.AddTraffic(user.ID, int64(len(packet.Payload)), 0)
-
-	assoc, err := s.getUDPAssociation(packet, clientAddr)
-	if err != nil {
-		s.udpMetrics.dropTargetOpen.Add(1)
-		log.Printf("debug: udp target open failed from %s: %v", clientIP, err)
-		return
-	}
-	assoc.enqueuePacket(packet.PacketID)
-	if _, err := assoc.conn.Write(packet.Payload); err != nil && !isExpectedCloseError(err) {
-		s.udpMetrics.dropTargetWrite.Add(1)
-		log.Printf("debug: udp target write failed from %s: %v", clientIP, err)
-	}
-}
-
-func (s *Server) getUDPAssociation(packet *UDPClientPacket, clientAddr *net.UDPAddr) (*udpAssociation, error) {
-	key := udpAssociationKey{
-		clientAddr:      clientAddr.String(),
-		userID:          packet.User.ID,
-		clientSessionID: packet.ClientSessionID,
-		targetHost:      packet.Target.Host,
-		targetPort:      packet.Target.Port,
-	}
-	s.udpMu.Lock()
-	if assoc := s.udpAssociations[key]; assoc != nil {
-		s.udpMu.Unlock()
-		return assoc, nil
-	}
-	s.udpMu.Unlock()
-
-	remoteAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", packet.Target.Host, packet.Target.Port))
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.DialUDP("udp", nil, remoteAddr)
-	if err != nil {
-		return nil, err
-	}
-	tuneUDP(conn, s.config)
-	assoc := &udpAssociation{
-		key:             key,
-		target:          packet.Target,
-		user:            packet.User,
-		clientAddr:      clientAddr,
-		clientSessionID: packet.ClientSessionID,
-		serverSessionID: makeUDPServerSessionID(),
-		pendingPacketID: make([]uint64, 0, 8),
-		conn:            conn,
-		lastSeen:        time.Now(),
-	}
-
-	s.udpMu.Lock()
-	if existing := s.udpAssociations[key]; existing != nil {
-		s.udpMu.Unlock()
-		_ = conn.Close()
-		return existing, nil
-	}
-	s.udpAssociations[key] = assoc
-	s.udpMu.Unlock()
-	go s.readUDPAssociation(assoc)
-	return assoc, nil
-}
-
-func (s *Server) readUDPAssociation(assoc *udpAssociation) {
-	buf := make([]byte, udpMaxPacketSize)
-	for {
-		n, err := assoc.conn.Read(buf)
-		if err != nil {
-			return
-		}
-		payload := make([]byte, n)
-		copy(payload, buf[:n])
-		s.handleUDPResponse(assoc, payload)
-	}
-}
-
-func (s *Server) handleUDPResponse(assoc *udpAssociation, payload []byte) {
-	s.mu.RLock()
-	inbound := s.udpConn
-	s.mu.RUnlock()
-	if inbound == nil {
-		return
-	}
-	packetID := assoc.nextPacketID()
-	response, err := encryptUDPServerPacket(assoc.user, assoc.target, payload, assoc.clientSessionID, packetID, assoc.serverSessionID)
-	if err != nil {
-		s.udpMetrics.dropResponseEncrypt.Add(1)
-		log.Printf("debug: udp response encrypt failed: %v", err)
-		return
-	}
-	if _, err := inbound.WriteToUDP(response, assoc.clientAddr); err != nil && !isExpectedCloseError(err) {
-		s.udpMetrics.dropResponseWrite.Add(1)
-		log.Printf("debug: udp response write failed: %v", err)
-		return
-	}
-	s.udpMetrics.txPackets.Add(1)
-	s.udpMetrics.txBytes.Add(uint64(len(payload)))
-	s.state.AddTraffic(assoc.user.ID, 0, int64(len(payload)))
-	s.state.AddAliveIP(assoc.user.ID, assoc.clientAddr.IP.String())
-}
-
-func (s *Server) cleanupUDPAssociations() {
-	cutoff := time.Now().Add(-time.Duration(s.config.UDPIdleTimeout) * time.Second)
-	s.udpMu.Lock()
-	defer s.udpMu.Unlock()
-	for key, assoc := range s.udpAssociations {
-		if assoc.lastSeenBefore(cutoff) {
-			_ = assoc.conn.Close()
-			delete(s.udpAssociations, key)
-		}
-	}
-}
-
-func (s *Server) closeUDPAssociations() {
-	s.udpMu.Lock()
-	defer s.udpMu.Unlock()
-	for key, assoc := range s.udpAssociations {
-		_ = assoc.conn.Close()
-		delete(s.udpAssociations, key)
-	}
-}
-
-func (a *udpAssociation) enqueuePacket(packetID uint64) {
-	a.mu.Lock()
-	a.pendingPacketID = append(a.pendingPacketID, packetID)
-	a.lastSeen = time.Now()
-	a.mu.Unlock()
-}
-
-func (a *udpAssociation) nextPacketID() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.lastSeen = time.Now()
-	if len(a.pendingPacketID) == 0 {
-		return 0
-	}
-	packetID := a.pendingPacketID[0]
-	copy(a.pendingPacketID, a.pendingPacketID[1:])
-	a.pendingPacketID = a.pendingPacketID[:len(a.pendingPacketID)-1]
-	return packetID
-}
-
-func (a *udpAssociation) lastSeenBefore(cutoff time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.lastSeen.Before(cutoff)
-}
-
-func (s *Server) cleanupUDPLoop(conn *net.UDPConn) {
-	interval := time.Duration(s.config.UDPIdleTimeout/2) * time.Second
-	if interval < 30*time.Second {
-		interval = 30 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.RLock()
-		current := s.udpConn
-		s.mu.RUnlock()
-		if current != conn {
-			return
-		}
-		s.cleanupUDPAssociations()
-	}
-}
-
-func (s *Server) reportUDPMetricsLoop(conn *net.UDPConn) {
-	interval := time.Duration(s.config.UDPMetricsSeconds) * time.Second
-	if interval <= 0 {
-		return
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.RLock()
-		current := s.udpConn
-		s.mu.RUnlock()
-		if current != conn {
-			return
-		}
-		log.Printf(
-			"udp metrics: rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d drop_decrypt=%d drop_forbidden=%d drop_target_open=%d drop_target_write=%d drop_response_encrypt=%d drop_response_write=%d drop_queue_full=%d associations=%d",
-			s.udpMetrics.rxPackets.Load(),
-			s.udpMetrics.rxBytes.Load(),
-			s.udpMetrics.txPackets.Load(),
-			s.udpMetrics.txBytes.Load(),
-			s.udpMetrics.dropDecrypt.Load(),
-			s.udpMetrics.dropForbidden.Load(),
-			s.udpMetrics.dropTargetOpen.Load(),
-			s.udpMetrics.dropTargetWrite.Load(),
-			s.udpMetrics.dropResponseEncrypt.Load(),
-			s.udpMetrics.dropResponseWrite.Load(),
-			s.udpMetrics.dropQueueFull.Load(),
-			s.udpAssociationCount(),
-		)
-	}
-}
-
-func (s *Server) udpAssociationCount() int {
-	s.udpMu.Lock()
-	defer s.udpMu.Unlock()
-	return len(s.udpAssociations)
 }
 
 func tuneTCP(conn net.Conn) {

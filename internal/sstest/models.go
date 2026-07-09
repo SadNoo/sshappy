@@ -1,16 +1,8 @@
 package sstest
 
 const (
-	method            = "2022-blake3-aes-256-gcm"
-	keyLen            = 32
-	saltLen           = 32
-	tagLen            = 16
-	identityHeaderLen = 16
-	tcpMaxPayloadSize = 0xffff
-	udpMaxPacketSize  = 65536
-	udpHeaderLen      = 16
-	udpClientType     = 0
-	udpServerType     = 1
+	method = "2022-blake3-aes-256-gcm"
+	keyLen = 32
 )
 
 type NodeInfo struct {

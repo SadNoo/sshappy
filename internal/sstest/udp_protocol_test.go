@@ -2,155 +2,140 @@ package sstest
 
 import (
 	"bytes"
-	"encoding/binary"
+	"context"
+	"net/netip"
 	"testing"
-	"time"
+
+	ssconn "github.com/database64128/shadowsocks-go/conn"
+	"github.com/database64128/shadowsocks-go/ss2022"
 )
 
-func TestUDPClientPacketIdentifiesUserAndPayload(t *testing.T) {
+func TestUpstreamUDPRejectsReplayAndRoundTrips(t *testing.T) {
 	serverKey := make([]byte, 32)
 	userKey := make([]byte, 32)
 	for i := range serverKey {
 		serverKey[i] = byte(i)
 		userKey[i] = byte(31 - i)
 	}
-	user := udpTestUser(userKey)
-	target := TargetAddress{Host: "8.8.8.8", Port: 53}
-	payload := []byte{0x12, 0x34, 'd', 'n', 's'}
-	packet := makeUDPClientTestPacket(t, serverKey, userKey, 0x0102030405060708, 9, target, payload)
+	identityConfig, err := ss2022.NewServerIdentityCipherConfig(serverKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := ss2022.NewUDPServer(
+		ss2022.DefaultSlidingWindowFilterSize,
+		ss2022.UserCipherConfig{},
+		identityConfig,
+		ss2022.NoPadding,
+	)
+	serverUser, err := ss2022.NewServerUserCipherConfig("7", userKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.ReplaceUserLookupMap(ss2022.UserLookupMap{
+		ss2022.PSKHash(userKey): serverUser,
+	})
+	clientConfig, err := ss2022.NewClientCipherConfig(userKey, [][]byte{serverKey}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := netip.MustParseAddrPort("127.0.0.1:23336")
+	client := ss2022.NewUDPClient(
+		"test",
+		"ip",
+		ssconn.AddrFromIPPort(serverAddr),
+		1500,
+		ssconn.DefaultUDPClientListenConfig,
+		ss2022.DefaultSlidingWindowFilterSize,
+		clientConfig,
+		ss2022.NoPadding,
+	)
+	_, clientSession, err := client.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	decoded, err := decryptUDPClientPacket(packet, map[[16]byte]*User{user.IdentityHash: user}, serverKey)
+	buf := make([]byte, udpPacketCapacity)
+	payload := []byte("upstream-udp")
+	copy(buf[udpPacketHeadroom:], payload)
+	targetAddr := netip.MustParseAddrPort("127.0.0.1:5353")
+	_, packetStart, packetLen, err := clientSession.Packer.PackInPlace(
+		context.Background(),
+		buf,
+		ssconn.AddrFromIPPort(targetAddr),
+		udpPacketHeadroom,
+		len(payload),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.User.ID != user.ID {
-		t.Fatalf("user id = %d", decoded.User.ID)
+	replay := append([]byte(nil), buf[packetStart:packetStart+packetLen]...)
+	packet := buf[packetStart : packetStart+packetLen]
+	clientSessionID, err := server.SessionInfo(packet)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if decoded.Target != target {
-		t.Fatalf("target = %#v", decoded.Target)
+	unpacker, username, err := server.NewUnpacker(packet, clientSessionID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(decoded.Payload, payload) {
-		t.Fatalf("payload = %x", decoded.Payload)
+	if username != "7" {
+		t.Fatalf("username = %q", username)
 	}
-	if decoded.ClientSessionID != 0x0102030405060708 || decoded.PacketID != 9 {
-		t.Fatalf("session/packet = %x/%d", decoded.ClientSessionID, decoded.PacketID)
+	target, payloadStart, payloadLen, err := unpacker.UnpackInPlace(
+		buf,
+		netip.MustParseAddrPort("127.0.0.1:40000"),
+		packetStart,
+		packetLen,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	if !target.Equals(ssconn.AddrFromIPPort(targetAddr)) {
+		t.Fatalf("target = %s", target)
+	}
+	if !bytes.Equal(buf[payloadStart:payloadStart+payloadLen], payload) {
+		t.Fatalf("payload = %x", buf[payloadStart:payloadStart+payloadLen])
+	}
 
-func TestUDPServerPacketRoundTrips(t *testing.T) {
-	userKey := make([]byte, 32)
-	for i := range userKey {
-		userKey[i] = byte(31 - i)
+	replayBuf := make([]byte, udpPacketHeadroom+len(replay)+32)
+	copy(replayBuf[udpPacketHeadroom:], replay)
+	replayPacket := replayBuf[udpPacketHeadroom : udpPacketHeadroom+len(replay)]
+	if _, err := server.SessionInfo(replayPacket); err != nil {
+		t.Fatal(err)
 	}
-	user := udpTestUser(userKey)
-	target := TargetAddress{Host: "1.1.1.1", Port: 53}
-	payload := []byte{0xab, 0xcd, 'r', 'e', 'p', 'l', 'y'}
+	if _, _, _, err := unpacker.UnpackInPlace(
+		replayBuf,
+		netip.MustParseAddrPort("127.0.0.1:40000"),
+		udpPacketHeadroom,
+		len(replay),
+	); err == nil {
+		t.Fatal("replayed packet was accepted")
+	}
 
-	packet, err := encryptUDPServerPacket(user, target, payload, 3, 4, 5)
+	packer, err := unpacker.NewPacker()
 	if err != nil {
 		t.Fatal(err)
 	}
-	header, err := aesECBDecryptBlock(userKey, packet[:16])
+	packetStart, packetLen, err = packer.PackInPlace(
+		buf,
+		targetAddr,
+		payloadStart,
+		payloadLen,
+		1472,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sessionIDBytes [8]byte
-	binary.BigEndian.PutUint64(sessionIDBytes[:], 5)
-	block, err := newAESGCM(deriveSessionSubkey(userKey, sessionIDBytes[:]))
+	source, payloadStart, payloadLen, err := clientSession.Unpacker.UnpackInPlace(
+		buf,
+		serverAddr,
+		packetStart,
+		packetLen,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, err := block.Open(nil, header[4:16], packet[16:], nil)
-	if err != nil {
-		t.Fatal(err)
+	if source != targetAddr || !bytes.Equal(buf[payloadStart:payloadStart+payloadLen], payload) {
+		t.Fatalf("response source=%s payload=%x", source, buf[payloadStart:payloadStart+payloadLen])
 	}
-	if plaintext[0] != udpServerType {
-		t.Fatalf("type = %d", plaintext[0])
-	}
-	if binary.BigEndian.Uint64(plaintext[9:17]) != 3 {
-		t.Fatalf("client session = %d", binary.BigEndian.Uint64(plaintext[9:17]))
-	}
-	if plaintext[17] != 0 || plaintext[18] != 0 {
-		t.Fatalf("padding length = %x", plaintext[17:19])
-	}
-	decodedTarget, offset, err := parseTargetAddress(plaintext, 19)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decodedTarget != target {
-		t.Fatalf("target = %#v", decodedTarget)
-	}
-	if !bytes.Equal(plaintext[offset:], payload) {
-		t.Fatalf("payload = %x", plaintext[offset:])
-	}
-}
-
-func TestUDPAssociationPacketIDsAreFIFO(t *testing.T) {
-	assoc := &udpAssociation{
-		pendingPacketID: make([]uint64, 0, 2),
-		lastSeen:        time.Now(),
-	}
-	assoc.enqueuePacket(11)
-	assoc.enqueuePacket(12)
-	if got := assoc.nextPacketID(); got != 11 {
-		t.Fatalf("first packet id = %d", got)
-	}
-	if got := assoc.nextPacketID(); got != 12 {
-		t.Fatalf("second packet id = %d", got)
-	}
-}
-
-func udpTestUser(userKey []byte) *User {
-	return &User{
-		ID:           7,
-		Email:        "u@example.test",
-		Passwd:       "passwd",
-		UserKey:      userKey,
-		IdentityHash: identityHash(userKey),
-	}
-}
-
-func makeUDPClientTestPacket(t *testing.T, serverKey []byte, userKey []byte, sessionID uint64, packetID uint64, target TargetAddress, payload []byte) []byte {
-	t.Helper()
-	header := make([]byte, 16)
-	binary.BigEndian.PutUint64(header[:8], sessionID)
-	binary.BigEndian.PutUint64(header[8:16], packetID)
-	identity := identityHash(userKey)
-	identityPlain := make([]byte, 16)
-	for i := range identityPlain {
-		identityPlain[i] = identity[i] ^ header[i]
-	}
-	packedTarget, err := packTargetAddress(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plaintext := make([]byte, 0, 1+8+2+len(packedTarget)+len(payload))
-	plaintext = append(plaintext, udpClientType)
-	var tmp [8]byte
-	binary.BigEndian.PutUint64(tmp[:], uint64(time.Now().Unix()))
-	plaintext = append(plaintext, tmp[:]...)
-	plaintext = append(plaintext, 0, 0)
-	plaintext = append(plaintext, packedTarget...)
-	plaintext = append(plaintext, payload...)
-
-	var sessionIDBytes [8]byte
-	binary.BigEndian.PutUint64(sessionIDBytes[:], sessionID)
-	block, err := newAESGCM(deriveSessionSubkey(userKey, sessionIDBytes[:]))
-	if err != nil {
-		t.Fatal(err)
-	}
-	encrypted := block.Seal(nil, header[4:16], plaintext, nil)
-	encryptedHeader, err := aesECBEncryptBlock(serverKey, header)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedIdentity, err := aesECBEncryptBlock(serverKey, identityPlain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := make([]byte, 0, len(encryptedHeader)+len(encryptedIdentity)+len(encrypted))
-	out = append(out, encryptedHeader...)
-	out = append(out, encryptedIdentity...)
-	out = append(out, encrypted...)
-	return out
 }
