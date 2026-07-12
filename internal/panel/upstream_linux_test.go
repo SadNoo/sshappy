@@ -41,16 +41,17 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 	}
 	defer logger.Sync()
 	config := Config{
-		ListenHost:             "127.0.0.1",
-		EnableTCP:              true,
-		EnableUDP:              false,
-		UDPMTU:                 1496,
-		UDPRelayBatchSize:      256,
-		UDPServerBatchSize:     64,
-		UDPSendQueueSize:       1024,
-		CredentialPath:         credentialPath,
-		SyncIntervalSeconds:    60,
-		TCPTrafficFlushSeconds: 1,
+		ListenHost:               "127.0.0.1",
+		EnableTCP:                true,
+		EnableUDP:                false,
+		UDPMTU:                   1496,
+		UDPRelayBatchSize:        256,
+		UDPServerBatchSize:       64,
+		UDPSendQueueSize:         1024,
+		CredentialPath:           credentialPath,
+		SyncIntervalSeconds:      60,
+		TCPMaxConnectionsPerUser: 1,
+		TCPTrafficFlushSeconds:   1,
 	}
 	manager, _, err := newManager(config, Node{ID: 1, ListenPort: port, ServerKey: serverKey}, runtime, logger)
 	if err != nil {
@@ -120,6 +121,26 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 		t.Fatal("TCP response mismatch")
 	}
 	waitForTrafficTotals(t, state, int64(len(payload)), int64(len(payload)), 3*time.Second)
+
+	rejectedConnection, err := client.DialStream(
+		context.Background(),
+		conn.AddrFromIPPort(echoListener.Addr().(*net.TCPAddr).AddrPort()),
+		[]byte("over-user-limit"),
+	)
+	if err == nil {
+		defer rejectedConnection.Close()
+		if err := rejectedConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var b [1]byte
+		_, readErr := rejectedConnection.Read(b[:])
+		if readErr == nil {
+			t.Fatal("second connection for the same user remained open above the limit")
+		}
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+			t.Fatal("second connection for the same user was not closed by the limit")
+		}
+	}
 
 	secondPayload := bytes.Repeat([]byte("shutdown-accounting-"), 2048)
 	if _, err := clientConnection.Write(secondPayload); err != nil {

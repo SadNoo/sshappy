@@ -96,6 +96,10 @@ type TCPListenerConfig struct {
 	// Established relay connections do not consume this capacity. The default is 1024.
 	MaxConcurrentHandshakes int `json:"maxConcurrentHandshakes,omitzero"`
 
+	// MaxConnectionsPerUser limits authenticated connections for one user.
+	// Zero leaves per-user connections unlimited.
+	MaxConnectionsPerUser int `json:"maxConnectionsPerUser,omitzero"`
+
 	// TrafficFlushInterval controls how often active TCP sessions submit traffic deltas.
 	// The default is 30s.
 	TrafficFlushInterval jsoncfg.Duration `json:"trafficFlushInterval,omitzero"`
@@ -159,6 +163,9 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 	case maxConcurrentHandshakes < 0:
 		return tcpRelayListener{}, fmt.Errorf("negative maximum concurrent handshakes: %d", maxConcurrentHandshakes)
 	}
+	if lnc.MaxConnectionsPerUser < 0 {
+		return tcpRelayListener{}, fmt.Errorf("negative maximum connections per user: %d", lnc.MaxConnectionsPerUser)
+	}
 	trafficFlushInterval := lnc.TrafficFlushInterval.Value()
 	switch {
 	case trafficFlushInterval == 0:
@@ -192,6 +199,7 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 		waitForInitialPayload:        !serverNativeInitialPayload && !lnc.DisableInitialPayloadWait,
 		handshakeTimeout:             handshakeTimeout,
 		handshakeSlots:               make(chan struct{}, maxConcurrentHandshakes),
+		maxConnectionsPerUser:        lnc.MaxConnectionsPerUser,
 		trafficFlushInterval:         trafficFlushInterval,
 		initialPayloadWaitTimeout:    initialPayloadWaitTimeout,
 		initialPayloadWaitBufferSize: initialPayloadWaitBufferSize,

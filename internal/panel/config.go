@@ -36,6 +36,7 @@ type Config struct {
 	CredentialPath             string
 	TrafficOutboxPath          string
 	TCPMaxHandshakes           int
+	TCPMaxConnectionsPerUser   int
 	TCPTrafficFlushSeconds     int
 	TrafficBatchRetentionDays  int
 	loadError                  error
@@ -72,6 +73,7 @@ func LoadConfig() Config {
 		CredentialPath:             getenv("UPSK_STORE_PATH", "/var/lib/sshappy/users.json"),
 		TrafficOutboxPath:          getenv("TRAFFIC_OUTBOX_PATH", "/var/lib/sshappy/traffic-outbox.json"),
 		TCPMaxHandshakes:           getenvInt("TCP_MAX_CONCURRENT_HANDSHAKES", 1024),
+		TCPMaxConnectionsPerUser:   getenvInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPTrafficFlushSeconds:     getenvInt("TCP_TRAFFIC_FLUSH_SECONDS", 30),
 		TrafficBatchRetentionDays:  getenvInt("TRAFFIC_BATCH_RETENTION_DAYS", 30),
 		loadError:                  errors.Join(tcpErr, udpErr),
@@ -107,6 +109,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("UDP_MAX_SESSIONS_PER_USER must be positive and no greater than UDP_MAX_SESSIONS")
 	case c.EnableTCP && c.TCPMaxHandshakes < 1:
 		return fmt.Errorf("TCP_MAX_CONCURRENT_HANDSHAKES must be positive")
+	case c.EnableTCP && c.TCPMaxConnectionsPerUser < 0:
+		return fmt.Errorf("TCP_MAX_CONNECTIONS_PER_USER must not be negative")
 	case c.EnableTCP && c.TCPTrafficFlushSeconds < 1:
 		return fmt.Errorf("TCP_TRAFFIC_FLUSH_SECONDS must be positive")
 	case c.TrafficBatchRetentionDays < 0:

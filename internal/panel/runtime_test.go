@@ -74,6 +74,7 @@ func TestDefaultOperationalSettings(t *testing.T) {
 	config := LoadConfig()
 	if !config.EnableTCP || !config.EnableUDP ||
 		config.TCPMaxHandshakes != 1024 ||
+		config.TCPMaxConnectionsPerUser != 800 ||
 		config.TCPTrafficFlushSeconds != 30 ||
 		config.TrafficBatchRetentionDays != 30 ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
@@ -122,9 +123,24 @@ func TestDisabledProtocolIgnoresItsTuningParameters(t *testing.T) {
 	config.UDPMaxSessions = 2048
 	config.UDPMaxSessionsPerUser = 128
 	config.TCPMaxHandshakes = 0
+	config.TCPMaxConnectionsPerUser = -1
 	config.TCPTrafficFlushSeconds = 0
 	if err := config.Validate(); err != nil {
 		t.Fatalf("disabled TCP settings were validated: %v", err)
+	}
+}
+
+func TestTCPConnectionLimitValidation(t *testing.T) {
+	config := LoadConfig()
+	config.NodeID = 1
+	config.TCPMaxConnectionsPerUser = -1
+	if err := config.Validate(); err == nil {
+		t.Fatal("negative per-user TCP connection limit was accepted")
+	}
+
+	config.TCPMaxConnectionsPerUser = 0
+	if err := config.Validate(); err != nil {
+		t.Fatalf("unlimited per-user TCP connections were rejected: %v", err)
 	}
 }
 

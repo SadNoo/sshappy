@@ -34,6 +34,7 @@ type tcpRelayListener struct {
 	waitForInitialPayload        bool
 	handshakeTimeout             time.Duration
 	handshakeSlots               chan struct{}
+	maxConnectionsPerUser        int
 	trafficFlushInterval         time.Duration
 	initialPayloadWaitTimeout    time.Duration
 	initialPayloadWaitBufferSize int
@@ -48,33 +49,39 @@ type tcpRelayListener struct {
 //
 // TCPRelay implements the Service interface.
 type TCPRelay struct {
-	serverIndex         int
-	serverName          string
-	listeners           []tcpRelayListener
-	acceptWg            sync.WaitGroup
-	server              netio.StreamServer
-	collector           stats.Collector
-	observer            RuntimeObserver
-	router              *router.Router
-	logger              *zap.Logger
-	metricsWg           sync.WaitGroup
-	handlerWg           sync.WaitGroup
-	connectionsMu       sync.Mutex
-	connections         map[net.Conn]struct{}
-	stopping            bool
-	acceptedConnections atomic.Uint64
-	activeConnections   atomic.Int64
-	activeHandshakes    atomic.Int64
-	handshakeTimeouts   atomic.Uint64
-	handshakeFailures   atomic.Uint64
-	rejectedCapacity    atomic.Uint64
-	targetDialAttempts  atomic.Uint64
-	targetDialCompleted atomic.Uint64
-	targetDialErrors    atomic.Uint64
-	targetDialNanos     atomic.Uint64
-	relayErrors         atomic.Uint64
-	uplinkBytes         atomic.Uint64
-	downlinkBytes       atomic.Uint64
+	serverIndex           int
+	serverName            string
+	listeners             []tcpRelayListener
+	acceptWg              sync.WaitGroup
+	server                netio.StreamServer
+	collector             stats.Collector
+	observer              RuntimeObserver
+	router                *router.Router
+	logger                *zap.Logger
+	metricsWg             sync.WaitGroup
+	handlerWg             sync.WaitGroup
+	connectionsMu         sync.Mutex
+	connections           map[net.Conn]struct{}
+	userConnectionsMu     sync.Mutex
+	connectionsByUser     map[string]int
+	lastLimitedUser       string
+	stopping              bool
+	acceptedConnections   atomic.Uint64
+	activeConnections     atomic.Int64
+	activeHandshakes      atomic.Int64
+	handshakeTimeouts     atomic.Uint64
+	handshakeFailures     atomic.Uint64
+	rejectedCapacity      atomic.Uint64
+	rejectedUserLimit     atomic.Uint64
+	activeUserConnections atomic.Int64
+	peakUserConnections   atomic.Uint64
+	targetDialAttempts    atomic.Uint64
+	targetDialCompleted   atomic.Uint64
+	targetDialErrors      atomic.Uint64
+	targetDialNanos       atomic.Uint64
+	relayErrors           atomic.Uint64
+	uplinkBytes           atomic.Uint64
+	downlinkBytes         atomic.Uint64
 }
 
 func NewTCPRelay(
@@ -88,16 +95,47 @@ func NewTCPRelay(
 	logger *zap.Logger,
 ) *TCPRelay {
 	return &TCPRelay{
-		serverIndex: serverIndex,
-		serverName:  serverName,
-		listeners:   listeners,
-		server:      server,
-		collector:   collector,
-		observer:    observer,
-		router:      router,
-		logger:      logger,
-		connections: make(map[net.Conn]struct{}),
+		serverIndex:       serverIndex,
+		serverName:        serverName,
+		listeners:         listeners,
+		server:            server,
+		collector:         collector,
+		observer:          observer,
+		router:            router,
+		logger:            logger,
+		connections:       make(map[net.Conn]struct{}),
+		connectionsByUser: make(map[string]int),
 	}
+}
+
+func (s *TCPRelay) reserveUserConnection(username string, limit int) bool {
+	s.userConnectionsMu.Lock()
+	defer s.userConnectionsMu.Unlock()
+	if limit > 0 && s.connectionsByUser[username] >= limit {
+		s.lastLimitedUser = username
+		s.rejectedUserLimit.Add(1)
+		return false
+	}
+	s.connectionsByUser[username]++
+	active := s.activeUserConnections.Add(1)
+	for peak := s.peakUserConnections.Load(); uint64(active) > peak; peak = s.peakUserConnections.Load() {
+		if s.peakUserConnections.CompareAndSwap(peak, uint64(active)) {
+			break
+		}
+	}
+	return true
+}
+
+func (s *TCPRelay) releaseUserConnection(username string) {
+	s.userConnectionsMu.Lock()
+	remaining := s.connectionsByUser[username] - 1
+	if remaining <= 0 {
+		delete(s.connectionsByUser, username)
+	} else {
+		s.connectionsByUser[username] = remaining
+	}
+	s.userConnectionsMu.Unlock()
+	s.activeUserConnections.Add(-1)
 }
 
 var _ shadowsocks.Service = (*TCPRelay)(nil)
@@ -162,11 +200,28 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 	s.metricsWg.Go(func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
+		var lastRejectedUserLimit uint64
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				s.userConnectionsMu.Lock()
+				lastLimitedUser := s.lastLimitedUser
+				var busiestUser string
+				var busiestUserConnections int
+				for username, connections := range s.connectionsByUser {
+					if connections > busiestUserConnections {
+						busiestUser = username
+						busiestUserConnections = connections
+					}
+				}
+				s.userConnectionsMu.Unlock()
+				rejectedUserLimit := s.rejectedUserLimit.Load()
+				maxConnectionsPerUser := 0
+				if len(s.listeners) > 0 {
+					maxConnectionsPerUser = s.listeners[0].maxConnectionsPerUser
+				}
 				s.logger.Info("TCP relay metrics",
 					zap.String("server", s.serverName),
 					zap.Uint64("accepted", s.acceptedConnections.Load()),
@@ -175,6 +230,13 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					zap.Uint64("handshakeTimeouts", s.handshakeTimeouts.Load()),
 					zap.Uint64("handshakeFailures", s.handshakeFailures.Load()),
 					zap.Uint64("rejectedCapacity", s.rejectedCapacity.Load()),
+					zap.Uint64("rejectedUserLimit", rejectedUserLimit),
+					zap.Int64("activeUserConnections", s.activeUserConnections.Load()),
+					zap.Uint64("peakUserConnections", s.peakUserConnections.Load()),
+					zap.String("busiestUser", busiestUser),
+					zap.Int("busiestUserConnections", busiestUserConnections),
+					zap.String("lastLimitedUser", lastLimitedUser),
+					zap.Int("maxConnectionsPerUser", maxConnectionsPerUser),
 					zap.Uint64("targetDialAttempts", s.targetDialAttempts.Load()),
 					zap.Uint64("targetDialErrors", s.targetDialErrors.Load()),
 					zap.Duration("averageTargetDialLatency", averageDuration(s.targetDialNanos.Load(), s.targetDialCompleted.Load())),
@@ -182,6 +244,15 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					zap.Uint64("uplinkBytes", s.uplinkBytes.Load()),
 					zap.Uint64("downlinkBytes", s.downlinkBytes.Load()),
 				)
+				if delta := rejectedUserLimit - lastRejectedUserLimit; delta > 0 {
+					s.logger.Warn("TCP connections rejected by per-user limit",
+						zap.Uint64("rejectedSinceLastReport", delta),
+						zap.Uint64("rejectedTotal", rejectedUserLimit),
+						zap.String("username", lastLimitedUser),
+						zap.Int("maxConnectionsPerUser", maxConnectionsPerUser),
+					)
+				}
+				lastRejectedUserLimit = rejectedUserLimit
 			}
 		}
 	})
@@ -244,6 +315,17 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		logger.Debug("Rejected TCP connection by runtime policy", zap.String("username", req.Username))
 		return
 	}
+	if !s.reserveUserConnection(req.Username, lnc.maxConnectionsPerUser) {
+		logger.Debug("Rejected TCP connection by per-user limit",
+			zap.String("username", req.Username),
+			zap.Int("maxConnectionsPerUser", lnc.maxConnectionsPerUser),
+		)
+		if err := req.Abort(conn.DialResult{Code: conn.DialResultCodeEACCES}); err != nil {
+			logger.Debug("Failed to abort connection rejected by per-user limit", zap.Error(err))
+		}
+		return
+	}
+	defer s.releaseUserConnection(req.Username)
 	if s.observer != nil {
 		s.observer.Observe("tcp", req.Username, clientAddrPort)
 	}

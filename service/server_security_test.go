@@ -25,6 +25,12 @@ func TestTCPListenerHandshakeCapacityDefaultsAndValidation(t *testing.T) {
 	if _, err := config.Configure(conn.NewListenConfigCache(), false, false); err == nil {
 		t.Fatal("negative handshake capacity was accepted")
 	}
+
+	config.MaxConcurrentHandshakes = 0
+	config.MaxConnectionsPerUser = -1
+	if _, err := config.Configure(conn.NewListenConfigCache(), false, false); err == nil {
+		t.Fatal("negative per-user connection capacity was accepted")
+	}
 }
 
 func TestSocks5UDPWithUserPassAuthIsRejected(t *testing.T) {

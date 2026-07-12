@@ -80,6 +80,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if config.EnableTCP {
 		startupFields = append(startupFields,
 			zap.Int("tcpMaxConcurrentHandshakes", config.TCPMaxHandshakes),
+			zap.Int("tcpMaxConnectionsPerUser", config.TCPMaxConnectionsPerUser),
 			zap.Int("tcpTrafficFlushSeconds", config.TCPTrafficFlushSeconds),
 		)
 	}
@@ -244,6 +245,7 @@ func newManager(config Config, node Node, runtime *Runtime, logger *zap.Logger) 
 			FastOpen:                true,
 			FastOpenFallback:        true,
 			MaxConcurrentHandshakes: config.TCPMaxHandshakes,
+			MaxConnectionsPerUser:   config.TCPMaxConnectionsPerUser,
 			TrafficFlushInterval:    jsoncfg.Duration(time.Duration(config.TCPTrafficFlushSeconds) * time.Second),
 		}}
 	}
