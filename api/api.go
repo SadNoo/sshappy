@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,6 +48,11 @@ type Config struct {
 	// SecretPath adds a secret path prefix to API and pprof endpoints.
 	// Static files are not affected. If empty, no secret path is added.
 	SecretPath string `json:"secretPath,omitzero"`
+
+	// AuthToken is required as a Bearer token for API and pprof endpoints.
+	//
+	// The API server refuses to start when this field is empty.
+	AuthToken string `json:"authToken,omitzero"`
 
 	// Listeners is the list of server listeners.
 	Listeners []ListenerConfig `json:"listeners"`
@@ -166,6 +172,10 @@ func (c *Config) NewServer(
 	if len(c.Listeners) == 0 {
 		return nil, errors.New("no listeners specified")
 	}
+	if strings.TrimSpace(c.AuthToken) == "" {
+		return nil, errors.New("api authToken is required")
+	}
+	authenticate := newBearerAuthMiddleware(c.AuthToken)
 
 	lcs := make([]listenConfig, len(c.Listeners))
 	for i := range c.Listeners {
@@ -232,13 +242,13 @@ func (c *Config) NewServer(
 	if c.DebugPprof {
 		register := func(path string, handler http.HandlerFunc) {
 			pattern := "GET " + joinPatternPath(basePath, path)
-			mux.Handle(pattern, realIP(logPprofRequests(logger, handler)))
+			mux.Handle(pattern, authenticate(realIP(logPprofRequests(logger, handler))))
 		}
 
 		// [pprof.Index] requires the URL path to start with "/debug/pprof/".
 		indexPath := joinPatternPath(basePath, "/debug/pprof/")
 		prefix := strings.TrimSuffix(indexPath, "/debug/pprof/")
-		mux.Handle(indexPath, realIP(logPprofRequests(logger, http.StripPrefix(prefix, http.HandlerFunc(pprof.Index)))))
+		mux.Handle(indexPath, authenticate(realIP(logPprofRequests(logger, http.StripPrefix(prefix, http.HandlerFunc(pprof.Index))))))
 
 		register("/debug/pprof/cmdline", pprof.Cmdline)
 		register("/debug/pprof/profile", pprof.Profile)
@@ -251,7 +261,7 @@ func (c *Config) NewServer(
 	sm := ssm.NewServerManager(serverByName, serverNames)
 	sm.RegisterHandlers(func(method, path string, handler restapi.HandlerFunc) {
 		pattern := method + " " + joinPatternPath(apiSSMv1Path, path)
-		mux.Handle(pattern, realIP(logAPIRequests(logger, handler)))
+		mux.Handle(pattern, authenticate(realIP(logAPIRequests(logger, handler))))
 	})
 
 	// /api/tlscerts/v1
@@ -259,7 +269,7 @@ func (c *Config) NewServer(
 	cm := certmgr.NewCertificateManager(tlsCertStore)
 	cm.RegisterHandlers(func(method, path string, handler restapi.HandlerFunc) {
 		pattern := method + " " + joinPatternPath(apiTLSCertsV1Path, path)
-		mux.Handle(pattern, realIP(logAPIRequests(logger, handler)))
+		mux.Handle(pattern, authenticate(realIP(logAPIRequests(logger, handler))))
 	})
 
 	if c.StaticPath != "" {
@@ -279,6 +289,26 @@ func (c *Config) NewServer(
 			ErrorLog: errorLog,
 		},
 	}, nil
+}
+
+func newBearerAuthMiddleware(token string) func(http.Handler) http.Handler {
+	expected := []byte(token)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			const prefix = "Bearer "
+			authorization := r.Header.Get("Authorization")
+			provided := []byte(nil)
+			if strings.HasPrefix(authorization, prefix) {
+				provided = []byte(authorization[len(prefix):])
+			}
+			if subtle.ConstantTimeCompare(provided, expected) != 1 {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="api"`)
+				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // joinPatternPath joins path elements into a pattern path.

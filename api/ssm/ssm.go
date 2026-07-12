@@ -93,6 +93,31 @@ func handleGetStats(w http.ResponseWriter, r *http.Request, sc stats.Collector) 
 	return restapi.EncodeResponse(w, http.StatusOK, serverStats)
 }
 
+type userSummary struct {
+	Username string `json:"username"`
+}
+
+type userListResponse struct {
+	Users []userSummary `json:"users"`
+}
+
+type userDetailResponse struct {
+	Username string `json:"username"`
+	stats.Traffic
+}
+
+func summarizeUserCredential(uc cred.UserCredential) userSummary {
+	return userSummary{Username: uc.Name}
+}
+
+func summarizeUserCredentials(credentials []cred.UserCredential) []userSummary {
+	users := make([]userSummary, 0, len(credentials))
+	for _, credential := range credentials {
+		users = append(users, summarizeUserCredential(credential))
+	}
+	return users
+}
+
 func (sm *ServerManager) requireServerUsers(h func(http.ResponseWriter, *http.Request, Server) (int, error)) func(http.ResponseWriter, *http.Request) (int, error) {
 	return func(w http.ResponseWriter, r *http.Request) (int, error) {
 		name := r.PathValue("server")
@@ -108,10 +133,9 @@ func (sm *ServerManager) requireServerUsers(h func(http.ResponseWriter, *http.Re
 }
 
 func handleListUsers(w http.ResponseWriter, _ *http.Request, s Server) (int, error) {
-	type response struct {
-		Users []cred.UserCredential `json:"users"`
-	}
-	return restapi.EncodeResponse(w, http.StatusOK, response{Users: s.CredentialManager.Credentials()})
+	return restapi.EncodeResponse(w, http.StatusOK, userListResponse{
+		Users: summarizeUserCredentials(s.CredentialManager.Credentials()),
+	})
 }
 
 func handleAddUser(w http.ResponseWriter, r *http.Request, s Server) (int, error) {
@@ -124,22 +148,20 @@ func handleAddUser(w http.ResponseWriter, r *http.Request, s Server) (int, error
 		return restapi.EncodeResponse(w, http.StatusBadRequest, StandardError{Message: err.Error()})
 	}
 
-	return restapi.EncodeResponse(w, http.StatusCreated, &uc)
+	return restapi.EncodeResponse(w, http.StatusCreated, userSummary{Username: uc.Name})
 }
 
 func handleGetUser(w http.ResponseWriter, r *http.Request, s Server) (int, error) {
-	type response struct {
-		cred.UserCredential
-		stats.Traffic
-	}
-
 	username := r.PathValue("username")
 	userCred, ok := s.CredentialManager.GetCredential(username)
 	if !ok {
 		return restapi.EncodeResponse(w, http.StatusNotFound, &userNotFoundJSON)
 	}
 
-	return restapi.EncodeResponse(w, http.StatusOK, response{userCred, s.StatsCollector.Snapshot().Traffic})
+	return restapi.EncodeResponse(w, http.StatusOK, userDetailResponse{
+		Username: userCred.Name,
+		Traffic:  s.StatsCollector.Snapshot().Traffic,
+	})
 }
 
 func handleUpdateUser(w http.ResponseWriter, r *http.Request, s Server) (int, error) {

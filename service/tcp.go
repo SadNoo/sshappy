@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/database64128/shadowsocks-go"
@@ -20,6 +21,9 @@ import (
 const (
 	defaultInitialPayloadWaitBufferSize = 1440
 	defaultInitialPayloadWaitTimeout    = 250 * time.Millisecond
+	defaultHandshakeTimeout             = 10 * time.Second
+	defaultMaxConcurrentHandshakes      = 1024
+	defaultTCPTrafficFlushInterval      = 30 * time.Second
 )
 
 // tcpRelayListener configures the TCP listener for a relay service.
@@ -28,6 +32,9 @@ type tcpRelayListener struct {
 	listener                     *net.TCPListener
 	listenConfig                 conn.ListenConfig
 	waitForInitialPayload        bool
+	handshakeTimeout             time.Duration
+	handshakeSlots               chan struct{}
+	trafficFlushInterval         time.Duration
 	initialPayloadWaitTimeout    time.Duration
 	initialPayloadWaitBufferSize int
 	network                      string
@@ -41,15 +48,33 @@ type tcpRelayListener struct {
 //
 // TCPRelay implements the Service interface.
 type TCPRelay struct {
-	serverIndex int
-	serverName  string
-	listeners   []tcpRelayListener
-	acceptWg    sync.WaitGroup
-	server      netio.StreamServer
-	collector   stats.Collector
-	observer    RuntimeObserver
-	router      *router.Router
-	logger      *zap.Logger
+	serverIndex         int
+	serverName          string
+	listeners           []tcpRelayListener
+	acceptWg            sync.WaitGroup
+	server              netio.StreamServer
+	collector           stats.Collector
+	observer            RuntimeObserver
+	router              *router.Router
+	logger              *zap.Logger
+	metricsWg           sync.WaitGroup
+	handlerWg           sync.WaitGroup
+	connectionsMu       sync.Mutex
+	connections         map[net.Conn]struct{}
+	stopping            bool
+	acceptedConnections atomic.Uint64
+	activeConnections   atomic.Int64
+	activeHandshakes    atomic.Int64
+	handshakeTimeouts   atomic.Uint64
+	handshakeFailures   atomic.Uint64
+	rejectedCapacity    atomic.Uint64
+	targetDialAttempts  atomic.Uint64
+	targetDialCompleted atomic.Uint64
+	targetDialErrors    atomic.Uint64
+	targetDialNanos     atomic.Uint64
+	relayErrors         atomic.Uint64
+	uplinkBytes         atomic.Uint64
+	downlinkBytes       atomic.Uint64
 }
 
 func NewTCPRelay(
@@ -71,6 +96,7 @@ func NewTCPRelay(
 		observer:    observer,
 		router:      router,
 		logger:      logger,
+		connections: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -109,18 +135,72 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					lnc.logger.Error("Failed to accept TCP connection", zap.Error(err))
 					continue
 				}
-
-				go s.handleConn(ctx, lnc, clientConn)
+				s.acceptedConnections.Add(1)
+				select {
+				case lnc.handshakeSlots <- struct{}{}:
+					s.activeHandshakes.Add(1)
+				default:
+					s.rejectedCapacity.Add(1)
+					_ = clientConn.Close()
+					continue
+				}
+				if !s.registerConnection(clientConn) {
+					<-lnc.handshakeSlots
+					s.activeHandshakes.Add(-1)
+					_ = clientConn.Close()
+					continue
+				}
+				s.activeConnections.Add(1)
+				s.handlerWg.Go(func() {
+					s.handleConn(ctx, lnc, clientConn)
+				})
 			}
 		})
 
 		lnc.logger.Info("Started TCP relay service listener")
 	}
+	s.metricsWg.Go(func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.logger.Info("TCP relay metrics",
+					zap.String("server", s.serverName),
+					zap.Uint64("accepted", s.acceptedConnections.Load()),
+					zap.Int64("activeConnections", s.activeConnections.Load()),
+					zap.Int64("activeHandshakes", s.activeHandshakes.Load()),
+					zap.Uint64("handshakeTimeouts", s.handshakeTimeouts.Load()),
+					zap.Uint64("handshakeFailures", s.handshakeFailures.Load()),
+					zap.Uint64("rejectedCapacity", s.rejectedCapacity.Load()),
+					zap.Uint64("targetDialAttempts", s.targetDialAttempts.Load()),
+					zap.Uint64("targetDialErrors", s.targetDialErrors.Load()),
+					zap.Duration("averageTargetDialLatency", averageDuration(s.targetDialNanos.Load(), s.targetDialCompleted.Load())),
+					zap.Uint64("relayErrors", s.relayErrors.Load()),
+					zap.Uint64("uplinkBytes", s.uplinkBytes.Load()),
+					zap.Uint64("downlinkBytes", s.downlinkBytes.Load()),
+				)
+			}
+		}
+	})
 	return nil
 }
 
 // handleConn handles an accepted TCP connection.
 func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, clientTCPConn *net.TCPConn) {
+	handshakeActive := true
+	releaseHandshake := func() {
+		if handshakeActive {
+			<-lnc.handshakeSlots
+			s.activeHandshakes.Add(-1)
+			handshakeActive = false
+		}
+	}
+	defer releaseHandshake()
+	defer s.activeConnections.Add(-1)
+	defer s.unregisterConnection(clientTCPConn)
 	var clientConn netio.Conn
 	defer func() {
 		if clientConn != nil {
@@ -138,13 +218,26 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	)
 
 	// Handshake.
+	if err := clientTCPConn.SetReadDeadline(time.Now().Add(lnc.handshakeTimeout)); err != nil {
+		logger.Warn("Failed to set handshake read deadline", zap.Error(err))
+		return
+	}
 	req, err := s.server.HandleStream(clientTCPConn, logger)
 	if err != nil {
 		if err == netio.ErrHandleStreamDone {
 			logger.Debug("Handled TCP connection without bidirectional copy")
 			return
 		}
-		logger.Warn("Failed to complete handshake with client", zap.Error(err))
+		s.handshakeFailures.Add(1)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			s.handshakeTimeouts.Add(1)
+		}
+		logger.Debug("Failed to complete handshake with client", zap.Error(err))
+		return
+	}
+	releaseHandshake()
+	if err := clientTCPConn.SetReadDeadline(time.Time{}); err != nil {
+		logger.Warn("Failed to clear handshake read deadline", zap.Error(err))
 		return
 	}
 	if s.observer != nil && !s.observer.Accept("tcp", req.Username, clientAddrPort, req.Addr) {
@@ -247,9 +340,14 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	}
 
 	// Create remote connection.
+	dialStartedAt := time.Now()
+	s.targetDialAttempts.Add(1)
 	remoteConn, err := dialer.DialStream(ctx, req.Addr, req.Payload)
+	s.targetDialNanos.Add(uint64(time.Since(dialStartedAt)))
+	s.targetDialCompleted.Add(1)
 	if err != nil {
-		logger.Warn("Failed to create remote connection",
+		s.targetDialErrors.Add(1)
+		logger.Debug("Failed to create remote connection",
 			zap.Int("initialPayloadLength", len(req.Payload)),
 			zap.Error(err),
 		)
@@ -262,6 +360,10 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		return
 	}
 	defer remoteConn.Close()
+	if !s.registerConnection(remoteConn) {
+		return
+	}
+	defer s.unregisterConnection(remoteConn)
 
 	if clientConn == nil {
 		clientConn, err = req.PendingConn.Proceed()
@@ -271,16 +373,22 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		}
 	}
 
-	logger.Info("Bidirectional copy started",
+	logger.Debug("Bidirectional copy started",
 		zap.Int("initialPayloadLength", len(req.Payload)),
 	)
 
-	// Bidirectional copy.
-	nl2r, nr2l, err := netio.BidirectionalCopy(clientConn, remoteConn)
+	accounting := newTCPSessionAccounting(s, req.Username, uint64(len(req.Payload)))
+	stopAccounting := accounting.start(lnc.trafficFlushInterval)
+	defer stopAccounting()
+
+	// Count bytes only after a successful write to each side.
+	meteredClientConn := meteredTCPConn{Conn: clientConn, written: &accounting.downlink}
+	meteredRemoteConn := meteredTCPConn{Conn: remoteConn, written: &accounting.uplink}
+	nl2r, nr2l, err := netio.BidirectionalCopy(&meteredClientConn, &meteredRemoteConn)
 	nl2r += int64(len(req.Payload))
-	s.collector.CollectTCPSession(req.Username, uint64(nr2l), uint64(nl2r))
 	if err != nil {
-		logger.Warn("Bidirectional copy failed",
+		s.relayErrors.Add(1)
+		logger.Debug("Bidirectional copy failed",
 			zap.Int64("nl2r", nl2r),
 			zap.Int64("nr2l", nr2l),
 			zap.Error(err),
@@ -288,14 +396,102 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		return
 	}
 
-	logger.Info("Bidirectional copy completed",
+	logger.Debug("Bidirectional copy completed",
 		zap.Int64("nl2r", nl2r),
 		zap.Int64("nr2l", nr2l),
 	)
 }
 
+type meteredTCPConn struct {
+	netio.Conn
+	written *atomic.Uint64
+}
+
+func (c *meteredTCPConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.written.Add(uint64(n))
+	return n, err
+}
+
+type tcpSessionAccounting struct {
+	relay    *TCPRelay
+	username string
+	uplink   atomic.Uint64
+	downlink atomic.Uint64
+}
+
+func newTCPSessionAccounting(relay *TCPRelay, username string, initialUplink uint64) *tcpSessionAccounting {
+	a := &tcpSessionAccounting{relay: relay, username: username}
+	a.uplink.Store(initialUplink)
+	return a
+}
+
+func (a *tcpSessionAccounting) start(interval time.Duration) func() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				a.flush()
+			}
+		}
+	})
+	return func() {
+		close(done)
+		wg.Wait()
+		a.flush()
+	}
+}
+
+func (a *tcpSessionAccounting) flush() {
+	uplink := a.uplink.Swap(0)
+	downlink := a.downlink.Swap(0)
+	if uplink == 0 && downlink == 0 {
+		return
+	}
+	a.relay.uplinkBytes.Add(uplink)
+	a.relay.downlinkBytes.Add(downlink)
+	a.relay.collector.CollectTCPSession(a.username, downlink, uplink)
+}
+
+func (s *TCPRelay) registerConnection(connection net.Conn) bool {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.connections[connection] = struct{}{}
+	return true
+}
+
+func (s *TCPRelay) unregisterConnection(connection net.Conn) {
+	s.connectionsMu.Lock()
+	delete(s.connections, connection)
+	s.connectionsMu.Unlock()
+}
+
+func averageDuration(totalNanos, count uint64) time.Duration {
+	if count == 0 {
+		return 0
+	}
+	return time.Duration(totalNanos / count)
+}
+
 // Stop implements [shadowsocks.Service.Stop].
 func (s *TCPRelay) Stop() error {
+	s.connectionsMu.Lock()
+	s.stopping = true
+	connections := make([]net.Conn, 0, len(s.connections))
+	for connection := range s.connections {
+		connections = append(connections, connection)
+	}
+	s.connectionsMu.Unlock()
+
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
 		if err := lnc.listener.SetDeadline(conn.ALongTimeAgo); err != nil {
@@ -304,6 +500,11 @@ func (s *TCPRelay) Stop() error {
 	}
 
 	s.acceptWg.Wait()
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+	s.handlerWg.Wait()
+	s.metricsWg.Wait()
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]

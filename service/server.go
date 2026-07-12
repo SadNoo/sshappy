@@ -87,6 +87,19 @@ type TCPListenerConfig struct {
 	// Setting it to true is useful when the listener only relays server-speaks-first protocols.
 	DisableInitialPayloadWait bool `json:"disableInitialPayloadWait,omitzero"`
 
+	// HandshakeTimeout is the maximum time allowed for the protocol handshake.
+	//
+	// The default value is 10s.
+	HandshakeTimeout jsoncfg.Duration `json:"handshakeTimeout,omitzero"`
+
+	// MaxConcurrentHandshakes limits connections still performing the protocol handshake.
+	// Established relay connections do not consume this capacity. The default is 1024.
+	MaxConcurrentHandshakes int `json:"maxConcurrentHandshakes,omitzero"`
+
+	// TrafficFlushInterval controls how often active TCP sessions submit traffic deltas.
+	// The default is 30s.
+	TrafficFlushInterval jsoncfg.Duration `json:"trafficFlushInterval,omitzero"`
+
 	// InitialPayloadWaitTimeout is the read timeout when waiting for the initial payload.
 	//
 	// The default value is 250ms.
@@ -132,6 +145,28 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 		return tcpRelayListener{}, fmt.Errorf("negative initial payload wait timeout: %s", initialPayloadWaitTimeout)
 	}
 
+	handshakeTimeout := lnc.HandshakeTimeout.Value()
+	switch {
+	case handshakeTimeout == 0:
+		handshakeTimeout = defaultHandshakeTimeout
+	case handshakeTimeout < 0:
+		return tcpRelayListener{}, fmt.Errorf("negative handshake timeout: %s", handshakeTimeout)
+	}
+	maxConcurrentHandshakes := lnc.MaxConcurrentHandshakes
+	switch {
+	case maxConcurrentHandshakes == 0:
+		maxConcurrentHandshakes = defaultMaxConcurrentHandshakes
+	case maxConcurrentHandshakes < 0:
+		return tcpRelayListener{}, fmt.Errorf("negative maximum concurrent handshakes: %d", maxConcurrentHandshakes)
+	}
+	trafficFlushInterval := lnc.TrafficFlushInterval.Value()
+	switch {
+	case trafficFlushInterval == 0:
+		trafficFlushInterval = defaultTCPTrafficFlushInterval
+	case trafficFlushInterval < 0:
+		return tcpRelayListener{}, fmt.Errorf("negative TCP traffic flush interval: %s", trafficFlushInterval)
+	}
+
 	initialPayloadWaitBufferSize := lnc.InitialPayloadWaitBufferSize
 	switch {
 	case initialPayloadWaitBufferSize == 0:
@@ -155,6 +190,9 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 			MultipathTCP:        lnc.Multipath,
 		}),
 		waitForInitialPayload:        !serverNativeInitialPayload && !lnc.DisableInitialPayloadWait,
+		handshakeTimeout:             handshakeTimeout,
+		handshakeSlots:               make(chan struct{}, maxConcurrentHandshakes),
+		trafficFlushInterval:         trafficFlushInterval,
 		initialPayloadWaitTimeout:    initialPayloadWaitTimeout,
 		initialPayloadWaitBufferSize: initialPayloadWaitBufferSize,
 		network:                      lnc.Network,
@@ -174,6 +212,14 @@ type UDPListenerConfig struct {
 	//
 	// The default value is 5 minutes.
 	NATTimeout jsoncfg.Duration `json:"natTimeout,omitzero"`
+
+	// MaxSessions limits concurrent sessions handled by this listener.
+	// Zero leaves the number of sessions unlimited.
+	MaxSessions int `json:"maxSessions,omitzero"`
+
+	// MaxSessionsPerUser limits concurrent sessions for one authenticated user.
+	// Zero leaves per-user sessions unlimited.
+	MaxSessionsPerUser int `json:"maxSessionsPerUser,omitzero"`
 
 	// AllowFragmentation controls whether to allow IP fragmentation.
 	//
@@ -196,6 +242,15 @@ func (lnc *UDPListenerConfig) Configure(logger *zap.Logger, serverName string, l
 
 	if err := lnc.UDPPerfConfig.CheckAndApplyDefaults(); err != nil {
 		return udpRelayServerConn{}, err
+	}
+	if lnc.MaxSessions < 0 {
+		return udpRelayServerConn{}, fmt.Errorf("max sessions must not be negative: %d", lnc.MaxSessions)
+	}
+	if lnc.MaxSessionsPerUser < 0 {
+		return udpRelayServerConn{}, fmt.Errorf("max sessions per user must not be negative: %d", lnc.MaxSessionsPerUser)
+	}
+	if lnc.MaxSessions > 0 && lnc.MaxSessionsPerUser > lnc.MaxSessions {
+		return udpRelayServerConn{}, fmt.Errorf("max sessions per user %d exceeds max sessions %d", lnc.MaxSessionsPerUser, lnc.MaxSessions)
 	}
 
 	pmtud := lnc.PathMTUDiscovery
@@ -233,6 +288,8 @@ func (lnc *UDPListenerConfig) Configure(logger *zap.Logger, serverName string, l
 		serverRecvBatchSize: lnc.UDPPerfConfig.ServerRecvBatchSize,
 		sendChannelCapacity: lnc.UDPPerfConfig.SendChannelCapacity,
 		natTimeout:          natTimeout,
+		maxSessions:         lnc.MaxSessions,
+		maxSessionsPerUser:  lnc.MaxSessionsPerUser,
 	}, nil
 }
 
@@ -378,6 +435,9 @@ type ServerConfig struct {
 func (sc *ServerConfig) Initialize(tlsCertStore *tlscerts.Store, listenConfigCache conn.ListenConfigCache, statsConfig stats.Config, router *router.Router, logger *zap.Logger, index int) error {
 	sc.tcpEnabled = sc.EnableTCP || len(sc.TCPListeners) > 0
 	sc.udpEnabled = sc.EnableUDP || len(sc.UDPListeners) > 0
+	if sc.Protocol == "socks5" && sc.udpEnabled && sc.Socks5.EnableUserPassAuth {
+		return errors.New("SOCKS5 UDP cannot be enabled together with username/password authentication")
+	}
 
 	switch sc.Protocol {
 	case "direct":

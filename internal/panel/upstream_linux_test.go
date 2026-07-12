@@ -18,7 +18,9 @@ import (
 	"github.com/database64128/shadowsocks-go/logging"
 	"github.com/database64128/shadowsocks-go/netio"
 	"github.com/database64128/shadowsocks-go/ss2022"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
@@ -39,13 +41,16 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 	}
 	defer logger.Sync()
 	config := Config{
-		ListenHost:          "127.0.0.1",
-		UDPMTU:              1496,
-		UDPRelayBatchSize:   256,
-		UDPServerBatchSize:  64,
-		UDPSendQueueSize:    1024,
-		CredentialPath:      credentialPath,
-		SyncIntervalSeconds: 60,
+		ListenHost:             "127.0.0.1",
+		EnableTCP:              true,
+		EnableUDP:              false,
+		UDPMTU:                 1496,
+		UDPRelayBatchSize:      256,
+		UDPServerBatchSize:     64,
+		UDPSendQueueSize:       1024,
+		CredentialPath:         credentialPath,
+		SyncIntervalSeconds:    60,
+		TCPTrafficFlushSeconds: 1,
 	}
 	manager, _, err := newManager(config, Node{ID: 1, ListenPort: port, ServerKey: serverKey}, runtime, logger)
 	if err != nil {
@@ -57,7 +62,11 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 	go func() {
 		done <- manager.Run(ctx)
 	}()
+	stopped := false
 	defer func() {
+		if stopped {
+			return
+		}
 		cancel()
 		if ok := <-done; !ok {
 			t.Error("upstream manager stopped with an error")
@@ -110,11 +119,37 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 	if !bytes.Equal(response, payload) {
 		t.Fatal("TCP response mismatch")
 	}
-	if err := clientConnection.Close(); err != nil {
+	waitForTrafficTotals(t, state, int64(len(payload)), int64(len(payload)), 3*time.Second)
+
+	secondPayload := bytes.Repeat([]byte("shutdown-accounting-"), 2048)
+	if _, err := clientConnection.Write(secondPayload); err != nil {
 		t.Fatal(err)
 	}
+	secondResponse := make([]byte, len(secondPayload))
+	if _, err := io.ReadFull(clientConnection, secondResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(secondResponse, secondPayload) {
+		t.Fatal("second TCP response mismatch")
+	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	cancel()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("upstream manager stopped with an error")
+		}
+		stopped = true
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream manager did not stop active TCP connection")
+	}
+	waitForTrafficTotals(t, state, int64(len(secondPayload)), int64(len(secondPayload)), time.Second)
+	_ = clientConnection.Close()
+}
+
+func waitForTrafficTotals(t *testing.T, state *State, wantUpload, wantDownload int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for {
 		traffic := state.SnapshotTraffic()
 		var upload, download int64
@@ -122,12 +157,12 @@ func TestUpstreamTCPRelayRoundTripAndAccounting(t *testing.T) {
 			upload += delta.Upload
 			download += delta.Download
 		}
-		if upload == int64(len(payload)) && download == int64(len(payload)) {
-			break
+		if upload == wantUpload && download == wantDownload {
+			return
 		}
 		state.MergeTraffic(traffic)
 		if time.Now().After(deadline) {
-			t.Fatalf("TCP traffic upload=%d download=%d", upload, download)
+			t.Fatalf("TCP traffic upload=%d download=%d, want %d/%d", upload, download, wantUpload, wantDownload)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -150,13 +185,13 @@ func TestUpstreamUDPRelayRoundTripAndAccounting(t *testing.T) {
 	state := NewState()
 	runtime := NewRuntime(state)
 	runtime.ReplaceUsers([]User{user})
-	logger, err := logging.NewZapLogger("production", zapcore.ErrorLevel)
-	if err != nil {
-		t.Fatal(err)
-	}
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
 	defer logger.Sync()
 	config := Config{
 		ListenHost:          "127.0.0.1",
+		EnableTCP:           false,
+		EnableUDP:           true,
 		UDPMTU:              1496,
 		UDPRelayBatchSize:   256,
 		UDPServerBatchSize:  64,
@@ -181,7 +216,7 @@ func TestUpstreamUDPRelayRoundTripAndAccounting(t *testing.T) {
 			t.Error("upstream manager stopped with an error")
 		}
 	}()
-	waitForTCPListener(t, port)
+	waitForLogMessage(t, logs, "Started UDP session relay service listener")
 
 	echoConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -380,6 +415,19 @@ func waitForTCPListener(t *testing.T, port int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("TCP listener did not start: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForLogMessage(t *testing.T, logs *observer.ObservedLogs, message string) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if logs.FilterMessage(message).Len() > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log message %q was not observed", message)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

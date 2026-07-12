@@ -104,6 +104,16 @@ type UDPSessionRelay struct {
 	wg                     sync.WaitGroup
 	mwg                    sync.WaitGroup
 	table                  map[uint64]*session
+	sessionsByUser         map[string]int
+	lastLimitedUser        string
+	rxPackets              atomic.Uint64
+	rxBytes                atomic.Uint64
+	dropDecrypt            atomic.Uint64
+	dropForbidden          atomic.Uint64
+	dropQueueFull          atomic.Uint64
+	dropSessionLimit       atomic.Uint64
+	dropUserSessionLimit   atomic.Uint64
+	peakSessions           atomic.Uint64
 }
 
 func NewUDPSessionRelay(
@@ -135,7 +145,42 @@ func NewUDPSessionRelay(
 				}
 			},
 		},
-		table: make(map[uint64]*session),
+		table:          make(map[uint64]*session),
+		sessionsByUser: make(map[string]int),
+	}
+}
+
+// reserveSession reserves capacity for a new session. The caller must hold s.mu.
+func (s *UDPSessionRelay) reserveSession(username string, lnc *udpRelayServerConn) bool {
+	if lnc.maxSessions > 0 && len(s.table) >= lnc.maxSessions {
+		s.dropSessionLimit.Add(1)
+		return false
+	}
+	if lnc.maxSessionsPerUser > 0 && s.sessionsByUser[username] >= lnc.maxSessionsPerUser {
+		s.dropUserSessionLimit.Add(1)
+		s.lastLimitedUser = username
+		return false
+	}
+	s.sessionsByUser[username]++
+	return true
+}
+
+// releaseSession releases a session reservation. The caller must hold s.mu.
+func (s *UDPSessionRelay) releaseSession(username string) {
+	remaining := s.sessionsByUser[username] - 1
+	if remaining <= 0 {
+		delete(s.sessionsByUser, username)
+		return
+	}
+	s.sessionsByUser[username] = remaining
+}
+
+func (s *UDPSessionRelay) updatePeakSessions(active int) {
+	value := uint64(active)
+	for peak := s.peakSessions.Load(); value > peak; peak = s.peakSessions.Load() {
+		if s.peakSessions.CompareAndSwap(peak, value) {
+			return
+		}
 	}
 }
 
@@ -153,7 +198,77 @@ func (s *UDPSessionRelay) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	go s.logMetrics(ctx)
 	return nil
+}
+
+func (s *UDPSessionRelay) logMetrics(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	var lastSessionLimitDrops uint64
+	var lastUserSessionLimitDrops uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			activeSessions := len(s.table)
+			lastLimitedUser := s.lastLimitedUser
+			var busiestUser string
+			var busiestUserSessions int
+			for username, sessions := range s.sessionsByUser {
+				if sessions > busiestUserSessions {
+					busiestUser = username
+					busiestUserSessions = sessions
+				}
+			}
+			s.mu.Unlock()
+			sessionLimitDrops := s.dropSessionLimit.Load()
+			userSessionLimitDrops := s.dropUserSessionLimit.Load()
+			var maxSessions int
+			var maxSessionsPerUser int
+			if len(s.listeners) > 0 {
+				maxSessions = s.listeners[0].maxSessions
+				maxSessionsPerUser = s.listeners[0].maxSessionsPerUser
+			}
+			s.logger.Info("UDP relay metrics",
+				zap.Uint64("rxPackets", s.rxPackets.Load()),
+				zap.Uint64("rxBytes", s.rxBytes.Load()),
+				zap.Uint64("dropDecrypt", s.dropDecrypt.Load()),
+				zap.Uint64("dropForbidden", s.dropForbidden.Load()),
+				zap.Uint64("dropQueueFull", s.dropQueueFull.Load()),
+				zap.Uint64("dropSessionLimit", sessionLimitDrops),
+				zap.Uint64("dropUserSessionLimit", userSessionLimitDrops),
+				zap.Int("activeSessions", activeSessions),
+				zap.Uint64("peakSessions", s.peakSessions.Load()),
+				zap.String("busiestUser", busiestUser),
+				zap.Int("busiestUserSessions", busiestUserSessions),
+				zap.Int("maxSessions", maxSessions),
+				zap.Int("maxSessionsPerUser", maxSessionsPerUser),
+				zap.String("lastLimitedUser", lastLimitedUser),
+			)
+			if delta := sessionLimitDrops - lastSessionLimitDrops; delta > 0 {
+				s.logger.Warn("UDP sessions rejected by global limit",
+					zap.Uint64("rejectedSinceLastReport", delta),
+					zap.Uint64("rejectedTotal", sessionLimitDrops),
+					zap.Int("activeSessions", activeSessions),
+					zap.Int("maxSessions", maxSessions),
+				)
+			}
+			if delta := userSessionLimitDrops - lastUserSessionLimitDrops; delta > 0 {
+				s.logger.Warn("UDP sessions rejected by per-user limit",
+					zap.Uint64("rejectedSinceLastReport", delta),
+					zap.Uint64("rejectedTotal", userSessionLimitDrops),
+					zap.String("username", lastLimitedUser),
+					zap.Int("busiestUserSessions", busiestUserSessions),
+					zap.Int("maxSessionsPerUser", maxSessionsPerUser),
+				)
+			}
+			lastSessionLimitDrops = sessionLimitDrops
+			lastUserSessionLimitDrops = userSessionLimitDrops
+		}
+	}
 }
 
 func (s *UDPSessionRelay) startGeneric(ctx context.Context, index int, lnc *udpRelayServerConn) (err error) {
@@ -219,11 +334,14 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 			s.putQueuedPacket(queuedPacket)
 			continue
 		}
+		s.rxPackets.Add(1)
+		s.rxBytes.Add(uint64(n))
 
 		packet := recvBuf[:n]
 
 		csid, err := s.server.SessionInfo(packet)
 		if err != nil {
+			s.dropDecrypt.Add(1)
 			lnc.logger.Warn("Failed to extract session info from packet",
 				zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 				zap.Int("packetLength", n),
@@ -245,6 +363,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 			entry.serverConnUnpacker, entry.username, err = s.server.NewUnpacker(packet, csid)
 			if err != nil {
+				s.dropDecrypt.Add(1)
 				lnc.logger.Warn("Failed to create unpacker for client session",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 					zap.Uint64("clientSessionID", csid),
@@ -260,6 +379,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 		queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length, err = entry.serverConnUnpacker.UnpackInPlace(queuedPacket.buf, queuedPacket.clientAddrPort, s.packetBufFrontHeadroom, n)
 		if err != nil {
+			s.dropDecrypt.Add(1)
 			lnc.logger.Warn("Failed to unpack packet",
 				zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 				zap.String("username", entry.username),
@@ -273,6 +393,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 			continue
 		}
 		if s.observer != nil && !s.observer.Accept("udp", entry.username, queuedPacket.clientAddrPort, queuedPacket.targetAddr) {
+			s.dropForbidden.Add(1)
 			s.putQueuedPacket(queuedPacket)
 			s.mu.Unlock()
 			continue
@@ -331,9 +452,15 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 		}
 
 		if !ok {
+			if !s.reserveSession(entry.username, lnc) {
+				s.putQueuedPacket(queuedPacket)
+				s.mu.Unlock()
+				continue
+			}
 			natConnSendCh := make(chan *sessionQueuedPacket, lnc.sendChannelCapacity)
 			entry.natConnSendCh = natConnSendCh
 			s.table[csid] = entry
+			s.updatePeakSessions(len(s.table))
 
 			s.wg.Go(func() {
 				var sendChClean bool
@@ -342,6 +469,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 					s.mu.Lock()
 					close(natConnSendCh)
 					delete(s.table, csid)
+					s.releaseSession(entry.username)
 					s.mu.Unlock()
 
 					if !sendChClean {
@@ -435,7 +563,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 				// No more early returns!
 				sendChClean = true
 
-				lnc.logger.Info("UDP session relay started",
+				lnc.logger.Debug("UDP session relay started",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 					zap.String("username", entry.username),
 					zap.Uint64("clientSessionID", csid),
@@ -486,6 +614,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 		select {
 		case entry.natConnSendCh <- queuedPacket:
 		default:
+			s.dropQueueFull.Add(1)
 			if ce := lnc.logger.Check(zap.DebugLevel, "Dropping packet due to full send channel"); ce != nil {
 				ce.Write(
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),

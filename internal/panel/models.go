@@ -35,3 +35,8 @@ type TrafficDelta struct {
 	Upload   int64
 	Download int64
 }
+
+type TrafficBatch struct {
+	ID     string         `json:"id"`
+	Deltas []TrafficDelta `json:"deltas"`
+}

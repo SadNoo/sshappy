@@ -18,6 +18,32 @@ type CertificateManager struct {
 	store *tlscerts.Store
 }
 
+type certListSummary struct {
+	Name             string `json:"name"`
+	Reloadable       bool   `json:"reloadable,omitzero"`
+	CertificateCount int    `json:"certificateCount"`
+}
+
+type certPoolSummary struct {
+	Name            string `json:"name"`
+	CertificateCount int   `json:"certificateCount"`
+}
+
+func summarizeCertList(config tlscerts.TLSCertListConfig) certListSummary {
+	return certListSummary{
+		Name:             config.Name,
+		Reloadable:       config.Reloadable,
+		CertificateCount: len(config.Certs),
+	}
+}
+
+func summarizeCertPool(config tlscerts.X509CertPoolConfig) certPoolSummary {
+	return certPoolSummary{
+		Name:             config.Name,
+		CertificateCount: len(config.CertPaths),
+	}
+}
+
 // NewCertificateManager returns a new certificate manager.
 func NewCertificateManager(store *tlscerts.Store) *CertificateManager {
 	return &CertificateManager{
@@ -35,15 +61,23 @@ func (cm *CertificateManager) RegisterHandlers(register func(method string, path
 }
 
 func (cm *CertificateManager) newListCertListsHandler() restapi.HandlerFunc {
-	certLists := &cm.store.Config().CertLists
 	return func(w http.ResponseWriter, _ *http.Request) (int, error) {
+		configs := cm.store.Config().CertLists
+		certLists := make([]certListSummary, 0, len(configs))
+		for _, config := range configs {
+			certLists = append(certLists, summarizeCertList(config))
+		}
 		return restapi.EncodeResponse(w, http.StatusOK, certLists)
 	}
 }
 
 func (cm *CertificateManager) newListX509CertPoolsHandler() restapi.HandlerFunc {
-	certPools := &cm.store.Config().X509CertPools
 	return func(w http.ResponseWriter, _ *http.Request) (int, error) {
+		configs := cm.store.Config().X509CertPools
+		certPools := make([]certPoolSummary, 0, len(configs))
+		for _, config := range configs {
+			certPools = append(certPools, summarizeCertPool(config))
+		}
 		return restapi.EncodeResponse(w, http.StatusOK, certPools)
 	}
 }
@@ -60,7 +94,7 @@ func newGetCertListHandler(store *tlscerts.Store) restapi.HandlerFunc {
 		if !ok {
 			return restapi.EncodeResponse(w, http.StatusNotFound, &certListNotFoundJSON)
 		}
-		return restapi.EncodeResponse(w, http.StatusOK, certList.Config())
+		return restapi.EncodeResponse(w, http.StatusOK, summarizeCertList(*certList.Config()))
 	}
 }
 

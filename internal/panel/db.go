@@ -1,18 +1,29 @@
 package panel
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"math"
+	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 var processStartedAt = time.Now()
+
+const (
+	trafficSQLBatchSize = 50
+	aliveIPSQLBatchSize = 500
+)
 
 type Database struct {
 	db     *sql.DB
@@ -20,14 +31,12 @@ type Database struct {
 }
 
 func OpenDatabase(config Config) (*Database, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&loc=Local",
-		config.MySQLUser,
-		config.MySQLPassword,
-		config.MySQLHost,
-		config.MySQLPort,
-		config.MySQLDB,
-	)
-	db, err := sql.Open("mysql", dsn)
+	tlsMode, err := mysqlTLSMode(config)
+	if err != nil {
+		return nil, err
+	}
+	driverConfig := mysqlDriverConfig(config, tlsMode)
+	db, err := sql.Open("mysql", driverConfig.FormatDSN())
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +47,97 @@ func OpenDatabase(config Config) (*Database, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := ensureTrafficBatchTable(db, config.MySQLDB); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Database{db: db, config: config}, nil
+}
+
+func mysqlDriverConfig(config Config, tlsMode string) *mysql.Config {
+	driverConfig := mysql.NewConfig()
+	driverConfig.User = config.MySQLUser
+	driverConfig.Passwd = config.MySQLPassword
+	driverConfig.Net = "tcp"
+	driverConfig.Addr = net.JoinHostPort(config.MySQLHost, strconv.Itoa(config.MySQLPort))
+	driverConfig.DBName = config.MySQLDB
+	driverConfig.Params = map[string]string{"charset": "utf8mb4"}
+	driverConfig.ParseTime = true
+	driverConfig.Loc = time.Local
+	driverConfig.TLSConfig = tlsMode
+	driverConfig.Timeout = time.Duration(config.MySQLConnectTimeoutSeconds) * time.Second
+	driverConfig.ReadTimeout = time.Duration(config.MySQLIOTimeoutSeconds) * time.Second
+	driverConfig.WriteTimeout = time.Duration(config.MySQLIOTimeoutSeconds) * time.Second
+	return driverConfig
+}
+
+func ensureTrafficBatchTable(db *sql.DB, schema string) error {
+	var tableCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = ? AND table_name = 'sshappy_traffic_batch'
+	`, schema).Scan(&tableCount); err != nil {
+		return fmt.Errorf("failed to inspect traffic batch table: %w", err)
+	}
+	if tableCount > 0 {
+		return nil
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS sshappy_traffic_batch (
+			batch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+			node_id INT NOT NULL,
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (batch_id),
+			KEY node_created_at (node_id, created_at)
+		) ENGINE=InnoDB
+	`); err != nil {
+		return fmt.Errorf("failed to initialize traffic batch table: %w", err)
+	}
+	return nil
+}
+
+const mysqlTLSConfigName = "sshappy-panel-mysql"
+
+func mysqlTLSMode(config Config) (string, error) {
+	mode := strings.ToLower(config.MySQLTLSMode)
+	if mode == "" || mode == "auto" {
+		if config.MySQLHost == "localhost" {
+			return "false", nil
+		}
+		if ip := net.ParseIP(config.MySQLHost); ip != nil && ip.IsLoopback() {
+			return "false", nil
+		}
+		mode = "required"
+	}
+
+	switch mode {
+	case "disabled":
+		return "false", nil
+	case "preferred":
+		return mode, nil
+	case "required":
+		return "true", nil
+	case "verify":
+		data, err := os.ReadFile(config.MySQLTLSCA)
+		if err != nil {
+			return "", fmt.Errorf("failed to read MYSQL_TLS_CA: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(data) {
+			return "", fmt.Errorf("MYSQL_TLS_CA does not contain a valid certificate")
+		}
+		if err := mysql.RegisterTLSConfig(mysqlTLSConfigName, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    roots,
+			ServerName: config.MySQLHost,
+		}); err != nil {
+			return "", fmt.Errorf("failed to register MySQL TLS config: %w", err)
+		}
+		return mysqlTLSConfigName, nil
+	default:
+		return "", fmt.Errorf("unsupported MySQL TLS mode %q", config.MySQLTLSMode)
+	}
 }
 
 func (d *Database) Close() error {
@@ -127,38 +226,107 @@ func (d *Database) LoadUsers(node Node) ([]User, error) {
 	return users, rows.Err()
 }
 
-func (d *Database) ReportTraffic(node Node, traffic []TrafficDelta) error {
+func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error {
 	if len(traffic) == 0 {
 		return nil
 	}
+	committed, err := d.trafficBatchCommitted(node.ID, batchID)
+	if err != nil {
+		return err
+	}
+	if committed {
+		return nil
+	}
+
+	traffic = mergeTrafficDeltas(traffic)
+	sort.Slice(traffic, func(i, j int) bool {
+		return traffic[i].UserID < traffic[j].UserID
+	})
+	billed := make([]billedTrafficDelta, 0, len(traffic))
+	for _, delta := range traffic {
+		if delta.UserID <= 0 || delta.Upload < 0 || delta.Download < 0 {
+			return fmt.Errorf("invalid traffic delta for user %d", delta.UserID)
+		}
+		billedUpload := int64(float64(delta.Upload) * node.TrafficRate)
+		billedDownload := int64(float64(delta.Download) * node.TrafficRate)
+		billed = append(billed, billedTrafficDelta{
+			TrafficDelta:   delta,
+			BilledUpload:   billedUpload,
+			BilledDownload: billedDownload,
+			TrafficText:    flowAutoShow(int64(float64(delta.Upload+delta.Download) * node.TrafficRate)),
+		})
+	}
 	now := time.Now().Unix()
+	chunkIDs := make([]string, 0, (len(billed)+trafficSQLBatchSize-1)/trafficSQLBatchSize)
+	for start := 0; start < len(billed); start += trafficSQLBatchSize {
+		end := min(start+trafficSQLBatchSize, len(billed))
+		chunkID := trafficChunkID(batchID, node.ID, len(chunkIDs))
+		chunkIDs = append(chunkIDs, chunkID)
+		if err := d.reportTrafficChunk(node, chunkID, billed[start:end], now); err != nil {
+			return fmt.Errorf("traffic chunk %d/%d failed: %w", len(chunkIDs), (len(billed)+trafficSQLBatchSize-1)/trafficSQLBatchSize, err)
+		}
+	}
+	return d.finalizeTrafficBatch(node.ID, batchID, chunkIDs, now)
+}
+
+func (d *Database) trafficBatchCommitted(nodeID int, batchID string) (bool, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.Exec(
+		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
+		batchID,
+		nodeID,
+		time.Now().Unix(),
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return false, err
+	}
+	if err := tx.Rollback(); err != nil {
+		return false, err
+	}
+	return inserted == 0, nil
+}
+
+func (d *Database) reportTrafficChunk(node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
+	result, err := tx.Exec(
+		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
+		chunkID,
+		node.ID,
+		now,
+	)
+	if err != nil {
+		return err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if inserted == 0 {
+		return nil
+	}
+	query, args := userTrafficUpdateStatement(batch, now)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return err
+	}
+	query, args = trafficLogInsertStatement(batch, node, now)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return err
+	}
 	var total int64
-	for _, delta := range traffic {
-		billedUpload := int64(float64(delta.Upload) * node.TrafficRate)
-		billedDownload := int64(float64(delta.Download) * node.TrafficRate)
-		if _, err := tx.Exec(
-			"UPDATE user SET u = u + ?, d = d + ?, t = ? WHERE id = ?",
-			billedUpload,
-			billedDownload,
-			now,
-			delta.UserID,
-		); err != nil {
-			return err
-		}
-		trafficText := flowAutoShow(int64(float64(delta.Upload+delta.Download) * node.TrafficRate))
-		if _, err := tx.Exec(`
-			INSERT INTO user_traffic_log
-			  (user_id, u, d, node_id, rate, traffic, log_time)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, delta.UserID, delta.Upload, delta.Download, node.ID, node.TrafficRate, trafficText, now); err != nil {
-			return err
-		}
+	for _, delta := range batch {
 		total += delta.Upload + delta.Download
 	}
 	if _, err := tx.Exec(`
@@ -171,6 +339,130 @@ func (d *Database) ReportTraffic(node Node, traffic []TrafficDelta) error {
 	return tx.Commit()
 }
 
+func (d *Database) finalizeTrafficBatch(nodeID int, batchID string, chunkIDs []string, now int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
+		batchID,
+		nodeID,
+		now,
+	); err != nil {
+		return err
+	}
+	if len(chunkIDs) > 0 {
+		var query strings.Builder
+		query.WriteString("DELETE FROM sshappy_traffic_batch WHERE node_id = ? AND batch_id IN (")
+		appendSQLPlaceholders(&query, len(chunkIDs), 1)
+		query.WriteByte(')')
+		args := make([]any, 0, len(chunkIDs)+1)
+		args = append(args, nodeID)
+		for _, chunkID := range chunkIDs {
+			args = append(args, chunkID)
+		}
+		if _, err := tx.Exec(query.String(), args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func trafficChunkID(batchID string, nodeID, index int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", batchID, nodeID, index)))
+	return hex.EncodeToString(sum[:16])
+}
+
+type billedTrafficDelta struct {
+	TrafficDelta
+	BilledUpload   int64
+	BilledDownload int64
+	TrafficText    string
+}
+
+func userTrafficUpdateStatement(batch []billedTrafficDelta, now int64) (string, []any) {
+	var query strings.Builder
+	args := make([]any, 0, len(batch)*5+1)
+	query.WriteString("UPDATE user SET u = u + CASE id")
+	for _, delta := range batch {
+		query.WriteString(" WHEN ? THEN ?")
+		args = append(args, delta.UserID, delta.BilledUpload)
+	}
+	query.WriteString(" ELSE 0 END, d = d + CASE id")
+	for _, delta := range batch {
+		query.WriteString(" WHEN ? THEN ?")
+		args = append(args, delta.UserID, delta.BilledDownload)
+	}
+	query.WriteString(" ELSE 0 END, t = ? WHERE id IN (")
+	args = append(args, now)
+	appendSQLPlaceholders(&query, len(batch), 1)
+	query.WriteByte(')')
+	for _, delta := range batch {
+		args = append(args, delta.UserID)
+	}
+	return query.String(), args
+}
+
+func trafficLogInsertStatement(batch []billedTrafficDelta, node Node, now int64) (string, []any) {
+	var query strings.Builder
+	args := make([]any, 0, len(batch)*7)
+	query.WriteString("INSERT INTO user_traffic_log (user_id, u, d, node_id, rate, traffic, log_time) VALUES ")
+	appendSQLPlaceholders(&query, len(batch), 7)
+	for _, delta := range batch {
+		args = append(args, delta.UserID, delta.Upload, delta.Download, node.ID, node.TrafficRate, delta.TrafficText, now)
+	}
+	return query.String(), args
+}
+
+func appendSQLPlaceholders(builder *strings.Builder, rows, columns int) {
+	for row := 0; row < rows; row++ {
+		if row > 0 {
+			builder.WriteByte(',')
+		}
+		if columns > 1 {
+			builder.WriteByte('(')
+		}
+		for column := 0; column < columns; column++ {
+			if column > 0 {
+				builder.WriteByte(',')
+			}
+			builder.WriteByte('?')
+		}
+		if columns > 1 {
+			builder.WriteByte(')')
+		}
+	}
+}
+
+func (d *Database) CleanupTrafficBatches(nodeID, retentionDays int) (int64, error) {
+	if retentionDays == 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
+	const deleteBatchSize = 5000
+	var deletedTotal int64
+	for {
+		result, err := d.db.Exec(`
+			DELETE FROM sshappy_traffic_batch
+			WHERE node_id = ? AND created_at < ?
+			LIMIT ?
+		`, nodeID, cutoff, deleteBatchSize)
+		if err != nil {
+			return deletedTotal, err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return deletedTotal, err
+		}
+		deletedTotal += deleted
+		if deleted < deleteBatchSize {
+			return deletedTotal, nil
+		}
+	}
+}
+
 func (d *Database) ReportAliveIPs(node Node, alive map[int]map[string]struct{}) error {
 	if len(alive) == 0 {
 		return nil
@@ -181,20 +473,36 @@ func (d *Database) ReportAliveIPs(node Node, alive map[int]map[string]struct{}) 
 		return err
 	}
 	defer tx.Rollback()
+	records := make([]aliveIPRecord, 0)
 	for userID, ips := range alive {
 		for ip := range ips {
-			if _, err := tx.Exec(
-				"INSERT INTO alive_ip (nodeid, userid, ip, datetime) VALUES (?, ?, ?, ?)",
-				node.ID,
-				userID,
-				ip,
-				now,
-			); err != nil {
-				return err
-			}
+			records = append(records, aliveIPRecord{UserID: userID, IP: ip})
+		}
+	}
+	for start := 0; start < len(records); start += aliveIPSQLBatchSize {
+		end := min(start+aliveIPSQLBatchSize, len(records))
+		query, args := aliveIPInsertStatement(records[start:end], node.ID, now)
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+type aliveIPRecord struct {
+	UserID int
+	IP     string
+}
+
+func aliveIPInsertStatement(records []aliveIPRecord, nodeID int, now int64) (string, []any) {
+	var query strings.Builder
+	args := make([]any, 0, len(records)*4)
+	query.WriteString("INSERT INTO alive_ip (nodeid, userid, ip, datetime) VALUES ")
+	appendSQLPlaceholders(&query, len(records), 4)
+	for _, record := range records {
+		args = append(args, nodeID, record.UserID, record.IP, now)
+	}
+	return query.String(), args
 }
 
 func (d *Database) ReportNodeStatus(node Node, online int) error {

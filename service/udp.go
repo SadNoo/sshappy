@@ -109,4 +109,6 @@ type udpRelayServerConn struct {
 	serverRecvBatchSize int
 	sendChannelCapacity int
 	natTimeout          time.Duration
+	maxSessions         int
+	maxSessionsPerUser  int
 }

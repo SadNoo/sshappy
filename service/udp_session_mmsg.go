@@ -164,9 +164,12 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 			}
 
 			packet := queuedPacket.buf[s.packetBufFrontHeadroom : s.packetBufFrontHeadroom+int(msg.Msglen)]
+			s.rxPackets.Add(1)
+			s.rxBytes.Add(uint64(msg.Msglen))
 
 			csid, err := s.server.SessionInfo(packet)
 			if err != nil {
+				s.dropDecrypt.Add(1)
 				lnc.logger.Warn("Failed to extract session info from packet",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 					zap.Uint32("packetLength", msg.Msglen),
@@ -186,6 +189,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 
 				entry.serverConnUnpacker, entry.username, err = s.server.NewUnpacker(packet, csid)
 				if err != nil {
+					s.dropDecrypt.Add(1)
 					lnc.logger.Warn("Failed to create unpacker for client session",
 						zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 						zap.Uint64("clientSessionID", csid),
@@ -200,6 +204,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 
 			queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length, err = entry.serverConnUnpacker.UnpackInPlace(queuedPacket.buf, queuedPacket.clientAddrPort, s.packetBufFrontHeadroom, int(msg.Msglen))
 			if err != nil {
+				s.dropDecrypt.Add(1)
 				lnc.logger.Warn("Failed to unpack packet from serverConn",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 					zap.String("username", entry.username),
@@ -212,6 +217,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 				continue
 			}
 			if s.observer != nil && !s.observer.Accept("udp", entry.username, queuedPacket.clientAddrPort, queuedPacket.targetAddr) {
+				s.dropForbidden.Add(1)
 				s.putQueuedPacket(queuedPacket)
 				continue
 			}
@@ -267,9 +273,14 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 			}
 
 			if !ok {
+				if !s.reserveSession(entry.username, lnc) {
+					s.putQueuedPacket(queuedPacket)
+					continue
+				}
 				natConnSendCh := make(chan *sessionQueuedPacket, lnc.sendChannelCapacity)
 				entry.natConnSendCh = natConnSendCh
 				s.table[csid] = entry
+				s.updatePeakSessions(len(s.table))
 
 				s.wg.Go(func() {
 					var sendChClean bool
@@ -278,6 +289,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 						s.mu.Lock()
 						close(natConnSendCh)
 						delete(s.table, csid)
+						s.releaseSession(entry.username)
 						s.mu.Unlock()
 
 						if !sendChClean {
@@ -371,7 +383,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 					// No more early returns!
 					sendChClean = true
 
-					lnc.logger.Info("UDP session relay started",
+					lnc.logger.Debug("UDP session relay started",
 						zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 						zap.String("username", entry.username),
 						zap.Uint64("clientSessionID", csid),
@@ -424,6 +436,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 			select {
 			case entry.natConnSendCh <- queuedPacket:
 			default:
+				s.dropQueueFull.Add(1)
 				if ce := lnc.logger.Check(zap.DebugLevel, "Dropping packet due to full send channel"); ce != nil {
 					ce.Write(
 						zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
