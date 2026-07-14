@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
 
@@ -25,22 +24,32 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if err := config.Validate(); err != nil {
 		return err
 	}
+	dbHealth := &databaseHealth{}
+	dbStartedAt := time.Now()
 	db, err := OpenDatabase(config)
 	if err != nil {
 		return err
 	}
+	dbHealth.Record("open", dbStartedAt, nil)
 	defer db.Close()
 
+	startedAt := time.Now()
 	node, err := db.LoadNode()
+	dbHealth.Record("loadNode", startedAt, err)
 	if err != nil {
 		return err
 	}
-	if deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays); err != nil {
+	startedAt = time.Now()
+	deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+	dbHealth.Record("cleanupTrafficBatches", startedAt, err)
+	if err != nil {
 		logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
 	} else if deleted > 0 {
 		logger.Info("Traffic batch markers cleaned", zap.Int64("deleted", deleted))
 	}
+	startedAt = time.Now()
 	users, err := db.LoadUsers(node)
+	dbHealth.Record("loadUsers", startedAt, err)
 	if err != nil {
 		return err
 	}
@@ -50,6 +59,14 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	trafficReporter, err := newTrafficReporter(config.TrafficOutboxPath)
 	if err != nil {
 		return err
+	}
+	if outbox := trafficReporter.Metrics(time.Now()); outbox.Batches > 0 {
+		logger.Warn("Recovered pending traffic outbox",
+			zap.Int("batches", outbox.Batches),
+			zap.Int("users", outbox.Users),
+			zap.Int64("fileBytes", outbox.FileBytes),
+			zap.Duration("oldestAge", outbox.OldestAge),
+		)
 	}
 
 	state := NewState()
@@ -76,6 +93,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		zap.Bool("udpEnabled", config.EnableUDP),
 		zap.Int("trafficBatchRetentionDays", config.TrafficBatchRetentionDays),
 		zap.Int("trafficSQLBatchSize", trafficSQLBatchSize),
+		zap.Int("resourceReportSeconds", config.ResourceReportSeconds),
 	}
 	if config.EnableTCP {
 		startupFields = append(startupFields,
@@ -101,7 +119,8 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	trafficTicker := time.NewTicker(time.Duration(config.TrafficReportSeconds) * time.Second)
 	nodeTicker := time.NewTicker(time.Duration(config.NodeReportSeconds) * time.Second)
 	aliveTicker := time.NewTicker(time.Duration(config.AliveIPReportSeconds) * time.Second)
-	resourceTicker := time.NewTicker(time.Minute)
+	resourceTicker := time.NewTicker(time.Duration(config.ResourceReportSeconds) * time.Second)
+	monitor := &operationalMonitor{}
 	var cleanupTicker *time.Ticker
 	var cleanupC <-chan time.Time
 	if config.TrafficBatchRetentionDays > 0 {
@@ -122,7 +141,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		case <-ctx.Done():
 			cancel()
 			ok := <-runResult
-			if err := reportFinalTraffic(db, node, state, trafficReporter, logger); err != nil {
+			if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
 				return err
 			}
 			if !ok {
@@ -130,7 +149,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			}
 			return nil
 		case ok := <-runResult:
-			if err := reportFinalTraffic(db, node, state, trafficReporter, logger); err != nil {
+			if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
 				return err
 			}
 			if !ok {
@@ -138,7 +157,9 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			}
 			return errors.New("upstream service manager stopped unexpectedly")
 		case <-syncTicker.C:
+			startedAt := time.Now()
 			loadedNode, err := db.LoadNode()
+			dbHealth.Record("loadNode", startedAt, err)
 			if err != nil {
 				logger.Error("Failed to load node", zap.Error(err))
 				continue
@@ -147,7 +168,9 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 				!bytes.Equal(loadedNode.ServerKey, node.ServerKey) {
 				return errors.New("node port or server key changed; restart is required")
 			}
+			startedAt = time.Now()
 			loadedUsers, err := db.LoadUsers(loadedNode)
+			dbHealth.Record("loadUsers", startedAt, err)
 			if err != nil {
 				logger.Error("Failed to load users", zap.Error(err))
 				continue
@@ -161,30 +184,55 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
 		case <-trafficTicker.C:
 			startedAt := time.Now()
-			if err := reportTraffic(db, node, state, trafficReporter); err != nil {
-				logger.Error("Failed to report traffic", zap.Duration("duration", time.Since(startedAt)), zap.Error(err))
+			if err := reportTraffic(db, node, state, trafficReporter, dbHealth); err != nil {
+				outbox := trafficReporter.Metrics(time.Now())
+				logger.Error("Failed to report traffic",
+					zap.Duration("duration", time.Since(startedAt)),
+					zap.Int("outboxBatches", outbox.Batches),
+					zap.Int64("outboxFileBytes", outbox.FileBytes),
+					zap.Duration("outboxOldestAge", outbox.OldestAge),
+					zap.Error(err),
+				)
 			} else {
-				logger.Info("Traffic reported", zap.Duration("duration", time.Since(startedAt)))
+				logger.Info("Traffic reported",
+					zap.Duration("duration", time.Since(startedAt)),
+					zap.Int("outboxBatches", trafficReporter.Metrics(time.Now()).Batches),
+				)
 			}
 		case <-nodeTicker.C:
 			online := state.OnlineUserCount(onlineCountWindow(config))
-			if err := db.ReportNodeStatus(node, online); err != nil {
+			startedAt := time.Now()
+			err := db.ReportNodeStatus(node, online)
+			dbHealth.Record("reportNodeStatus", startedAt, err)
+			if err != nil {
 				logger.Error("Failed to report node status", zap.Error(err))
 			} else {
 				logger.Info("Node status reported", zap.Int("online", online))
 			}
 		case <-aliveTicker.C:
 			alive := state.SnapshotAliveIPs()
-			if err := db.ReportAliveIPs(node, alive); err != nil {
+			startedAt := time.Now()
+			err := db.ReportAliveIPs(node, alive)
+			dbHealth.Record("reportAliveIPs", startedAt, err)
+			if err != nil {
 				state.MergeAliveIPs(alive)
 				logger.Error("Failed to report alive IPs", zap.Error(err))
 			} else {
 				logger.Info("Alive IPs reported", zap.Int("users", len(alive)))
 			}
 		case <-resourceTicker.C:
-			logRuntimeMetrics(logger)
+			monitor.Log(
+				logger,
+				db.Stats(),
+				dbHealth.Snapshot(),
+				trafficReporter.Metrics(time.Now()),
+				state.PendingMetrics(),
+				state.OnlineUserCount(onlineCountWindow(config)),
+			)
 		case <-cleanupC:
+			startedAt := time.Now()
 			deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+			dbHealth.Record("cleanupTrafficBatches", startedAt, err)
 			if err != nil {
 				logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
 			} else {
@@ -194,26 +242,44 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	}
 }
 
-func reportTraffic(db *Database, node Node, state *State, reporter *trafficReporter) error {
-	// Flush a recovered or previously failed batch before assigning new traffic
-	// to a batch ID. This prevents newly captured traffic from being merged into
-	// a batch that MySQL has already committed.
-	if reporter.pending != nil {
-		if err := reporter.Flush(db, node); err != nil {
-			return err
-		}
-	}
+func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) error {
 	traffic := state.SnapshotTraffic()
 	if err := reporter.Capture(traffic); err != nil {
 		state.MergeTraffic(traffic)
 		return err
 	}
-	return reporter.Flush(db, node)
+	if len(reporter.pending) == 0 {
+		return nil
+	}
+	startedAt := time.Now()
+	err := reporter.Flush(db, node)
+	health.Record("reportTraffic", startedAt, err)
+	return err
 }
 
-func reportFinalTraffic(db *Database, node Node, state *State, reporter *trafficReporter, logger *zap.Logger) error {
-	if err := reportTraffic(db, node, state, reporter); err != nil {
-		return fmt.Errorf("failed to report final traffic: %w", err)
+func reportFinalTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth, logger *zap.Logger) error {
+	traffic := state.SnapshotTraffic()
+	if err := reporter.Capture(traffic); err != nil {
+		state.MergeTraffic(traffic)
+		return fmt.Errorf("failed to persist final traffic: %w", err)
+	}
+	if len(reporter.pending) == 0 {
+		logger.Info("Final traffic reported", zap.Int("pendingUsers", 0))
+		return nil
+	}
+	startedAt := time.Now()
+	err := reporter.Flush(db, node)
+	health.Record("reportFinalTraffic", startedAt, err)
+	if err != nil {
+		outbox := reporter.Metrics(time.Now())
+		logger.Warn("Final traffic persisted for retry",
+			zap.Int("pendingBatches", outbox.Batches),
+			zap.Int("pendingUsers", outbox.Users),
+			zap.Int64("outboxFileBytes", outbox.FileBytes),
+			zap.Duration("oldestAge", outbox.OldestAge),
+			zap.Error(err),
+		)
+		return nil
 	}
 	logger.Info("Final traffic reported", zap.Int("pendingUsers", reporter.PendingUsers()))
 	return nil
@@ -290,40 +356,6 @@ func newManager(config Config, node Node, runtime *Runtime, logger *zap.Logger) 
 		return nil, nil, errors.New("upstream credential manager is unavailable")
 	}
 	return manager, runtimeServer.CredentialManager, nil
-}
-
-type runtimeMetrics struct {
-	memoryHeapBytes      uint64
-	memoryHeapInuseBytes uint64
-	memorySysBytes       uint64
-	heapObjects          uint64
-	gcCycles             uint32
-	goroutines           int
-}
-
-func readRuntimeMetrics() runtimeMetrics {
-	var stats runtime.MemStats
-	runtime.ReadMemStats(&stats)
-	return runtimeMetrics{
-		memoryHeapBytes:      stats.HeapAlloc,
-		memoryHeapInuseBytes: stats.HeapInuse,
-		memorySysBytes:       stats.Sys,
-		heapObjects:          stats.HeapObjects,
-		gcCycles:             stats.NumGC,
-		goroutines:           runtime.NumGoroutine(),
-	}
-}
-
-func logRuntimeMetrics(logger *zap.Logger) {
-	metrics := readRuntimeMetrics()
-	logger.Info("Runtime resource metrics",
-		zap.Uint64("memoryHeapBytes", metrics.memoryHeapBytes),
-		zap.Uint64("memoryHeapInuseBytes", metrics.memoryHeapInuseBytes),
-		zap.Uint64("memorySysBytes", metrics.memorySysBytes),
-		zap.Uint64("heapObjects", metrics.heapObjects),
-		zap.Uint32("gcCycles", metrics.gcCycles),
-		zap.Int("goroutines", metrics.goroutines),
-	)
 }
 
 func writeCredentialFile(path string, users []User) error {

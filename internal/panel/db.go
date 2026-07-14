@@ -144,6 +144,10 @@ func (d *Database) Close() error {
 	return d.db.Close()
 }
 
+func (d *Database) Stats() sql.DBStats {
+	return d.db.Stats()
+}
+
 func (d *Database) LoadNode() (Node, error) {
 	var node Node
 	err := d.db.QueryRow(`

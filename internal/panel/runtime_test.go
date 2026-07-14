@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -71,12 +72,14 @@ func TestDefaultOperationalSettings(t *testing.T) {
 	t.Setenv("TRAFFIC_BATCH_RETENTION_DAYS", "")
 	t.Setenv("MYSQL_CONNECT_TIMEOUT_SECONDS", "")
 	t.Setenv("MYSQL_IO_TIMEOUT_SECONDS", "")
+	t.Setenv("RESOURCE_REPORT_SECONDS", "")
 	config := LoadConfig()
 	if !config.EnableTCP || !config.EnableUDP ||
 		config.TCPMaxHandshakes != 1024 ||
 		config.TCPMaxConnectionsPerUser != 800 ||
 		config.TCPTrafficFlushSeconds != 30 ||
 		config.TrafficBatchRetentionDays != 30 ||
+		config.ResourceReportSeconds != 60 ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
 		config.MySQLIOTimeoutSeconds != 30 {
 		t.Fatalf("unexpected operational defaults: %+v", config)
@@ -148,6 +151,35 @@ func TestRuntimeMetricsSnapshot(t *testing.T) {
 	metrics := readRuntimeMetrics()
 	if metrics.memoryHeapBytes == 0 || metrics.memorySysBytes == 0 || metrics.goroutines < 1 {
 		t.Fatalf("invalid runtime metrics: %+v", metrics)
+	}
+}
+
+func TestPendingStateMetrics(t *testing.T) {
+	state := NewState()
+	state.AddTraffic(7, 100, 200)
+	state.AddTraffic(9, 30, 40)
+	state.AddAliveIP(7, "192.0.2.1")
+	state.AddAliveIP(7, "192.0.2.2")
+	metrics := state.PendingMetrics()
+	if metrics.TrafficUsers != 2 || metrics.TrafficUploadBytes != 130 || metrics.TrafficDownloadBytes != 240 ||
+		metrics.AliveUsers != 1 || metrics.AliveRecords != 2 {
+		t.Fatalf("unexpected pending state metrics: %+v", metrics)
+	}
+}
+
+func TestDatabaseHealthTracksRecovery(t *testing.T) {
+	health := &databaseHealth{}
+	failedAt := time.Now().Add(-time.Millisecond)
+	health.Record("reportTraffic", failedAt, errors.New("timeout"))
+	health.Record("reportTraffic", failedAt, errors.New("timeout"))
+	snapshot := health.Snapshot()
+	if snapshot.Failures != 2 || snapshot.ConsecutiveFailures != 2 || snapshot.LastFailure.IsZero() {
+		t.Fatalf("unexpected failed health snapshot: %+v", snapshot)
+	}
+	health.Record("reportTraffic", failedAt, nil)
+	snapshot = health.Snapshot()
+	if snapshot.Successes != 1 || snapshot.ConsecutiveFailures != 0 || snapshot.LastSuccess.IsZero() {
+		t.Fatalf("unexpected recovered health snapshot: %+v", snapshot)
 	}
 }
 

@@ -37,6 +37,7 @@ type TrafficDelta struct {
 }
 
 type TrafficBatch struct {
-	ID     string         `json:"id"`
-	Deltas []TrafficDelta `json:"deltas"`
+	ID        string         `json:"id"`
+	CreatedAt int64          `json:"createdAt,omitempty"`
+	Deltas    []TrafficDelta `json:"deltas"`
 }

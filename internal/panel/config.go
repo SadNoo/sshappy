@@ -39,6 +39,7 @@ type Config struct {
 	TCPMaxConnectionsPerUser   int
 	TCPTrafficFlushSeconds     int
 	TrafficBatchRetentionDays  int
+	ResourceReportSeconds      int
 	loadError                  error
 }
 
@@ -76,6 +77,7 @@ func LoadConfig() Config {
 		TCPMaxConnectionsPerUser:   getenvInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPTrafficFlushSeconds:     getenvInt("TCP_TRAFFIC_FLUSH_SECONDS", 30),
 		TrafficBatchRetentionDays:  getenvInt("TRAFFIC_BATCH_RETENTION_DAYS", 30),
+		ResourceReportSeconds:      getenvInt("RESOURCE_REPORT_SECONDS", 60),
 		loadError:                  errors.Join(tcpErr, udpErr),
 	}
 }
@@ -115,6 +117,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("TCP_TRAFFIC_FLUSH_SECONDS must be positive")
 	case c.TrafficBatchRetentionDays < 0:
 		return fmt.Errorf("TRAFFIC_BATCH_RETENTION_DAYS must not be negative")
+	case c.ResourceReportSeconds < 10:
+		return fmt.Errorf("RESOURCE_REPORT_SECONDS must be at least 10")
 	case c.MySQLConnectTimeoutSeconds < 1:
 		return fmt.Errorf("MYSQL_CONNECT_TIMEOUT_SECONDS must be positive")
 	case c.MySQLIOTimeoutSeconds < 1:

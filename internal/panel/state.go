@@ -19,6 +19,14 @@ type State struct {
 	lastSeen map[int]time.Time
 }
 
+type pendingStateMetrics struct {
+	TrafficUsers         int
+	TrafficUploadBytes   int64
+	TrafficDownloadBytes int64
+	AliveUsers           int
+	AliveRecords         int
+}
+
 func NewState() *State {
 	state := &State{
 		alive:    make(map[int]map[string]struct{}),
@@ -108,4 +116,26 @@ func (s *State) OnlineUserCount(window time.Duration) int {
 		}
 	}
 	return online
+}
+
+func (s *State) PendingMetrics() pendingStateMetrics {
+	var metrics pendingStateMetrics
+	for i := range s.traffic {
+		shard := &s.traffic[i]
+		shard.mu.Lock()
+		metrics.TrafficUsers += len(shard.traffic)
+		for _, delta := range shard.traffic {
+			metrics.TrafficUploadBytes += delta.Upload
+			metrics.TrafficDownloadBytes += delta.Download
+		}
+		shard.mu.Unlock()
+	}
+
+	s.aliveMu.Lock()
+	metrics.AliveUsers = len(s.alive)
+	for _, ips := range s.alive {
+		metrics.AliveRecords += len(ips)
+	}
+	s.aliveMu.Unlock()
+	return metrics
 }
