@@ -69,17 +69,21 @@ func TestDefaultOperationalSettings(t *testing.T) {
 	t.Setenv("ENABLE_UDP", "")
 	t.Setenv("TCP_MAX_CONCURRENT_HANDSHAKES", "")
 	t.Setenv("TCP_TRAFFIC_FLUSH_SECONDS", "")
+	t.Setenv("TCP_MAX_ESTABLISHED_TOTAL", "")
 	t.Setenv("TRAFFIC_BATCH_RETENTION_DAYS", "")
 	t.Setenv("MYSQL_CONNECT_TIMEOUT_SECONDS", "")
 	t.Setenv("MYSQL_IO_TIMEOUT_SECONDS", "")
 	t.Setenv("RESOURCE_REPORT_SECONDS", "")
+	t.Setenv("OUTBOX_MIN_FREE_BYTES", "")
 	config := LoadConfig()
 	if !config.EnableTCP || !config.EnableUDP ||
 		config.TCPMaxHandshakes != 1024 ||
 		config.TCPMaxConnectionsPerUser != 800 ||
+		config.TCPMaxEstablishedTotal != 0 ||
 		config.TCPTrafficFlushSeconds != 30 ||
 		config.TrafficBatchRetentionDays != 30 ||
 		config.ResourceReportSeconds != 60 ||
+		config.OutboxMinFreeBytes != 256<<20 ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
 		config.MySQLIOTimeoutSeconds != 30 {
 		t.Fatalf("unexpected operational defaults: %+v", config)
@@ -142,6 +146,12 @@ func TestTCPConnectionLimitValidation(t *testing.T) {
 	}
 
 	config.TCPMaxConnectionsPerUser = 0
+	config.TCPMaxEstablishedTotal = -1
+	if err := config.Validate(); err == nil {
+		t.Fatal("negative total established TCP connection limit was accepted")
+	}
+
+	config.TCPMaxEstablishedTotal = 0
 	if err := config.Validate(); err != nil {
 		t.Fatalf("unlimited per-user TCP connections were rejected: %v", err)
 	}
@@ -180,6 +190,12 @@ func TestDatabaseHealthTracksRecovery(t *testing.T) {
 	snapshot = health.Snapshot()
 	if snapshot.Successes != 1 || snapshot.ConsecutiveFailures != 0 || snapshot.LastSuccess.IsZero() {
 		t.Fatalf("unexpected recovered health snapshot: %+v", snapshot)
+	}
+	health.Record("reportTraffic", failedAt, errors.New("timeout"))
+	health.Record("reportNodeStatus", failedAt, nil)
+	snapshot = health.Snapshot()
+	if snapshot.Operations["reportTraffic"].consecutiveFailures != 1 || snapshot.Operations["reportNodeStatus"].consecutiveFailures != 0 {
+		t.Fatalf("operation health was not tracked independently: %+v", snapshot.Operations)
 	}
 }
 

@@ -100,6 +100,10 @@ type TCPListenerConfig struct {
 	// Zero leaves per-user connections unlimited.
 	MaxConnectionsPerUser int `json:"maxConnectionsPerUser,omitzero"`
 
+	// MaxEstablishedConnections limits authenticated connections across all users.
+	// Zero leaves total established connections unlimited.
+	MaxEstablishedConnections int `json:"maxEstablishedConnections,omitzero"`
+
 	// TrafficFlushInterval controls how often active TCP sessions submit traffic deltas.
 	// The default is 30s.
 	TrafficFlushInterval jsoncfg.Duration `json:"trafficFlushInterval,omitzero"`
@@ -166,6 +170,9 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 	if lnc.MaxConnectionsPerUser < 0 {
 		return tcpRelayListener{}, fmt.Errorf("negative maximum connections per user: %d", lnc.MaxConnectionsPerUser)
 	}
+	if lnc.MaxEstablishedConnections < 0 {
+		return tcpRelayListener{}, fmt.Errorf("negative maximum established connections: %d", lnc.MaxEstablishedConnections)
+	}
 	trafficFlushInterval := lnc.TrafficFlushInterval.Value()
 	switch {
 	case trafficFlushInterval == 0:
@@ -200,6 +207,7 @@ func (lnc *TCPListenerConfig) Configure(listenConfigCache conn.ListenConfigCache
 		handshakeTimeout:             handshakeTimeout,
 		handshakeSlots:               make(chan struct{}, maxConcurrentHandshakes),
 		maxConnectionsPerUser:        lnc.MaxConnectionsPerUser,
+		maxEstablishedConnections:    lnc.MaxEstablishedConnections,
 		trafficFlushInterval:         trafficFlushInterval,
 		initialPayloadWaitTimeout:    initialPayloadWaitTimeout,
 		initialPayloadWaitBufferSize: initialPayloadWaitBufferSize,

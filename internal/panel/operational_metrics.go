@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,16 @@ type databaseHealth struct {
 	lastFailure         time.Time
 	lastOperation       string
 	lastDuration        time.Duration
+	operations          map[string]*databaseOperationHealth
+}
+
+type databaseOperationHealth struct {
+	successes           uint64
+	failures            uint64
+	consecutiveFailures uint64
+	lastSuccess         time.Time
+	lastFailure         time.Time
+	lastDuration        time.Duration
 }
 
 type databaseHealthSnapshot struct {
@@ -31,24 +42,44 @@ type databaseHealthSnapshot struct {
 	LastFailure         time.Time
 	LastOperation       string
 	LastDuration        time.Duration
+	Operations          map[string]databaseOperationHealth
 }
 
 func (h *databaseHealth) Record(operation string, startedAt time.Time, err error) {
 	now := time.Now()
+	if h.operations == nil {
+		h.operations = make(map[string]*databaseOperationHealth)
+	}
+	operationHealth := h.operations[operation]
+	if operationHealth == nil {
+		operationHealth = &databaseOperationHealth{}
+		h.operations[operation] = operationHealth
+	}
 	h.lastOperation = operation
 	h.lastDuration = now.Sub(startedAt)
+	operationHealth.lastDuration = h.lastDuration
 	if err != nil {
 		h.failures++
 		h.consecutiveFailures++
 		h.lastFailure = now
+		operationHealth.failures++
+		operationHealth.consecutiveFailures++
+		operationHealth.lastFailure = now
 		return
 	}
 	h.successes++
 	h.consecutiveFailures = 0
 	h.lastSuccess = now
+	operationHealth.successes++
+	operationHealth.consecutiveFailures = 0
+	operationHealth.lastSuccess = now
 }
 
 func (h *databaseHealth) Snapshot() databaseHealthSnapshot {
+	operations := make(map[string]databaseOperationHealth, len(h.operations))
+	for name, health := range h.operations {
+		operations[name] = *health
+	}
 	return databaseHealthSnapshot{
 		Successes:           h.successes,
 		Failures:            h.failures,
@@ -57,12 +88,17 @@ func (h *databaseHealth) Snapshot() databaseHealthSnapshot {
 		LastFailure:         h.lastFailure,
 		LastOperation:       h.lastOperation,
 		LastDuration:        h.lastDuration,
+		Operations:          operations,
 	}
 }
 
 type operationalMonitor struct {
-	lastDatabaseWarning time.Time
-	lastOutboxWarning   time.Time
+	lastDatabaseWarnings map[string]time.Time
+	lastOutboxWarning    time.Time
+	lastDiskWarning      time.Time
+	lastOutboxSample     time.Time
+	lastOutboxFileBytes  int64
+	outboxMinFreeBytes   int64
 }
 
 func (m *operationalMonitor) Log(
@@ -75,6 +111,17 @@ func (m *operationalMonitor) Log(
 ) {
 	now := time.Now()
 	runtimeMetrics := readRuntimeMetrics()
+	var outboxGrowthBytes int64
+	var outboxGrowthBytesPerSecond float64
+	if !m.lastOutboxSample.IsZero() {
+		outboxGrowthBytes = outbox.FileBytes - m.lastOutboxFileBytes
+		seconds := now.Sub(m.lastOutboxSample).Seconds()
+		if seconds > 0 {
+			outboxGrowthBytesPerSecond = float64(outboxGrowthBytes) / seconds
+		}
+	}
+	m.lastOutboxSample = now
+	m.lastOutboxFileBytes = outbox.FileBytes
 	fields := []zap.Field{
 		zap.Uint64("memoryHeapBytes", runtimeMetrics.memoryHeapBytes),
 		zap.Uint64("memoryHeapInuseBytes", runtimeMetrics.memoryHeapInuseBytes),
@@ -97,6 +144,12 @@ func (m *operationalMonitor) Log(
 		zap.Int64("outboxDownloadBytes", outbox.DownloadBytes),
 		zap.Int64("outboxFileBytes", outbox.FileBytes),
 		zap.Duration("outboxOldestAge", outbox.OldestAge),
+		zap.Int64("outboxGrowthBytes", outboxGrowthBytes),
+		zap.Float64("outboxGrowthBytesPerSecond", outboxGrowthBytesPerSecond),
+		zap.Bool("outboxDiskAvailable", outbox.DiskAvailable),
+		zap.Uint64("outboxDiskFreeBytes", outbox.DiskFreeBytes),
+		zap.Uint64("outboxDiskTotalBytes", outbox.DiskTotalBytes),
+		zap.Int64("outboxMinFreeBytes", m.outboxMinFreeBytes),
 		zap.Uint64("databaseSuccesses", health.Successes),
 		zap.Uint64("databaseFailures", health.Failures),
 		zap.Uint64("databaseConsecutiveFailures", health.ConsecutiveFailures),
@@ -111,17 +164,26 @@ func (m *operationalMonitor) Log(
 		zap.Duration("databaseWaitDuration", dbStats.WaitDuration),
 		zap.Int64("databaseMaxIdleClosed", dbStats.MaxIdleClosed),
 		zap.Int64("databaseMaxLifetimeClosed", dbStats.MaxLifetimeClosed),
+		databaseOperationsField(now, health.Operations),
 	}
 	logger.Info("Operational metrics", fields...)
 
-	if health.ConsecutiveFailures >= 3 && now.Sub(m.lastDatabaseWarning) >= operationalWarningInterval {
-		logger.Warn("Database operations are repeatedly failing",
-			zap.Uint64("consecutiveFailures", health.ConsecutiveFailures),
-			zap.Uint64("failuresTotal", health.Failures),
-			zap.String("lastOperation", health.LastOperation),
-			zap.Duration("lastSuccessAge", ageSince(now, health.LastSuccess)),
+	if m.lastDatabaseWarnings == nil {
+		m.lastDatabaseWarnings = make(map[string]time.Time)
+	}
+	operationNames := sortedDatabaseOperationNames(health.Operations)
+	for _, operation := range operationNames {
+		operationHealth := health.Operations[operation]
+		if operationHealth.consecutiveFailures < 3 || now.Sub(m.lastDatabaseWarnings[operation]) < operationalWarningInterval {
+			continue
+		}
+		logger.Warn("Database operation is repeatedly failing",
+			zap.String("operation", operation),
+			zap.Uint64("consecutiveFailures", operationHealth.consecutiveFailures),
+			zap.Uint64("failuresTotal", operationHealth.failures),
+			zap.Duration("lastSuccessAge", ageSince(now, operationHealth.lastSuccess)),
 		)
-		m.lastDatabaseWarning = now
+		m.lastDatabaseWarnings[operation] = now
 	}
 	if (outbox.Batches >= 5 || outbox.OldestAge >= 5*time.Minute) && now.Sub(m.lastOutboxWarning) >= operationalWarningInterval {
 		logger.Warn("Traffic outbox is accumulating",
@@ -132,6 +194,41 @@ func (m *operationalMonitor) Log(
 		)
 		m.lastOutboxWarning = now
 	}
+	if outbox.DiskAvailable && m.outboxMinFreeBytes > 0 && outbox.DiskFreeBytes < uint64(m.outboxMinFreeBytes) && now.Sub(m.lastDiskWarning) >= operationalWarningInterval {
+		logger.Warn("Traffic outbox disk space is low",
+			zap.Uint64("freeBytes", outbox.DiskFreeBytes),
+			zap.Uint64("totalBytes", outbox.DiskTotalBytes),
+			zap.Int64("minimumFreeBytes", m.outboxMinFreeBytes),
+			zap.Int64("outboxFileBytes", outbox.FileBytes),
+			zap.Int64("outboxGrowthBytes", outboxGrowthBytes),
+		)
+		m.lastDiskWarning = now
+	}
+}
+
+func databaseOperationsField(now time.Time, operations map[string]databaseOperationHealth) zap.Field {
+	fields := make([]zap.Field, 0, len(operations))
+	for _, name := range sortedDatabaseOperationNames(operations) {
+		health := operations[name]
+		fields = append(fields, zap.Dict(name,
+			zap.Uint64("successes", health.successes),
+			zap.Uint64("failures", health.failures),
+			zap.Uint64("consecutiveFailures", health.consecutiveFailures),
+			zap.Duration("lastSuccessAge", ageSince(now, health.lastSuccess)),
+			zap.Duration("lastFailureAge", ageSince(now, health.lastFailure)),
+			zap.Duration("lastDuration", health.lastDuration),
+		))
+	}
+	return zap.Dict("databaseOperations", fields...)
+}
+
+func sortedDatabaseOperationNames(operations map[string]databaseOperationHealth) []string {
+	names := make([]string, 0, len(operations))
+	for name := range operations {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func ageSince(now, value time.Time) time.Duration {

@@ -86,6 +86,38 @@ func TestTrafficReporterLoadsLegacyOutbox(t *testing.T) {
 	}
 }
 
+func TestTrafficReporterQuarantinesInvalidOutbox(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
+	invalid := []byte(`{"version":1,"batches":[`)
+	if err := os.WriteFile(path, invalid, 0600); err != nil {
+		t.Fatal(err)
+	}
+	reporter, err := newTrafficReporter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := reporter.Recovery()
+	if recovery == nil || recovery.Cause == nil || recovery.BackupPath == "" {
+		t.Fatalf("invalid outbox recovery = %+v", recovery)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid outbox was not moved: %v", err)
+	}
+	backup, err := os.ReadFile(recovery.BackupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup, invalid) {
+		t.Fatalf("quarantined outbox changed: %q", backup)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("new outbox was not created after recovery: %v", err)
+	}
+}
+
 func TestTrafficReporterQueuesWhileDatabaseIsUnavailable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
 	reporter, err := newTrafficReporter(path)

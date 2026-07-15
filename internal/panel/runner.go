@@ -60,6 +60,12 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if err != nil {
 		return err
 	}
+	if recovery := trafficReporter.Recovery(); recovery != nil {
+		logger.Error("Invalid traffic outbox quarantined",
+			zap.String("backupPath", recovery.BackupPath),
+			zap.Error(recovery.Cause),
+		)
+	}
 	if outbox := trafficReporter.Metrics(time.Now()); outbox.Batches > 0 {
 		logger.Warn("Recovered pending traffic outbox",
 			zap.Int("batches", outbox.Batches),
@@ -94,11 +100,13 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		zap.Int("trafficBatchRetentionDays", config.TrafficBatchRetentionDays),
 		zap.Int("trafficSQLBatchSize", trafficSQLBatchSize),
 		zap.Int("resourceReportSeconds", config.ResourceReportSeconds),
+		zap.Int64("outboxMinFreeBytes", config.OutboxMinFreeBytes),
 	}
 	if config.EnableTCP {
 		startupFields = append(startupFields,
 			zap.Int("tcpMaxConcurrentHandshakes", config.TCPMaxHandshakes),
 			zap.Int("tcpMaxConnectionsPerUser", config.TCPMaxConnectionsPerUser),
+			zap.Int("tcpMaxEstablishedTotal", config.TCPMaxEstablishedTotal),
 			zap.Int("tcpTrafficFlushSeconds", config.TCPTrafficFlushSeconds),
 		)
 	}
@@ -120,7 +128,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	nodeTicker := time.NewTicker(time.Duration(config.NodeReportSeconds) * time.Second)
 	aliveTicker := time.NewTicker(time.Duration(config.AliveIPReportSeconds) * time.Second)
 	resourceTicker := time.NewTicker(time.Duration(config.ResourceReportSeconds) * time.Second)
-	monitor := &operationalMonitor{}
+	monitor := &operationalMonitor{outboxMinFreeBytes: config.OutboxMinFreeBytes}
 	var cleanupTicker *time.Ticker
 	var cleanupC <-chan time.Time
 	if config.TrafficBatchRetentionDays > 0 {
@@ -308,11 +316,12 @@ func newManager(config Config, node Node, runtime *Runtime, logger *zap.Logger) 
 				Network: "tcp",
 				Address: address,
 			},
-			FastOpen:                true,
-			FastOpenFallback:        true,
-			MaxConcurrentHandshakes: config.TCPMaxHandshakes,
-			MaxConnectionsPerUser:   config.TCPMaxConnectionsPerUser,
-			TrafficFlushInterval:    jsoncfg.Duration(time.Duration(config.TCPTrafficFlushSeconds) * time.Second),
+			FastOpen:                  true,
+			FastOpenFallback:          true,
+			MaxConcurrentHandshakes:   config.TCPMaxHandshakes,
+			MaxConnectionsPerUser:     config.TCPMaxConnectionsPerUser,
+			MaxEstablishedConnections: config.TCPMaxEstablishedTotal,
+			TrafficFlushInterval:      jsoncfg.Duration(time.Duration(config.TCPTrafficFlushSeconds) * time.Second),
 		}}
 	}
 	if config.EnableUDP {

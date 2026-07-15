@@ -37,9 +37,11 @@ type Config struct {
 	TrafficOutboxPath          string
 	TCPMaxHandshakes           int
 	TCPMaxConnectionsPerUser   int
+	TCPMaxEstablishedTotal     int
 	TCPTrafficFlushSeconds     int
 	TrafficBatchRetentionDays  int
 	ResourceReportSeconds      int
+	OutboxMinFreeBytes         int64
 	loadError                  error
 }
 
@@ -75,9 +77,11 @@ func LoadConfig() Config {
 		TrafficOutboxPath:          getenv("TRAFFIC_OUTBOX_PATH", "/var/lib/sshappy/traffic-outbox.json"),
 		TCPMaxHandshakes:           getenvInt("TCP_MAX_CONCURRENT_HANDSHAKES", 1024),
 		TCPMaxConnectionsPerUser:   getenvInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
+		TCPMaxEstablishedTotal:     getenvInt("TCP_MAX_ESTABLISHED_TOTAL", 0),
 		TCPTrafficFlushSeconds:     getenvInt("TCP_TRAFFIC_FLUSH_SECONDS", 30),
 		TrafficBatchRetentionDays:  getenvInt("TRAFFIC_BATCH_RETENTION_DAYS", 30),
 		ResourceReportSeconds:      getenvInt("RESOURCE_REPORT_SECONDS", 60),
+		OutboxMinFreeBytes:         getenvInt64("OUTBOX_MIN_FREE_BYTES", 256<<20),
 		loadError:                  errors.Join(tcpErr, udpErr),
 	}
 }
@@ -113,12 +117,16 @@ func (c Config) Validate() error {
 		return fmt.Errorf("TCP_MAX_CONCURRENT_HANDSHAKES must be positive")
 	case c.EnableTCP && c.TCPMaxConnectionsPerUser < 0:
 		return fmt.Errorf("TCP_MAX_CONNECTIONS_PER_USER must not be negative")
+	case c.EnableTCP && c.TCPMaxEstablishedTotal < 0:
+		return fmt.Errorf("TCP_MAX_ESTABLISHED_TOTAL must not be negative")
 	case c.EnableTCP && c.TCPTrafficFlushSeconds < 1:
 		return fmt.Errorf("TCP_TRAFFIC_FLUSH_SECONDS must be positive")
 	case c.TrafficBatchRetentionDays < 0:
 		return fmt.Errorf("TRAFFIC_BATCH_RETENTION_DAYS must not be negative")
 	case c.ResourceReportSeconds < 10:
 		return fmt.Errorf("RESOURCE_REPORT_SECONDS must be at least 10")
+	case c.OutboxMinFreeBytes < 0:
+		return fmt.Errorf("OUTBOX_MIN_FREE_BYTES must not be negative")
 	case c.MySQLConnectTimeoutSeconds < 1:
 		return fmt.Errorf("MYSQL_CONNECT_TIMEOUT_SECONDS must be positive")
 	case c.MySQLIOTimeoutSeconds < 1:
@@ -153,6 +161,18 @@ func getenvInt(name string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvInt64(name string, fallback int64) int64 {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

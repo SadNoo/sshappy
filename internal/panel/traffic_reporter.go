@@ -13,6 +13,8 @@ import (
 
 const trafficOutboxVersion = 1
 
+const trafficOutboxWriteHeadroom = 1 << 20
+
 type trafficDatabase interface {
 	ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error
 }
@@ -23,25 +25,37 @@ type trafficOutbox struct {
 }
 
 type trafficOutboxMetrics struct {
-	Batches       int
-	Users         int
-	Records       int
-	UploadBytes   int64
-	DownloadBytes int64
-	FileBytes     int64
-	OldestAge     time.Duration
+	Batches        int
+	Users          int
+	Records        int
+	UploadBytes    int64
+	DownloadBytes  int64
+	FileBytes      int64
+	OldestAge      time.Duration
+	DiskAvailable  bool
+	DiskFreeBytes  uint64
+	DiskTotalBytes uint64
+}
+
+type trafficOutboxRecovery struct {
+	BackupPath string
+	Cause      error
 }
 
 type trafficReporter struct {
 	path      string
 	pending   []TrafficBatch
 	fileBytes int64
+	recovery  *trafficOutboxRecovery
 }
 
 func newTrafficReporter(path string) (*trafficReporter, error) {
 	reporter := &trafficReporter{path: path}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create traffic outbox directory: %w", err)
+		}
 		return reporter, nil
 	}
 	if err != nil {
@@ -53,7 +67,12 @@ func newTrafficReporter(path string) (*trafficReporter, error) {
 	}
 	batches, err := decodeTrafficOutbox(data, info.ModTime())
 	if err != nil {
-		return nil, err
+		backupPath, quarantineErr := quarantineCorruptOutbox(path)
+		if quarantineErr != nil {
+			return nil, fmt.Errorf("failed to quarantine invalid traffic outbox as %q after %v: %w", backupPath, err, quarantineErr)
+		}
+		reporter.recovery = &trafficOutboxRecovery{BackupPath: backupPath, Cause: err}
+		return reporter, nil
 	}
 	reporter.pending = batches
 	reporter.fileBytes = int64(len(data))
@@ -168,6 +187,10 @@ func (r *trafficReporter) PendingUsers() int {
 	return r.Metrics(time.Now()).Users
 }
 
+func (r *trafficReporter) Recovery() *trafficOutboxRecovery {
+	return r.recovery
+}
+
 func (r *trafficReporter) Metrics(now time.Time) trafficOutboxMetrics {
 	metrics := trafficOutboxMetrics{
 		Batches:   len(r.pending),
@@ -189,6 +212,11 @@ func (r *trafficReporter) Metrics(now time.Time) trafficOutboxMetrics {
 		}
 	}
 	metrics.Users = len(users)
+	if disk, err := readDiskSpace(filepath.Dir(r.path)); err == nil {
+		metrics.DiskAvailable = true
+		metrics.DiskFreeBytes = disk.FreeBytes
+		metrics.DiskTotalBytes = disk.TotalBytes
+	}
 	return metrics
 }
 
@@ -209,10 +237,33 @@ func (r *trafficReporter) persist(batches []TrafficBatch) (int64, error) {
 	if err != nil {
 		return r.fileBytes, fmt.Errorf("failed to encode traffic outbox: %w", err)
 	}
+	dir := filepath.Dir(r.path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return r.fileBytes, fmt.Errorf("failed to create traffic outbox directory: %w", err)
+	}
+	if disk, err := readDiskSpace(dir); err == nil && disk.FreeBytes < uint64(len(data))+trafficOutboxWriteHeadroom {
+		return r.fileBytes, fmt.Errorf("traffic outbox disk space is too low: free=%d required=%d", disk.FreeBytes, uint64(len(data))+trafficOutboxWriteHeadroom)
+	}
 	if err := writeFileAtomic(r.path, data, 0600); err != nil {
 		return r.fileBytes, fmt.Errorf("failed to persist traffic outbox: %w", err)
 	}
 	return int64(len(data)), nil
+}
+
+func quarantineCorruptOutbox(path string) (string, error) {
+	backupPath := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	if err := os.Rename(path, backupPath); err != nil {
+		return "", err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return backupPath, err
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return backupPath, err
+	}
+	return backupPath, nil
 }
 
 func newTrafficBatchID() (string, error) {
