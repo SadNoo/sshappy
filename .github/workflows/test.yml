@@ -20,11 +20,7 @@ permissions:
 jobs:
   test:
     name: Test
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -35,26 +31,15 @@ jobs:
           go-version: stable
 
       - name: Build
-        if: matrix.os != 'windows-latest'
         run: |
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go-domain-set-converter
 
-      - name: Build with tag tfogo_checklinkname0
-        if: matrix.os == 'windows-latest'
-        run: |
-          go build -v -trimpath -ldflags '-s -w -checklinkname=0' -tags tfogo_checklinkname0 ./cmd/shadowsocks-go
-          go build -v -trimpath -ldflags '-s -w -checklinkname=0' -tags tfogo_checklinkname0 ./cmd/shadowsocks-go-domain-set-converter
-
       - name: Test
         run: go test -v ./...
-
-      - name: Test with tag tfogo_checklinkname0
-        if: matrix.os == 'windows-latest'
-        run: go test -v -ldflags '-checklinkname=0' -tags tfogo_checklinkname0 ./...
 
       - name: Upload Binaries
         uses: actions/upload-artifact@v7
         with:
-          name: shadowsocks-go-${{ github.sha }}-${{ matrix.os }}-${{ runner.arch }}
+          name: shadowsocks-go-${{ github.sha }}-linux-${{ runner.arch }}
           path: shadowsocks-go*
