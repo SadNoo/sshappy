@@ -95,9 +95,9 @@ docker compose -f deploy/compose.yaml up -d
 注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。测试标签为 `sadno/ssbad:1.0`，本轮已验证的 linux/amd64 registry digest 为：
 
 ~~~text
-sadno/ssbad@sha256:9e8a7cecf49f93096c5e15f7ce6e61e826b6a34fe9b58fe51ab96febfecbdfce
+sadno/ssbad:1.0@sha256:41893dc9e78a4b12d35727e4ecdc0668053eb863763d5625d8a4412e99b8a00a
 ~~~
 
-生产部署应锁定该类 digest，不能只依赖可变标签。镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+该镜像的 `org.opencontainers.image.revision` 为 `b029471fe3c6e7c59eae7b76b91b3e6c59355dc9`。生产部署应锁定 digest，不能只依赖可变标签；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
-下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。
+下一阶段是建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。
