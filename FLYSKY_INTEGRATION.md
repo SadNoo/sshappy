@@ -29,3 +29,75 @@
 - ../docs/05-ss2022-contract.md
 
 正式 Flysky 构建最终不得链接 MySQL 驱动。
+
+## 当前适配进度
+
+控制面客户端位于 `internal/flyskyapi`，已经覆盖：
+
+- Node API capabilities、一次性注册、机器凭据轮换与状态心跳；
+- SS2022 全量快照与游标增量变更；
+- HTTPS 默认强制、认证请求禁止重定向、响应大小上限和脱敏 API 错误；
+- 机器凭据与同步游标的 `0600` 原子本地持久化。
+- `usage-reports` 与 `alive-ips` 上报，以及严格校验服务端回执。
+
+第二阶段运行适配位于 `internal/flyskynode`，已经覆盖：
+
+- Flysky 正式入口只接受 `SSBAD_MODE=flysky`（未设置时也进入 Flysky）；二进制不链接旧 MySQL Panel 适配；
+- UUID 用户标识、订阅有效期、剩余额度和快照 TTL 的默认拒绝授权；
+- 全量 snapshot 启动、`upsert_user`/`revoke_user` 热更新和 `410` 全量恢复；
+- 先原子更新凭据与快照，最后推进本地 cursor；重复拉取可幂等重放；
+- 节点端口或 server key 变化返回明确的 restart required，不进行危险的半热更新；
+- HTTPS 容器补充系统 CA，注册令牌只从受限文件读取并在成功换取机器凭据后尝试删除。
+- UUID 流量批次与在线 IP 汇总共用 `0600` 原子 Outbox；断网时保留原 report_id 和 sequence，只有收到匹配的 `202 accepted` 才删除。
+- 在线 IP 默认只离开进程的是节点级 `online_ip_count`、`active_users` 和预留连接数，不上传原始客户端 IP。
+- 显式 `unlimited` 字段区分无限套餐与额度耗尽，避免把合法的零值约定误判为无额度。
+- IPv4、IPv6 和双栈监听统一使用标准地址拼接，`LISTEN_HOST=::` 可正确生成 `[::]:port`。
+
+### Flysky 联调配置
+
+| 变量 | 用途 |
+| --- | --- |
+| `SSBAD_MODE=flysky` | 选择新 Node API 路径 |
+| `FLYSKY_CONTROL_PLANE_URL` | Panel HTTPS 根地址 |
+| `FLYSKY_ENROLLMENT_TOKEN_PATH` | 一次性注册令牌文件，默认 `/run/secrets/flysky-enrollment-token` |
+| `FLYSKY_MACHINE_CREDENTIAL_PATH` | 机器凭据状态文件 |
+| `FLYSKY_SNAPSHOT_PATH` | 最后有效快照缓存 |
+| `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |
+| `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
+| `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
+| `FLYSKY_CHANGE_POLL_SECONDS` | 增量同步周期 |
+| `FLYSKY_HEARTBEAT_SECONDS` | 状态心跳周期 |
+| `FLYSKY_USAGE_REPORT_SECONDS` | 流量落盘与上报周期，默认 30 秒 |
+| `FLYSKY_ALIVE_IP_REPORT_SECONDS` | 在线 IP 汇总周期，默认 60 秒 |
+
+原先的 `FLYSKY_INTEGRATION_MODE` 临时未计费 Gate 已移除。Flysky 路径现在必须成功打开持久 Outbox 才能启动；损坏、权限过宽或无法读取的 Outbox 会阻止启动，不能静默丢弃待计费数据。`FLYSKY_ALLOW_INSECURE_HTTP=true` 只允许本机回环联调，远程控制面始终要求 HTTPS。
+
+### Debian 与容器验证
+
+2026-07-23 已在 Debian 11 和 Debian 12 amd64 完成兼容验收：
+
+- 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
+- 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
+- Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
+- `sadno/ssbad:1.0` 镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归，并已发布到 Docker Hub。
+
+Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
+
+~~~bash
+install -d -m 0700 /var/lib/flysky/ssbad /etc/flysky/ssbad/secrets
+cp deploy/flysky-node.env.example deploy/flysky-node.env
+chmod 0600 deploy/flysky-node.env
+install -m 0600 /path/to/enrollment-token /etc/flysky/ssbad/secrets/enrollment-token
+docker compose -f deploy/compose.yaml pull
+docker compose -f deploy/compose.yaml up -d
+~~~
+
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。测试标签为 `sadno/ssbad:1.0`，本轮已验证的 linux/amd64 registry digest 为：
+
+~~~text
+sadno/ssbad@sha256:9e8a7cecf49f93096c5e15f7ce6e61e826b6a34fe9b58fe51ab96febfecbdfce
+~~~
+
+生产部署应锁定该类 digest，不能只依赖可变标签。镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+
+下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。

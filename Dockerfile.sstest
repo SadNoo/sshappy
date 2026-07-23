@@ -1,11 +1,22 @@
-FROM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
+RUN apk add --no-cache ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/sstest ./cmd/sstest
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -ldflags="-s -w" -o /out/sstest ./cmd/sstest
 
 FROM scratch
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="ssbad" \
+      org.opencontainers.image.description="Flysky SS2022 single-port node runtime" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION" \
+      org.opencontainers.image.source="https://github.com/SadNoo/sshappy"
 COPY --from=build /out/sstest /usr/local/bin/sstest
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY LICENSE /
 ENTRYPOINT ["/usr/local/bin/sstest"]

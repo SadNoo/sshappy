@@ -40,6 +40,19 @@ jobs:
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go-domain-set-converter
 
+      - name: Build Flysky ssbad
+        if: matrix.os == 'ubuntu-latest'
+        run: go build -v -trimpath -ldflags '-s -w' ./cmd/sstest
+
+      - name: Ensure Flysky ssbad does not link the MySQL panel
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          if go list -deps ./cmd/sstest | grep -E 'go-sql-driver/mysql|internal/panel'; then
+            echo "Flysky ssbad must not link MySQL or the legacy panel adapter"
+            exit 1
+          fi
+
       - name: Build with tag tfogo_checklinkname0
         if: matrix.os == 'windows-latest'
         run: |
