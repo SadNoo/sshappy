@@ -1,0 +1,27 @@
+name: flysky-ssbad
+
+services:
+  ssbad:
+    image: ${SSBAD_IMAGE:-sadno/ssbad:1.0}
+    network_mode: host
+    env_file:
+      - ${SSBAD_ENV_FILE:-./flysky-node.env}
+    environment:
+      FLYSKY_ENROLLMENT_TOKEN_PATH: /run/secrets/flysky/enrollment-token
+      FLYSKY_MACHINE_CREDENTIAL_PATH: /var/lib/flysky/machine.json
+      FLYSKY_SNAPSHOT_PATH: /var/lib/flysky/snapshot.json
+      FLYSKY_SYNC_STATE_PATH: /var/lib/flysky/sync.json
+      FLYSKY_REPORT_OUTBOX_PATH: /var/lib/flysky/reports.json
+      UPSK_STORE_PATH: /var/lib/flysky/users.json
+    volumes:
+      - ${SSBAD_STATE_DIR:-/var/lib/flysky/ssbad}:/var/lib/flysky:rw
+      - ${SSBAD_SECRET_DIR:-/etc/flysky/ssbad/secrets}:/run/secrets/flysky:rw
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 30s

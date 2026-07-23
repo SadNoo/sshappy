@@ -1,0 +1,29 @@
+[Unit]
+Description=Flysky ssbad node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ssbad
+Group=ssbad
+EnvironmentFile=/etc/flysky/ssbad/node.env
+ExecStart=/usr/local/bin/sstest
+WorkingDirectory=/var/lib/flysky/ssbad
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/flysky/ssbad /etc/flysky/ssbad/secrets
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/*-key
+**/*-key.*
+**/*.pem
+**/*.p12
+**/*.pfx
+coverage*
+*.out
