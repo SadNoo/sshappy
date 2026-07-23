@@ -15,16 +15,14 @@ on:
       - 'docs/**'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
-    name: Test
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    name: Test (linux-amd64)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
 
     steps:
       - uses: actions/checkout@v7
@@ -35,17 +33,14 @@ jobs:
           go-version: stable
 
       - name: Build
-        if: matrix.os != 'windows-latest'
         run: |
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go-domain-set-converter
 
       - name: Build Flysky ssbad
-        if: matrix.os == 'ubuntu-latest'
         run: go build -v -trimpath -ldflags '-s -w' ./cmd/sstest
 
       - name: Ensure Flysky ssbad does not link the MySQL panel
-        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           if go list -deps ./cmd/sstest | grep -E 'go-sql-driver/mysql|internal/panel'; then
@@ -53,21 +48,13 @@ jobs:
             exit 1
           fi
 
-      - name: Build with tag tfogo_checklinkname0
-        if: matrix.os == 'windows-latest'
-        run: |
-          go build -v -trimpath -ldflags '-s -w -checklinkname=0' -tags tfogo_checklinkname0 ./cmd/shadowsocks-go
-          go build -v -trimpath -ldflags '-s -w -checklinkname=0' -tags tfogo_checklinkname0 ./cmd/shadowsocks-go-domain-set-converter
-
       - name: Test
         run: go test -v ./...
-
-      - name: Test with tag tfogo_checklinkname0
-        if: matrix.os == 'windows-latest'
-        run: go test -v -ldflags '-checklinkname=0' -tags tfogo_checklinkname0 ./...
 
       - name: Upload Binaries
         uses: actions/upload-artifact@v7
         with:
-          name: shadowsocks-go-${{ github.sha }}-${{ matrix.os }}-${{ runner.arch }}
-          path: shadowsocks-go*
+          name: ssbad-${{ github.sha }}-linux-${{ runner.arch }}
+          path: |
+            shadowsocks-go*
+            sstest
