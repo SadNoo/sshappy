@@ -2,9 +2,9 @@
 
 本目录是 SadNoo/sshappy 的独立 Git worktree：
 
-- 分支：integration/flysky
+- 分支：integration/flysky-2.0
 - 基线：origin/4.2
-- 起点：73aa426ef5c1e4f9fd67639846836d0386cbe0e5
+- 起点：39a795fd7b2b1e81143e222b2918d9526be89740
 
 ## 责任
 
@@ -79,7 +79,7 @@
 - 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
 - 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
 - Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
-- `sadno/ssbad:1.0` 镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归，并已发布到 Docker Hub。
+- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
@@ -92,12 +92,20 @@ docker compose -f deploy/compose.yaml pull
 docker compose -f deploy/compose.yaml up -d
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。测试标签为 `sadno/ssbad:1.0`，本轮已验证的 linux/amd64 registry digest 为：
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:2.0`；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
-~~~text
-sadno/ssbad@sha256:9e8a7cecf49f93096c5e15f7ce6e61e826b6a34fe9b58fe51ab96febfecbdfce
+管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
+
+~~~sh
+install -d -m 0700 /var/lib/flysky/ssbad
+read -rsp 'Flysky enrollment token: ' FLYSKY_ENROLLMENT_TOKEN
+printf '\n'
+umask 077
+printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
+unset FLYSKY_ENROLLMENT_TOKEN
+docker pull sadno/flyskynode:2.0
 ~~~
 
-生产部署应锁定该类 digest，不能只依赖可变标签。镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
 
 下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。

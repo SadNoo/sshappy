@@ -2,7 +2,8 @@ name: flysky-ssbad
 
 services:
   ssbad:
-    image: ${SSBAD_IMAGE:-sadno/ssbad:1.0}
+    image: ${SSBAD_IMAGE:-sadno/flyskynode:2.0}
+    platform: linux/amd64
     network_mode: host
     env_file:
       - ${SSBAD_ENV_FILE:-./flysky-node.env}
