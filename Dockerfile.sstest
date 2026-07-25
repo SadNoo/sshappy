@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -ldfl
 FROM scratch
 ARG VERSION=dev
 ARG REVISION=unknown
-LABEL org.opencontainers.image.title="ssbad" \
+LABEL org.opencontainers.image.title="Flysky Node" \
       org.opencontainers.image.description="Flysky SS2022 single-port node runtime" \
       org.opencontainers.image.version="$VERSION" \
       org.opencontainers.image.revision="$REVISION" \
