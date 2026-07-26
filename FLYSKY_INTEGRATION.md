@@ -81,7 +81,7 @@
 - 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
 - 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
 - Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
-- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:1.0`。
+- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
@@ -94,10 +94,10 @@ docker compose -f deploy/compose.yaml pull
 docker compose -f deploy/compose.yaml up -d
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:1.0`，本轮验收的 linux/amd64 registry digest 为：
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:2.0`，本轮验收的 linux/amd64 registry digest 为：
 
 ~~~text
-sadno/flyskynode:1.0@sha256:8b787eecad017bca59579d352648d9f2ae1a12c31f9fe108c4bb5d0a4a095c9d
+sadno/flyskynode:2.0@sha256:c8319ce71b8a8907b7648b968845eab79edacb2d0180d5877db0d34b24522070
 ~~~
 
 该镜像的 `org.opencontainers.image.revision` 为 `fecde945a03e15a2bd4b47c868e649b975f5e2f7`。生产部署必须锁定 digest，不能只依赖可变标签；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
@@ -111,7 +111,7 @@ printf '\n'
 umask 077
 printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
 unset FLYSKY_ENROLLMENT_TOKEN
-docker pull sadno/flyskynode:1.0
+docker pull sadno/flyskynode:2.0
 ~~~
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
