@@ -97,10 +97,10 @@ docker compose -f deploy/compose.yaml up -d
 注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:1.0`，本轮验收的 linux/amd64 registry digest 为：
 
 ~~~text
-sadno/flyskynode:1.0@sha256:5b411316c4758e88c1f59e391902d186916e6cb189b9856a4c188db05990e35c
+sadno/flyskynode:1.0@sha256:8b787eecad017bca59579d352648d9f2ae1a12c31f9fe108c4bb5d0a4a095c9d
 ~~~
 
-该镜像的 `org.opencontainers.image.revision` 为 `24a058a71bcac3c167fc97de5f3ec6f5bce1d259`。生产部署必须锁定 digest，不能只依赖可变标签；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+该镜像的 `org.opencontainers.image.revision` 为 `fecde945a03e15a2bd4b47c868e649b975f5e2f7`。生产部署必须锁定 digest，不能只依赖可变标签；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
 管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
 

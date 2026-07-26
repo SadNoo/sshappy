@@ -2,7 +2,7 @@ name: flysky-ssbad
 
 services:
   ssbad:
-    image: ${SSBAD_IMAGE:-sadno/flyskynode:1.0@sha256:5b411316c4758e88c1f59e391902d186916e6cb189b9856a4c188db05990e35c}
+    image: ${SSBAD_IMAGE:-sadno/flyskynode:1.0@sha256:8b787eecad017bca59579d352648d9f2ae1a12c31f9fe108c4bb5d0a4a095c9d}
     platform: linux/amd64
     network_mode: host
     env_file:
