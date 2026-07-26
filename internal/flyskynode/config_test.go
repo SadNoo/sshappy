@@ -29,6 +29,14 @@ func TestLoadConfigRejectsInvalidBoolean(t *testing.T) {
 	}
 }
 
+func TestLoadConfigEnablesSafeOuterUDPFragmentationDefaults(t *testing.T) {
+	t.Setenv("FLYSKY_CONTROL_PLANE_URL", "https://panel.example")
+	config := LoadConfig()
+	if config.UDPMTU != 1600 || !config.UDPOuterFragmentation {
+		t.Fatalf("UDP transport defaults = mtu %d, fragmentation %v", config.UDPMTU, config.UDPOuterFragmentation)
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -44,7 +52,8 @@ func testConfig(t *testing.T) Config {
 		ChangePollInterval: 15 * time.Second, HeartbeatInterval: 30 * time.Second,
 		UsageReportInterval: 30 * time.Second, AliveIPReportInterval: time.Minute,
 		SnapshotRefreshBefore: 10 * time.Minute, CredentialRotateBefore: 2 * time.Hour,
-		UDPMTU: 1496, UDPRelayBatchSize: 8, UDPServerBatchSize: 64, UDPSendQueueSize: 1024,
+		UDPMTU: 1600, UDPOuterFragmentation: true,
+		UDPRelayBatchSize: 8, UDPServerBatchSize: 64, UDPSendQueueSize: 1024,
 		UDPNATTimeout: time.Minute, UDPMaxSessions: 2048, UDPMaxSessionsPerUser: 128,
 		TCPMaxHandshakes: 1024, TCPMaxConnectionsPerUser: 800,
 		TCPTrafficFlushInterval: 30 * time.Second,

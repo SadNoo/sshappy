@@ -418,6 +418,7 @@ func newManager(
 		return nil, nil, err
 	}
 	address := serverListenAddress(config.ListenHost, applied.Wire.Node.ListenPort)
+	udpPathMTUDiscovery := outerUDPPathMTUDiscovery(config.UDPOuterFragmentation)
 	server := service.ServerConfig{
 		Name: serverName, Protocol: method, MTU: config.UDPMTU, PSK: applied.ServerKey,
 		UPSKStorePath: config.CredentialPath, PaddingPolicy: paddingPolicy,
@@ -434,7 +435,10 @@ func newManager(
 	}
 	if config.EnableUDP {
 		server.UDPListeners = []service.UDPListenerConfig{{
-			ListenerConfig: service.ListenerConfig{Network: "udp", Address: address},
+			ListenerConfig: service.ListenerConfig{
+				Network: "udp", Address: address,
+				PathMTUDiscovery: udpPathMTUDiscovery,
+			},
 			UDPPerfConfig: service.UDPPerfConfig{
 				RelayBatchSize: config.UDPRelayBatchSize, ServerRecvBatchSize: config.UDPServerBatchSize,
 				SendChannelCapacity: config.UDPSendQueueSize,
@@ -462,6 +466,13 @@ func newManager(
 		return nil, nil, errors.New("SS2022 credential manager is unavailable")
 	}
 	return manager, runtimeServer.CredentialManager, nil
+}
+
+func outerUDPPathMTUDiscovery(allowFragmentation bool) service.PMTUDMode {
+	if allowFragmentation {
+		return service.PMTUDModeDont
+	}
+	return service.PMTUDModeAppDefault
 }
 
 func serverListenAddress(host string, port int) string {
