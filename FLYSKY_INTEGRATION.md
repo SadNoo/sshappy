@@ -60,6 +60,8 @@
 | `SSBAD_MODE=flysky` | 选择新 Node API 路径 |
 | `FLYSKY_CONTROL_PLANE_URL` | Panel HTTPS 根地址 |
 | `FLYSKY_ENROLLMENT_TOKEN_PATH` | 一次性注册令牌文件，默认 `/run/secrets/flysky-enrollment-token` |
+| `UDP_MTU` | SS2022 外层 UDP 路径预算；Flysky Node 默认 `1600`，用于容纳普通 1500 字节公网路径上的最大数据报及协议头 |
+| `UDP_OUTER_FRAGMENTATION` | 对超出物理路径 MTU 的 SS2022 UDP 外层包允许由发送端分片；默认 `true`，保证大 UDP 回包不会静默丢失 |
 | `FLYSKY_MACHINE_CREDENTIAL_PATH` | 机器凭据状态文件 |
 | `FLYSKY_SNAPSHOT_PATH` | 最后有效快照缓存 |
 | `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/database64128/shadowsocks-go/internal/flyskyapi"
+	"github.com/database64128/shadowsocks-go/service"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +47,17 @@ func TestServerListenAddressSupportsIPv4AndIPv6(t *testing.T) {
 		if actual := serverListenAddress(host, 18443); actual != expected {
 			t.Errorf("serverListenAddress(%q, 18443) = %q, want %q", host, actual, expected)
 		}
+	}
+}
+
+func TestOuterUDPPathMTUDiscovery(t *testing.T) {
+	t.Parallel()
+
+	if actual := outerUDPPathMTUDiscovery(true); actual != service.PMTUDModeDont {
+		t.Fatalf("fragmentation enabled PMTUD mode = %s", actual)
+	}
+	if actual := outerUDPPathMTUDiscovery(false); actual != service.PMTUDModeAppDefault {
+		t.Fatalf("fragmentation disabled PMTUD mode = %s", actual)
 	}
 }
 

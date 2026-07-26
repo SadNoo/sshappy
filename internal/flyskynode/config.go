@@ -29,6 +29,7 @@ type Config struct {
 	SnapshotRefreshBefore    time.Duration
 	CredentialRotateBefore   time.Duration
 	UDPMTU                   int
+	UDPOuterFragmentation    bool
 	UDPRelayBatchSize        int
 	UDPServerBatchSize       int
 	UDPSendQueueSize         int
@@ -45,6 +46,7 @@ type Config struct {
 func LoadConfig() Config {
 	enableTCP, tcpErr := envBool("ENABLE_TCP", true)
 	enableUDP, udpErr := envBool("ENABLE_UDP", true)
+	udpOuterFragmentation, udpOuterFragmentationErr := envBool("UDP_OUTER_FRAGMENTATION", true)
 	allowHTTP, httpErr := envBool("FLYSKY_ALLOW_INSECURE_HTTP", false)
 	return Config{
 		ControlPlaneURL:          strings.TrimSpace(os.Getenv("FLYSKY_CONTROL_PLANE_URL")),
@@ -64,7 +66,8 @@ func LoadConfig() Config {
 		AliveIPReportInterval:    envDurationSeconds("FLYSKY_ALIVE_IP_REPORT_SECONDS", 60),
 		SnapshotRefreshBefore:    envDurationSeconds("FLYSKY_SNAPSHOT_REFRESH_BEFORE_SECONDS", 600),
 		CredentialRotateBefore:   envDurationSeconds("FLYSKY_CREDENTIAL_ROTATE_BEFORE_SECONDS", 7200),
-		UDPMTU:                   envInt("UDP_MTU", 1496),
+		UDPMTU:                   envInt("UDP_MTU", 1600),
+		UDPOuterFragmentation:    udpOuterFragmentation,
 		UDPRelayBatchSize:        envInt("UDP_RELAY_BATCH_SIZE", 8),
 		UDPServerBatchSize:       envInt("UDP_SERVER_RECV_BATCH_SIZE", 64),
 		UDPSendQueueSize:         envInt("UDP_SEND_CHANNEL_CAPACITY", 1024),
@@ -75,7 +78,7 @@ func LoadConfig() Config {
 		TCPMaxConnectionsPerUser: envInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPMaxEstablishedTotal:   envInt("TCP_MAX_ESTABLISHED_TOTAL", 0),
 		TCPTrafficFlushInterval:  envDurationSeconds("TCP_TRAFFIC_FLUSH_SECONDS", 30),
-		loadError:                errors.Join(tcpErr, udpErr, httpErr),
+		loadError:                errors.Join(tcpErr, udpErr, udpOuterFragmentationErr, httpErr),
 	}
 }
 
