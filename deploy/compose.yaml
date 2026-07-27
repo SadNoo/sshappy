@@ -2,7 +2,7 @@ name: flysky-ssbad
 
 services:
   ssbad:
-    image: ${SSBAD_IMAGE:-sadno/flyskynode:2.0@sha256:c8319ce71b8a8907b7648b968845eab79edacb2d0180d5877db0d34b24522070}
+    image: ${SSBAD_IMAGE:-sadno/flyskynode:2.1}
     platform: linux/amd64
     network_mode: host
     env_file:
@@ -14,7 +14,7 @@ services:
       FLYSKY_SYNC_STATE_PATH: /var/lib/flysky/sync.json
       FLYSKY_REPORT_OUTBOX_PATH: /var/lib/flysky/reports.json
       UPSK_STORE_PATH: /var/lib/flysky/users.json
-      UDP_MTU: "1600"
+      UDP_MTU: "1496"
       UDP_OUTER_FRAGMENTATION: "true"
     volumes:
       - ${SSBAD_STATE_DIR:-/var/lib/flysky/ssbad}:/var/lib/flysky:rw

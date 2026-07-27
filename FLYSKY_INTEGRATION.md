@@ -60,7 +60,7 @@
 | `SSBAD_MODE=flysky` | 选择新 Node API 路径 |
 | `FLYSKY_CONTROL_PLANE_URL` | Panel HTTPS 根地址 |
 | `FLYSKY_ENROLLMENT_TOKEN_PATH` | 一次性注册令牌文件，默认 `/run/secrets/flysky-enrollment-token` |
-| `UDP_MTU` | SS2022 外层 UDP 路径预算；Flysky Node 默认 `1600`，用于容纳普通 1500 字节公网路径上的最大数据报及协议头 |
+| `UDP_MTU` | SS2022 外层 UDP 路径预算；Flysky Node 默认 `1496` |
 | `UDP_OUTER_FRAGMENTATION` | 对超出物理路径 MTU 的 SS2022 UDP 外层包允许由发送端分片；默认 `true`，保证大 UDP 回包不会静默丢失 |
 | `FLYSKY_MACHINE_CREDENTIAL_PATH` | 机器凭据状态文件 |
 | `FLYSKY_SNAPSHOT_PATH` | 最后有效快照缓存 |
@@ -81,7 +81,7 @@
 - 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
 - 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
 - Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
-- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.0`。
+- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.1`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
@@ -94,13 +94,7 @@ docker compose -f deploy/compose.yaml pull
 docker compose -f deploy/compose.yaml up -d
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:2.0`，本轮验收的 linux/amd64 registry digest 为：
-
-~~~text
-sadno/flyskynode:2.0@sha256:c8319ce71b8a8907b7648b968845eab79edacb2d0180d5877db0d34b24522070
-~~~
-
-该镜像的 `org.opencontainers.image.revision` 为 `fecde945a03e15a2bd4b47c868e649b975f5e2f7`。生产部署必须锁定 digest，不能只依赖可变标签；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:2.1`。部署说明只记录版本标签，不附带 registry digest；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
 管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
 
@@ -111,7 +105,7 @@ printf '\n'
 umask 077
 printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
 unset FLYSKY_ENROLLMENT_TOKEN
-docker pull sadno/flyskynode:2.0
+docker pull sadno/flyskynode:2.1
 ~~~
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
