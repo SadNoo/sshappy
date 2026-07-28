@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,22 @@ import (
 	"github.com/database64128/shadowsocks-go/service"
 	"go.uber.org/zap"
 )
+
+type enrollmentClientStub struct {
+	credential flyskyapi.MachineCredential
+	calls      int
+	token      string
+}
+
+func (client *enrollmentClientStub) Enroll(
+	_ context.Context,
+	token string,
+	_ flyskyapi.CapabilityReport,
+) (flyskyapi.MachineCredential, error) {
+	client.calls++
+	client.token = token
+	return client.credential, nil
+}
 
 func TestReadEnrollmentTokenRequiresPrivateRegularFile(t *testing.T) {
 	t.Parallel()
@@ -32,6 +49,56 @@ func TestReadEnrollmentTokenRequiresPrivateRegularFile(t *testing.T) {
 	}
 	if _, err := readEnrollmentToken(path); err == nil {
 		t.Fatal("world-readable enrollment token was accepted")
+	}
+}
+
+func TestEnrollmentTokenReplacesExistingMachineCredential(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig(t)
+	oldCredential := flyskyapi.MachineCredential{
+		NodeID:      "10000000-0000-4000-8000-000000000001",
+		AccessToken: "old-machine-token",
+		TokenType:   "Bearer",
+		ExpiresAt:   time.Now().Add(time.Hour),
+	}
+	if err := flyskyapi.SaveMachineCredential(config.MachineCredentialPath, oldCredential); err != nil {
+		t.Fatal(err)
+	}
+	token := "fenr_" + strings.Repeat("b", 43)
+	if err := os.WriteFile(config.EnrollmentTokenPath, []byte(token+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	nextCredential := flyskyapi.MachineCredential{
+		NodeID:      oldCredential.NodeID,
+		AccessToken: "replacement-machine-token",
+		TokenType:   "Bearer",
+		ExpiresAt:   time.Now().Add(2 * time.Hour),
+	}
+	client := &enrollmentClientStub{credential: nextCredential}
+
+	actual, err := loadOrEnroll(
+		context.Background(),
+		client,
+		config,
+		flyskyapi.CapabilityReport{},
+		zap.NewNop(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.AccessToken != nextCredential.AccessToken || client.calls != 1 || client.token != token {
+		t.Fatalf("loadOrEnroll() = %+v, calls = %d, token = %q", actual, client.calls, client.token)
+	}
+	persisted, err := flyskyapi.LoadMachineCredential(config.MachineCredentialPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != nextCredential.AccessToken {
+		t.Fatalf("persisted credential = %+v", persisted)
+	}
+	if _, err := os.Stat(config.EnrollmentTokenPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("consumed enrollment token still exists: %v", err)
 	}
 }
 

@@ -51,7 +51,8 @@
 - UUID 流量批次与在线 IP 汇总共用 `0600` 原子 Outbox；断网时保留原 report_id 和 sequence，只有收到匹配的 `202 accepted` 才删除。
 - 在线 IP 默认只离开进程的是节点级 `online_ip_count`、`active_users` 和预留连接数，不上传原始客户端 IP。
 - 显式 `unlimited` 字段区分无限套餐与额度耗尽，避免把合法的零值约定误判为无额度。
-- IPv4、IPv6 和双栈监听统一使用标准地址拼接，`LISTEN_HOST=::` 可正确生成 `[::]:port`。
+- IPv4、IPv6 和双栈监听统一使用标准地址拼接。默认 `LISTEN_HOST=0.0.0.0`，保证不受宿主机 `net.ipv6.bindv6only` 设置影响；明确验证双栈内核行为后才可改为 `::`。
+- 检测到新的注册令牌文件时优先执行重新注册并原子替换旧机器凭据，避免旧凭据继续请求新节点而返回 `NODE_FORBIDDEN`；管理端安装命令仍必须为每个节点使用独立状态目录。
 
 ### Flysky 联调配置
 

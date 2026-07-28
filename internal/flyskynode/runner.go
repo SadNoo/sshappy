@@ -23,6 +23,10 @@ import (
 
 const serverName = "flysky-ss2022"
 
+type enrollmentClient interface {
+	Enroll(context.Context, string, flyskyapi.CapabilityReport) (flyskyapi.MachineCredential, error)
+}
+
 func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if err := config.Validate(); err != nil {
 		return err
@@ -233,33 +237,29 @@ func flushReports(
 
 func loadOrEnroll(
 	ctx context.Context,
-	client *flyskyapi.Client,
+	client enrollmentClient,
 	config Config,
 	report flyskyapi.CapabilityReport,
 	logger *zap.Logger,
 ) (flyskyapi.MachineCredential, error) {
-	credential, err := flyskyapi.LoadMachineCredential(config.MachineCredentialPath)
+	token, err := readEnrollmentToken(config.EnrollmentTokenPath)
 	if err == nil {
+		credential, enrollErr := client.Enroll(ctx, token, report)
+		if enrollErr != nil {
+			return flyskyapi.MachineCredential{}, enrollErr
+		}
+		if err := flyskyapi.SaveMachineCredential(config.MachineCredentialPath, credential); err != nil {
+			return flyskyapi.MachineCredential{}, fmt.Errorf("persist Flysky machine credential: %w", err)
+		}
+		if err := os.Remove(config.EnrollmentTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("Consumed Flysky enrollment token file could not be removed", zap.Error(err))
+		}
 		return credential, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return flyskyapi.MachineCredential{}, err
-	}
-	token, err := readEnrollmentToken(config.EnrollmentTokenPath)
-	if err != nil {
 		return flyskyapi.MachineCredential{}, fmt.Errorf("read Flysky enrollment token: %w", err)
 	}
-	credential, err = client.Enroll(ctx, token, report)
-	if err != nil {
-		return flyskyapi.MachineCredential{}, err
-	}
-	if err := flyskyapi.SaveMachineCredential(config.MachineCredentialPath, credential); err != nil {
-		return flyskyapi.MachineCredential{}, fmt.Errorf("persist Flysky machine credential: %w", err)
-	}
-	if err := os.Remove(config.EnrollmentTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		logger.Warn("Consumed Flysky enrollment token file could not be removed", zap.Error(err))
-	}
-	return credential, nil
+	return flyskyapi.LoadMachineCredential(config.MachineCredentialPath)
 }
 
 func rotateCredentialIfNeeded(
