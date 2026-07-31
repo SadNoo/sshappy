@@ -1,11 +1,77 @@
-FROM golang:1.26-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/sstest ./cmd/sstest
+# syntax=docker/dockerfile:1.7
 
-FROM scratch
-COPY --from=build /out/sstest /usr/local/bin/sstest
-COPY LICENSE /
+ARG GO_IMAGE=golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
+ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG VERSION=4.3-dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=1970-01-01T00:00:00Z
+
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
+
+WORKDIR /src
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION
+ARG COMMIT
+ARG BUILD_TIME
+
+# This Dockerfile intentionally produces only the deployment platform reviewed
+# for 4.3. The guard prevents an Apple Silicon `docker build` from creating an
+# arm64 manifest that contains an amd64 executable.
+RUN test "${TARGETOS}/${TARGETARCH}" = "linux/amd64"
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" GOAMD64=v1 \
+    go build \
+      -mod=readonly \
+      -trimpath \
+      -buildvcs=false \
+      -tags=timetzdata \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
+      -o /out/sstest ./cmd/sstest
+
+FROM ${RUNTIME_IMAGE}
+
+ARG VERSION
+ARG COMMIT
+ARG BUILD_TIME
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 sshappy \
+    && useradd --uid 65532 --gid 65532 --no-create-home \
+         --home-dir /var/lib/sshappy --shell /usr/sbin/nologin \
+         --no-log-init sshappy \
+    && install -d -o 65532 -g 65532 -m 0700 /var/lib/sshappy \
+    && install -d -o 0 -g 0 -m 0755 /usr/share/doc/sshappy
+
+COPY --from=build --chown=0:0 --chmod=0555 /out/sstest /usr/local/bin/sstest
+COPY --chown=0:0 --chmod=0444 LICENSE /usr/share/doc/sshappy/LICENSE
+
+LABEL org.opencontainers.image.title="sshappy" \
+      org.opencontainers.image.description="SSPanel-managed Shadowsocks 2022 node" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}" \
+      org.opencontainers.image.source="https://github.com/SadNoo/sshappy" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
+ENV HOME=/var/lib/sshappy
+
+# Root is intentional for the default image: the relay port is panel-managed
+# and may be below 1024. Deployments using only high ports can opt into the
+# pre-created 65532:65532 user at runtime.
+USER 0:0
+WORKDIR /var/lib/sshappy
+VOLUME ["/var/lib/sshappy"]
+
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/sstest"]

@@ -41,7 +41,7 @@ MYSQL_PASS='replace-with-a-secret' \
 For a remote database, the default TLS mode is `auto`; use `MYSQL_TLS_MODE=verify` together with `MYSQL_TLS_CA=/path/to/ca.pem` when certificate verification is required.
 
 See [configuration](docs/configuration.md) for all environment variables and [operations](docs/operations.md) for data durability, shutdown and rollback guidance.
-Known items that require a product contract, schema migration or a later container phase are tracked in [4.3 remaining work](docs/4.3-remaining-work.md).
+Known items that require a product contract, schema migration or further deployment work are tracked in [4.3 remaining work](docs/4.3-remaining-work.md).
 
 Automatic traffic-marker cleanup is disabled by default. Do not enable it without first reading the single-instance and recovery-window requirements in the operations guide.
 
@@ -76,8 +76,22 @@ Never point this integration test at production: it creates fixed table names.
 - `api`, `stats`: management API and traffic statistics.
 - `.github/workflows`: build, test and release validation.
 
+## Docker image
+
+The reviewed container build is intentionally limited to `linux/amd64`. It uses a Debian 12 slim runtime and is intended for Docker Engine on Debian 11 and newer Linux hosts:
+
+```sh
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg VERSION=4.3 \
+  --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
+  --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --load -f Dockerfile.sstest \
+  -t sadno/sstest:4.3 .
+```
+
+See [Docker deployment](docs/docker.md) for persistent state, privileged relay ports, optional non-root execution, TCP/UDP publication, MySQL and shutdown requirements.
+
 ## Security
 
 Please report suspected vulnerabilities privately to the repository owner. Logs and bug reports must redact MySQL DSNs, passwords, PSKs, user credential files and traffic outbox contents.
-
-The Docker image workflow is deliberately not part of the 4.3 branch-completion step; image creation and publication should only happen after this branch is reviewed and approved.
