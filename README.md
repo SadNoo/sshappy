@@ -78,7 +78,7 @@ Never point this integration test at production: it creates fixed table names.
 
 ## Docker image
 
-The reviewed container build is intentionally limited to `linux/amd64`. It uses a Debian 12 slim runtime and is intended for Docker Engine on Debian 11 and newer Linux hosts:
+The reviewed container build is intentionally limited to `linux/amd64`. It uses a minimal Debian 12 distroless/static runtime and is intended for Docker Engine on Debian 11 and newer Linux hosts:
 
 ```sh
 docker buildx build \

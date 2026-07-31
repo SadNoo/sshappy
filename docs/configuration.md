@@ -18,6 +18,7 @@
 | `MYSQL_IO_TIMEOUT_SECONDS` | `30` | Positive read/write timeout. |
 
 `auto` disables TLS only for loopback/localhost and otherwise requires an encrypted connection. `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
+`disabled` permits plaintext authentication and queries; use it only when the database cannot support TLS and the connection stays on a trusted private network.
 
 If both a standard name and its legacy alias are present, keep their values identical. Legacy aliases are retained for compatibility and should be removed from new deployments.
 

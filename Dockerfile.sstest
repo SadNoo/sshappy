@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG GO_IMAGE=golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
-ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:latest@sha256:a9fcaedd4c9b59e12dd65d954f0b5044f19b0647a8a3712e77205df9e7b102cd
 ARG VERSION=4.3-dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=1970-01-01T00:00:00Z
@@ -37,23 +37,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
       -o /out/sstest ./cmd/sstest
 
+RUN install -d -o 65532 -g 65532 -m 0700 /out/state
+
 FROM ${RUNTIME_IMAGE}
 
 ARG VERSION
 ARG COMMIT
 ARG BUILD_TIME
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 65532 sshappy \
-    && useradd --uid 65532 --gid 65532 --no-create-home \
-         --home-dir /var/lib/sshappy --shell /usr/sbin/nologin \
-         --no-log-init sshappy \
-    && install -d -o 65532 -g 65532 -m 0700 /var/lib/sshappy \
-    && install -d -o 0 -g 0 -m 0755 /usr/share/doc/sshappy
-
 COPY --from=build --chown=0:0 --chmod=0555 /out/sstest /usr/local/bin/sstest
+COPY --from=build --chown=65532:65532 --chmod=0700 /out/state /var/lib/sshappy
 COPY --chown=0:0 --chmod=0444 LICENSE /usr/share/doc/sshappy/LICENSE
 
 LABEL org.opencontainers.image.title="sshappy" \
@@ -68,7 +61,7 @@ ENV HOME=/var/lib/sshappy
 
 # Root is intentional for the default image: the relay port is panel-managed
 # and may be below 1024. Deployments using only high ports can opt into the
-# pre-created 65532:65532 user at runtime.
+# distroless nonroot account (65532:65532) at runtime.
 USER 0:0
 WORKDIR /var/lib/sshappy
 VOLUME ["/var/lib/sshappy"]

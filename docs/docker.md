@@ -1,8 +1,8 @@
 # Docker image for Debian 11+ hosts
 
-The 4.3 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime userland is Debian 12 slim, which can run on supported Docker Engine installations on Debian 11 and newer hosts. An OCI image cannot enforce the host distribution or version, so a real Debian 11 host remains part of deployment acceptance testing.
+The 4.3 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime is Debian 12 distroless/static, which can run on supported Docker Engine installations on Debian 11 and newer hosts. An OCI image cannot enforce the host distribution or version, so a real Debian 11 host remains part of deployment acceptance testing.
 
-The image does not contain database credentials, node keys, user credentials or a MySQL CA.
+The image does not contain a shell, package manager, database credentials, node keys, user credentials or a MySQL CA. It retains the Debian CA bundle and timezone data needed by a static Go service.
 
 ## Build
 
@@ -24,7 +24,7 @@ The base images are pinned by digest. Updating either digest is a reviewed depen
 
 ## Runtime state, user and secrets
 
-The image runs as root by default so a panel-managed relay port in the `1`–`1023` range works without an image-level restriction. It also contains an optional UID/GID `65532:65532` account for deployments that use only unprivileged ports.
+The image runs as root by default so a panel-managed relay port in the `1`–`1023` range works without an image-level restriction. The distroless base also contains an optional UID/GID `65532:65532` account for deployments that use only unprivileged ports.
 
 Mount the entire `/var/lib/sshappy` directory read-write because credential and traffic-outbox updates use temporary files plus atomic rename in that directory. Use one volume per node and one active writer; never share the same outbox between replicas.
 
@@ -38,9 +38,11 @@ For a bind mount used with the optional non-root account, create the host direct
 
 If `MYSQL_TLS_MODE=verify` uses a private CA, mount that file read-only and set `MYSQL_TLS_CA` to its container path. Do not copy the CA or password into the image.
 
+If the database cannot negotiate TLS, set `MYSQL_TLS_MODE=disabled`. This is required for a remote plaintext database because the default `auto` mode requires encryption for non-loopback hosts. Plaintext exposes the database credentials and traffic to the network, so keep that connection on a trusted private network.
+
 ## Run on a privileged relay port
 
-The relay port comes from `ss_node.server`, so the image cannot declare a fixed `EXPOSE`. The example deliberately uses privileged port `443`; publish both protocols:
+The relay port comes from `ss_node.server`, so the image cannot declare a fixed `EXPOSE`. The example deliberately uses privileged port `1023`; replace it with the port configured in the database and publish both protocols:
 
 ```sh
 docker run -d \
@@ -49,9 +51,10 @@ docker run -d \
   --restart unless-stopped \
   --stop-timeout 120 \
   --env-file /secure/path/sshappy.env \
+  --env MYSQL_TLS_MODE=disabled \
   --mount type=volume,src=sshappy-node,dst=/var/lib/sshappy \
-  -p 443:443/tcp \
-  -p 443:443/udp \
+  -p 1023:1023/tcp \
+  -p 1023:1023/udp \
   sadno/sstest:4.3
 ```
 
@@ -66,20 +69,8 @@ The application handles `SIGTERM` and persists/retries final accounting during s
 ```sh
 docker image inspect sadno/sstest:4.3 \
   --format 'platform={{.Os}}/{{.Architecture}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}}'
-
-docker run --rm --platform linux/amd64 \
-  --entrypoint /bin/sh sadno/sstest:4.3 \
-  -ec '
-    test "$(id -u)" = 0
-    test "$(id -g)" = 0
-    test -w /var/lib/sshappy
-    test "$(stat -c %a /usr/local/bin/sstest)" = 555
-    test "$(stat -c %a /usr/share/doc/sshappy/LICENSE)" = 444
-    test -r /etc/ssl/certs/ca-certificates.crt
-    grep -q "VERSION_ID=\"12\"" /etc/os-release
-  '
 ```
 
-To verify the optional non-root mode separately, add `--user 65532:65532` and check that the named volume remains writable.
+The expected platform is `linux/amd64`, the default user is `0:0`, and the entrypoint is `/usr/local/bin/sstest`. Distroless intentionally has no `/bin/sh`; inspect logs and image metadata instead of opening a shell. To use the optional non-root mode, add `--user 65532:65532` and use a volume writable by that UID/GID.
 
 There is no fixed unauthenticated health endpoint. A synthetic `kill -0 1` check adds no information beyond the container state, while probing the relay port creates invalid Shadowsocks handshakes. Use the process exit status/restart policy plus external SS2022 authentication, panel heartbeat and outbox monitoring.
