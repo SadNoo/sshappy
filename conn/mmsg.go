@@ -57,6 +57,8 @@ type MmsgWConn struct {
 	writeErr     error
 }
 
+type sendmmsgCall func(fd int, msgvec []Mmsghdr, flags int) (int, syscall.Errno)
+
 // NewRConn returns the connection wrapped in a new [*MmsgRConn] for batch reading.
 func (c MmsgConn) NewRConn() *MmsgRConn {
 	rc := MmsgRConn{
@@ -87,40 +89,50 @@ func (c MmsgConn) NewWConn() *MmsgWConn {
 	}
 
 	wc.rawWriteFunc = func(fd uintptr) (done bool) {
-		wc.writeN = 0
-		for {
-			n, errno := sendmmsg(int(fd), wc.writeMsgvec, wc.writeFlags)
-			switch errno {
-			case 0:
-			case syscall.EAGAIN:
-				return false
-			default:
-				wc.writeErr = os.NewSyscallError("sendmmsg", errno)
-				return true
-			}
-
-			wc.writeMsgvec = wc.writeMsgvec[n:]
-			wc.writeN += n
-
-			if len(wc.writeMsgvec) == 0 {
-				wc.writeErr = nil
-				return true
-			}
-
-			// sendmmsg(2) may return less than vlen in one of the following cases:
-			//
-			//   - The socket write buffer is full.
-			//   - vlen is greater than UIO_MAXIOV (1024).
-			//   - Sending the next message would return an error.
-			//
-			// The first case is the only one where it's safe to clear write readiness.
-			// The other cases require the caller to retry sending the remaining messages.
-			// Unfortunately, the API does not tell us which one is the case, so we always
-			// retry the call with the remaining messages.
-		}
+		return wc.write(fd, sendmmsg)
 	}
 
 	return &wc
+}
+
+// write performs one readiness callback's worth of sendmmsg work. RawConn may
+// invoke the callback again after it returns false, so writeMsgvec and writeN
+// deliberately retain their progress across calls.
+func (c *MmsgWConn) write(fd uintptr, send sendmmsgCall) (done bool) {
+	for {
+		n, errno := send(int(fd), c.writeMsgvec, c.writeFlags)
+		switch errno {
+		case 0:
+		case syscall.EAGAIN:
+			return false
+		default:
+			c.writeErr = os.NewSyscallError("sendmmsg", errno)
+			return true
+		}
+
+		if n <= 0 || n > len(c.writeMsgvec) {
+			c.writeErr = os.NewSyscallError("sendmmsg", syscall.EIO)
+			return true
+		}
+		c.writeMsgvec = c.writeMsgvec[n:]
+		c.writeN += n
+
+		if len(c.writeMsgvec) == 0 {
+			c.writeErr = nil
+			return true
+		}
+
+		// sendmmsg(2) may return less than vlen in one of the following cases:
+		//
+		//   - The socket write buffer is full.
+		//   - vlen is greater than UIO_MAXIOV (1024).
+		//   - Sending the next message would return an error.
+		//
+		// The first case is the only one where it's safe to clear write readiness.
+		// The other cases require the caller to retry sending the remaining messages.
+		// Unfortunately, the API does not tell us which one is the case, so we always
+		// retry the call with the remaining messages.
+	}
 }
 
 // ReadMsgs reads as many messages as possible into msgvec
@@ -138,10 +150,15 @@ func (c *MmsgRConn) ReadMsgs(msgvec []Mmsghdr, flags int) (int, error) {
 // It returns the number of messages written as n, and if n < len(msgvec),
 // the error from writing the n-th message.
 func (c *MmsgWConn) WriteMsgs(msgvec []Mmsghdr, flags int) (int, error) {
+	if len(msgvec) == 0 {
+		return 0, nil
+	}
 	c.writeMsgvec = msgvec
 	c.writeFlags = flags
+	c.writeN = 0
+	c.writeErr = nil
 	if err := c.rawConn.Write(c.rawWriteFunc); err != nil {
-		return 0, err
+		return c.writeN, err
 	}
 	return c.writeN, c.writeErr
 }

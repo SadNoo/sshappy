@@ -170,6 +170,7 @@ func TestAddrIPPort(t *testing.T) {
 
 func TestAddrResolveIP(t *testing.T) {
 	ctx := t.Context()
+	localhost := MustAddrFromDomainPort("localhost", addrDomainPort)
 
 	ip, err := addrIP.ResolveIP(ctx, "ip")
 	if err != nil {
@@ -179,12 +180,12 @@ func TestAddrResolveIP(t *testing.T) {
 		t.Errorf("%q.ResolveIP() = %q, want %q", addrIP, ip, addrIPAddr)
 	}
 
-	ip, err = addrDomain.ResolveIP(ctx, "ip")
+	ip, err = localhost.ResolveIP(ctx, "ip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ip.IsValid() {
-		t.Errorf("%q.ResolveIP().IsValid() = false, want true", addrDomain)
+		t.Errorf("%q.ResolveIP().IsValid() = false, want true", localhost)
 	}
 
 	mustPanic(t, func() { _, _ = addrZero.ResolveIP(ctx, "ip") }, "addrZero.ResolveIP()")
@@ -192,6 +193,7 @@ func TestAddrResolveIP(t *testing.T) {
 
 func TestAddrResolveIPPort(t *testing.T) {
 	ctx := t.Context()
+	localhost := MustAddrFromDomainPort("localhost", addrDomainPort)
 
 	ipPort, err := addrIP.ResolveIPPort(ctx, "ip")
 	if err != nil {
@@ -201,15 +203,15 @@ func TestAddrResolveIPPort(t *testing.T) {
 		t.Errorf("%q.ResolveIPPort() = %q, want %q", addrIP, ipPort, addrIPAddrPort)
 	}
 
-	ipPort, err = addrDomain.ResolveIPPort(ctx, "ip")
+	ipPort, err = localhost.ResolveIPPort(ctx, "ip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ipPort.Addr().IsValid() {
-		t.Errorf("%q.ResolveIPPort().Addr().IsValid() = false, want true", addrDomain)
+		t.Errorf("%q.ResolveIPPort().Addr().IsValid() = false, want true", localhost)
 	}
 	if ipPort.Port() != addrDomainPort {
-		t.Errorf("%q.ResolveIPPort() = %q, want port %d", addrDomain, ipPort, addrDomainPort)
+		t.Errorf("%q.ResolveIPPort() = %q, want port %d", localhost, ipPort, addrDomainPort)
 	}
 
 	mustPanic(t, func() { _, _ = addrZero.ResolveIPPort(ctx, "ip") }, "addrZero.ResolveIPPort()")

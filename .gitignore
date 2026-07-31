@@ -3,3 +3,10 @@
 /shadowsocks-go.exe
 /shadowsocks-go-domain-set-converter
 /shadowsocks-go-domain-set-converter.exe
+/sstest
+/sstest.exe
+/.local/
+/.env
+/.env.*
+!/.env.example
+/secrets/

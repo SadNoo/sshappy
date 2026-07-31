@@ -13,14 +13,28 @@ import (
 
 type fakeTrafficDatabase struct {
 	err      error
+	errs     []error
 	batchIDs []string
+	nodes    []Node
+	onReport func()
 }
 
-func (d *fakeTrafficDatabase) ReportTraffic(_ Node, batchID string, _ []TrafficDelta) error {
+func (d *fakeTrafficDatabase) ReportTraffic(node Node, batchID string, _ []TrafficDelta) error {
+	if d.onReport != nil {
+		d.onReport()
+	}
+	if len(d.errs) > 0 {
+		err := d.errs[0]
+		d.errs = d.errs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	if d.err != nil {
 		return d.err
 	}
 	d.batchIDs = append(d.batchIDs, batchID)
+	d.nodes = append(d.nodes, node)
 	return nil
 }
 
@@ -38,7 +52,7 @@ func TestTrafficReporterPersistsMultipleBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	if bytes.Contains(data, []byte(`"version"`)) {
-		t.Fatalf("single-batch outbox is not readable by 4.0: %s", data)
+		t.Fatalf("single-batch outbox is not readable by 4.2: %s", data)
 	}
 	firstID := reporter.pending[0].ID
 	if len(firstID) != 32 {
@@ -71,6 +85,53 @@ func TestTrafficReporterPersistsMultipleBatches(t *testing.T) {
 	}
 }
 
+func TestTrafficOutboxJSONExactlyMatches42(t *testing.T) {
+	batches := []TrafficBatch{
+		{
+			ID:        "0123456789abcdef0123456789abcdef",
+			CreatedAt: 123,
+			Deltas:    []TrafficDelta{{UserID: 7, Upload: 10, Download: 20}},
+		},
+		{
+			ID:        "fedcba9876543210fedcba9876543210",
+			CreatedAt: 456,
+			Deltas:    []TrafficDelta{{UserID: 9, Upload: 30, Download: 40}},
+		},
+	}
+	tests := []struct {
+		name    string
+		batches []TrafficBatch
+		want    string
+	}{
+		{
+			name:    "single batch",
+			batches: batches[:1],
+			want:    `{"id":"0123456789abcdef0123456789abcdef","createdAt":123,"deltas":[{"UserID":7,"Upload":10,"Download":20}]}`,
+		},
+		{
+			name:    "multiple batches",
+			batches: batches,
+			want:    `{"version":1,"batches":[{"id":"0123456789abcdef0123456789abcdef","createdAt":123,"deltas":[{"UserID":7,"Upload":10,"Download":20}]},{"id":"fedcba9876543210fedcba9876543210","createdAt":456,"deltas":[{"UserID":9,"Upload":30,"Download":40}]}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "traffic-outbox.json")
+			reporter := &trafficReporter{path: path}
+			if _, err := reporter.persist(test.batches); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != test.want {
+				t.Fatalf("outbox JSON differs from 4.2 format:\n got %s\nwant %s", got, test.want)
+			}
+		})
+	}
+}
+
 func TestTrafficReporterLoadsLegacyOutbox(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
 	data := []byte(`{"id":"0123456789abcdef0123456789abcdef","deltas":[{"UserID":7,"Upload":10,"Download":20}]}`)
@@ -84,37 +145,48 @@ func TestTrafficReporterLoadsLegacyOutbox(t *testing.T) {
 	if len(reporter.pending) != 1 || reporter.pending[0].CreatedAt <= 0 {
 		t.Fatalf("legacy outbox was not migrated in memory: %+v", reporter.pending)
 	}
+	if dataAfter, err := os.ReadFile(path); err != nil || !bytes.Equal(dataAfter, data) {
+		t.Fatalf("legacy outbox was unexpectedly rewritten: data=%q err=%v", dataAfter, err)
+	}
 }
 
-func TestTrafficReporterQuarantinesInvalidOutbox(t *testing.T) {
+func TestTrafficReporterUsesFlushTimeBillingContext(t *testing.T) {
+	reporter, err := newTrafficReporter(filepath.Join(t.TempDir(), "traffic-outbox.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeTrafficDatabase{}
+	if err := reporter.Flush(database, Node{ID: 999, TrafficRate: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if len(database.nodes) != 1 || database.nodes[0].ID != 999 || database.nodes[0].TrafficRate != 9 {
+		t.Fatalf("traffic did not use the 4.2 flush-time billing context: %+v", database.nodes)
+	}
+}
+
+func TestTrafficReporterRefusesInvalidOutboxUntilManualRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
 	invalid := []byte(`{"version":1,"batches":[`)
 	if err := os.WriteFile(path, invalid, 0600); err != nil {
 		t.Fatal(err)
 	}
 	reporter, err := newTrafficReporter(path)
+	if err == nil || reporter != nil {
+		t.Fatalf("invalid outbox did not fail startup: reporter=%v err=%v", reporter, err)
+	}
+	dataAfter, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovery := reporter.Recovery()
-	if recovery == nil || recovery.Cause == nil || recovery.BackupPath == "" {
-		t.Fatalf("invalid outbox recovery = %+v", recovery)
+	if !bytes.Equal(dataAfter, invalid) {
+		t.Fatalf("invalid outbox changed: %q", dataAfter)
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("invalid outbox was not moved: %v", err)
-	}
-	backup, err := os.ReadFile(recovery.BackupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(backup, invalid) {
-		t.Fatalf("quarantined outbox changed: %q", backup)
-	}
-	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("new outbox was not created after recovery: %v", err)
+	reporter, err = newTrafficReporter(path)
+	if err == nil || reporter != nil {
+		t.Fatalf("second startup bypassed manual recovery: reporter=%v err=%v", reporter, err)
 	}
 }
 
@@ -154,7 +226,69 @@ func TestTrafficReporterQueuesWhileDatabaseIsUnavailable(t *testing.T) {
 	}
 }
 
-func TestReportTrafficPersistsEveryFailedReportingPeriod(t *testing.T) {
+func TestFlushClassifiesPostCommitPersistenceFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
+	reporter, err := newTrafficReporter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "block-removal"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeTrafficDatabase{}
+	flushed, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, NewState(), reporter, &databaseHealth{})
+	if !errors.Is(err, errTrafficOutboxPersistence) {
+		t.Fatalf("post-commit persistence error = %v, want fatal outbox classification", err)
+	}
+	if flushed {
+		t.Fatal("failed outbox update was reported as a successful flush")
+	}
+	if len(database.batchIDs) != 1 {
+		t.Fatalf("database was not committed before persistence failure: %v", database.batchIDs)
+	}
+}
+
+func TestFinalTrafficReturnsPostCommitPersistenceFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
+	reporter, err := newTrafficReporter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "block-removal"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = reportFinalTraffic(
+		&fakeTrafficDatabase{},
+		Node{ID: 116, TrafficRate: 1},
+		NewState(),
+		reporter,
+		&databaseHealth{},
+		zap.NewNop(),
+	)
+	if !errors.Is(err, errTrafficOutboxPersistence) {
+		t.Fatalf("final post-commit persistence error = %v, want fatal outbox classification", err)
+	}
+}
+
+func TestReportTrafficDrainsPendingBeforeSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
 	reporter, err := newTrafficReporter(path)
 	if err != nil {
@@ -164,15 +298,15 @@ func TestReportTrafficPersistsEveryFailedReportingPeriod(t *testing.T) {
 	database := &fakeTrafficDatabase{err: errors.New("database unavailable")}
 	health := &databaseHealth{}
 	state.AddTraffic(7, 100, 0)
-	if err := reportTraffic(database, Node{ID: 116}, state, reporter, health); err == nil {
+	if _, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, health); err == nil {
 		t.Fatal("first report unexpectedly succeeded")
 	}
 	state.AddTraffic(7, 0, 200)
-	if err := reportTraffic(database, Node{ID: 116}, state, reporter, health); err == nil {
+	if _, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, health); err == nil {
 		t.Fatal("second report unexpectedly succeeded")
 	}
-	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 0 {
-		t.Fatalf("failed-period traffic remained only in memory: %+v", metrics)
+	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 1 || metrics.TrafficDownloadBytes != 200 {
+		t.Fatalf("new traffic was removed before the durable backlog drained: %+v", metrics)
 	}
 
 	reloaded, err := newTrafficReporter(path)
@@ -180,8 +314,63 @@ func TestReportTrafficPersistsEveryFailedReportingPeriod(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := reloaded.Metrics(time.Now())
-	if metrics.Batches != 2 || metrics.UploadBytes != 100 || metrics.DownloadBytes != 200 {
-		t.Fatalf("failed reporting periods were not independently persisted: %+v", metrics)
+	if metrics.Batches != 1 || metrics.UploadBytes != 100 || metrics.DownloadBytes != 0 {
+		t.Fatalf("unexpected durable backlog: %+v", metrics)
+	}
+
+	database.err = nil
+	firstCall := true
+	database.onReport = func() {
+		if !firstCall {
+			return
+		}
+		firstCall = false
+		if pending := state.PendingMetrics(); pending.TrafficDownloadBytes != 200 {
+			t.Errorf("state was snapshotted before the old outbox batch flushed: %+v", pending)
+		}
+	}
+	if _, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reloaded, health); err != nil {
+		t.Fatal(err)
+	}
+	if len(database.batchIDs) != 2 {
+		t.Fatalf("reported batch IDs = %v, want recovered and newly captured batches", database.batchIDs)
+	}
+	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 0 {
+		t.Fatalf("traffic remained in memory after recovery: %+v", metrics)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outbox remained after recovery: %v", err)
+	}
+}
+
+func TestReportTrafficTreatsCaptureFailureAsFatal(t *testing.T) {
+	state := NewState()
+	state.AddTraffic(7, 100, 200)
+	reporter := &trafficReporter{path: t.TempDir()}
+	_, err := reportTraffic(&fakeTrafficDatabase{}, Node{ID: 116, TrafficRate: 1}, state, reporter, &databaseHealth{})
+	if !errors.Is(err, errTrafficOutboxPersistence) {
+		t.Fatalf("capture error = %v, want fatal outbox persistence error", err)
+	}
+	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 1 || metrics.TrafficUploadBytes != 100 || metrics.TrafficDownloadBytes != 200 {
+		t.Fatalf("capture failure lost in-memory traffic: %+v", metrics)
+	}
+}
+
+func TestReportTrafficReportsRecoveryBeforeLaterFailure(t *testing.T) {
+	reporter, err := newTrafficReporter(filepath.Join(t.TempDir(), "traffic-outbox.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	state := NewState()
+	state.AddTraffic(7, 0, 20)
+	laterFailure := errors.New("second flush failed")
+	database := &fakeTrafficDatabase{errs: []error{nil, laterFailure}}
+	flushed, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, &databaseHealth{})
+	if !flushed || !errors.Is(err, laterFailure) {
+		t.Fatalf("flushed=%v err=%v, want prior recovery followed by new failure", flushed, err)
 	}
 }
 
@@ -191,11 +380,14 @@ func TestFinalTrafficIsPersistedWhenDatabaseIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 50}}); err != nil {
+		t.Fatal(err)
+	}
 	state := NewState()
 	state.AddTraffic(7, 100, 200)
 	database := &fakeTrafficDatabase{err: errors.New("database unavailable")}
 	health := &databaseHealth{}
-	if err := reportFinalTraffic(database, Node{ID: 116}, state, reporter, health, zap.NewNop()); err != nil {
+	if err := reportFinalTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, health, zap.NewNop()); err != nil {
 		t.Fatal(err)
 	}
 	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 0 {
@@ -207,7 +399,7 @@ func TestFinalTrafficIsPersistedWhenDatabaseIsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := reloaded.Metrics(time.Now())
-	if metrics.Batches != 1 || metrics.UploadBytes != 100 || metrics.DownloadBytes != 200 {
+	if metrics.Batches != 2 || metrics.UploadBytes != 150 || metrics.DownloadBytes != 200 {
 		t.Fatalf("final traffic was not persisted: %+v", metrics)
 	}
 	if health.Snapshot().Failures != 1 {

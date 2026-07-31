@@ -59,6 +59,7 @@ type TCPRelay struct {
 	observer                 RuntimeObserver
 	router                   *router.Router
 	logger                   *zap.Logger
+	lifecycle                serviceLifecycle
 	metricsWg                sync.WaitGroup
 	handlerWg                sync.WaitGroup
 	connectionsMu            sync.Mutex
@@ -153,13 +154,14 @@ func (s *TCPRelay) ZapField() zap.Field {
 
 // Start implements [shadowsocks.Service.Start].
 func (s *TCPRelay) Start(ctx context.Context) error {
+	runCtx := s.lifecycle.start(ctx)
 	for i := range s.listeners {
 		index := i
 		lnc := &s.listeners[index]
 
-		l, _, err := lnc.listenConfig.ListenTCP(ctx, lnc.network, lnc.address)
+		l, _, err := lnc.listenConfig.ListenTCP(runCtx, lnc.network, lnc.address)
 		if err != nil {
-			return err
+			return errors.Join(err, s.rollbackStart())
 		}
 		lnc.listener = l
 		lnc.address = l.Addr().String()
@@ -173,7 +175,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 			for {
 				clientConn, err := lnc.listener.AcceptTCP()
 				if err != nil {
-					if errors.Is(err, os.ErrDeadlineExceeded) {
+					if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, net.ErrClosed) {
 						break
 					}
 					lnc.logger.Error("Failed to accept TCP connection", zap.Error(err))
@@ -196,7 +198,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 				}
 				s.activeConnections.Add(1)
 				s.handlerWg.Go(func() {
-					s.handleConn(ctx, lnc, clientConn)
+					s.handleConn(runCtx, lnc, clientConn)
 				})
 			}
 		})
@@ -210,7 +212,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 		var lastRejectedEstablishedLimit uint64
 		for {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			case <-ticker.C:
 				s.userConnectionsMu.Lock()
@@ -278,6 +280,35 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 		}
 	})
 	return nil
+}
+
+func (s *TCPRelay) rollbackStart() error {
+	s.lifecycle.stop()
+
+	s.connectionsMu.Lock()
+	s.stopping = true
+	connections := make([]net.Conn, 0, len(s.connections))
+	for connection := range s.connections {
+		connections = append(connections, connection)
+	}
+	s.connectionsMu.Unlock()
+
+	var errs []error
+	for i := range s.listeners {
+		if listener := s.listeners[i].listener; listener != nil {
+			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	s.acceptWg.Wait()
+	for _, connection := range connections {
+		if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	s.handlerWg.Wait()
+	return errors.Join(errs...)
 }
 
 // handleConn handles an accepted TCP connection.
@@ -480,6 +511,7 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	logger.Debug("Bidirectional copy started",
 		zap.Int("initialPayloadLength", len(req.Payload)),
 	)
+	s.collector.CollectTCPSessionStart(req.Username)
 
 	accounting := newTCPSessionAccounting(s, req.Username, uint64(len(req.Payload)))
 	stopAccounting := accounting.start(lnc.trafficFlushInterval)
@@ -588,6 +620,8 @@ func averageDuration(totalNanos, count uint64) time.Duration {
 
 // Stop implements [shadowsocks.Service.Stop].
 func (s *TCPRelay) Stop() error {
+	s.lifecycle.stop()
+
 	s.connectionsMu.Lock()
 	s.stopping = true
 	connections := make([]net.Conn, 0, len(s.connections))
@@ -598,6 +632,9 @@ func (s *TCPRelay) Stop() error {
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.listener == nil {
+			continue
+		}
 		if err := lnc.listener.SetDeadline(conn.ALongTimeAgo); err != nil {
 			lnc.logger.Error("Failed to set deadline on listener", zap.Error(err))
 		}
@@ -612,6 +649,9 @@ func (s *TCPRelay) Stop() error {
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.listener == nil {
+			continue
+		}
 		if err := lnc.listener.Close(); err != nil {
 			lnc.logger.Error("Failed to close listener", zap.Error(err))
 		}

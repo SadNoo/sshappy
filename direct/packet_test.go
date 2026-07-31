@@ -25,6 +25,30 @@ func TestDirectPacketPackUnpacker(t *testing.T) {
 	zerocopy.ClientServerPackerUnpackerTestFunc(t, c, DirectPacketClientUnpacker{}, s, s)
 }
 
+func TestDirectUDPClientUsesPerSessionPacker(t *testing.T) {
+	c := NewDirectUDPClient("direct", "ip", mtu, conn.DefaultUDPClientListenConfig)
+	_, first, err := c.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := c.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstPacker, ok := first.Packer.(*DirectPacketClientPacker)
+	if !ok {
+		t.Fatalf("first packer has type %T", first.Packer)
+	}
+	secondPacker, ok := second.Packer.(*DirectPacketClientPacker)
+	if !ok {
+		t.Fatalf("second packer has type %T", second.Packer)
+	}
+	if firstPacker == secondPacker {
+		t.Fatal("DirectUDPClient reused a mutable packer across sessions")
+	}
+}
+
 func TestShadowsocksNonePacketPackUnpacker(t *testing.T) {
 	clientPacker := NewShadowsocksNonePacketClientPacker(serverAddrPort, packetSize)
 	clientUnpacker := NewShadowsocksNonePacketClientUnpacker(serverAddrPort)

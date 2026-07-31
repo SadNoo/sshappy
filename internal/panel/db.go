@@ -1,11 +1,14 @@
 package panel
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -29,6 +32,11 @@ type Database struct {
 	db     *sql.DB
 	config Config
 }
+
+// ErrNodeNotAuthorized marks node state that is authoritative and must not be
+// treated like a temporary database failure. Keeping the previous node active
+// after this error would bypass a panel-side revoke or bandwidth limit.
+var ErrNodeNotAuthorized = errors.New("node is not authorized to serve traffic")
 
 func OpenDatabase(config Config) (*Database, error) {
 	tlsMode, err := mysqlTLSMode(config)
@@ -102,7 +110,7 @@ const mysqlTLSConfigName = "sshappy-panel-mysql"
 func mysqlTLSMode(config Config) (string, error) {
 	mode := strings.ToLower(config.MySQLTLSMode)
 	if mode == "" || mode == "auto" {
-		if config.MySQLHost == "localhost" {
+		if strings.EqualFold(config.MySQLHost, "localhost") {
 			return "false", nil
 		}
 		if ip := net.ParseIP(config.MySQLHost); ip != nil && ip.IsLoopback() {
@@ -150,11 +158,12 @@ func (d *Database) Stats() sql.DBStats {
 
 func (d *Database) LoadNode() (Node, error) {
 	var node Node
+	var bandwidth, bandwidthLimit int64
 	err := d.db.QueryRow(`
-		SELECT id, node_group, node_class, node_speedlimit, traffic_rate, sort, server
+		SELECT id, node_group, node_class, node_speedlimit, traffic_rate, sort, server,
+		       node_bandwidth, node_bandwidth_limit
 		FROM ss_node
 		WHERE id = ?
-		  AND (node_bandwidth < node_bandwidth_limit OR node_bandwidth_limit = 0)
 	`, d.config.NodeID).Scan(
 		&node.ID,
 		&node.Group,
@@ -163,26 +172,41 @@ func (d *Database) LoadNode() (Node, error) {
 		&node.TrafficRate,
 		&node.Sort,
 		&node.Server,
+		&bandwidth,
+		&bandwidthLimit,
 	)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return node, fmt.Errorf("%w: node %d does not exist", ErrNodeNotAuthorized, d.config.NodeID)
+		}
 		return node, err
 	}
+	return validateLoadedNode(node, bandwidth, bandwidthLimit)
+}
+
+func validateLoadedNode(node Node, bandwidth, bandwidthLimit int64) (Node, error) {
+	if bandwidthLimit != 0 && bandwidth >= bandwidthLimit {
+		return node, fmt.Errorf("%w: node %d exceeded its bandwidth limit", ErrNodeNotAuthorized, node.ID)
+	}
 	if node.Sort != 14 {
-		return node, fmt.Errorf("node %d must be sort=14", node.ID)
+		return node, fmt.Errorf("%w: node %d must be sort=14", ErrNodeNotAuthorized, node.ID)
 	}
 	_, port, serverKeyB64, err := parseSSSinglePort(node.Server)
 	if err != nil {
-		return node, err
+		return node, fmt.Errorf("%w: %v", ErrNodeNotAuthorized, err)
 	}
 	serverKey, err := decodePSK(serverKeyB64)
 	if err != nil {
-		return node, err
+		return node, fmt.Errorf("%w: node %d has an invalid server key", ErrNodeNotAuthorized, node.ID)
 	}
 	node.ListenPort = port
 	node.ServerKeyB64 = serverKeyB64
 	node.ServerKey = serverKey
 	if node.TrafficRate == 0 {
 		node.TrafficRate = 1
+	}
+	if node.TrafficRate < 0 || math.IsNaN(node.TrafficRate) || math.IsInf(node.TrafficRate, 0) {
+		return node, fmt.Errorf("%w: node %d has invalid traffic rate", ErrNodeNotAuthorized, node.ID)
 	}
 	return node, nil
 }
@@ -230,11 +254,21 @@ func (d *Database) LoadUsers(node Node) ([]User, error) {
 	return users, rows.Err()
 }
 
-func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error {
+func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) (err error) {
 	if len(traffic) == 0 {
 		return nil
 	}
-	committed, err := d.trafficBatchCommitted(node.ID, batchID)
+	conn, release, err := d.acquireTrafficBatchLock(node.ID, batchID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := release(); err == nil && releaseErr != nil {
+			err = releaseErr
+		}
+	}()
+
+	committed, err := d.trafficBatchCommitted(conn, node.ID, batchID)
 	if err != nil {
 		return err
 	}
@@ -266,15 +300,68 @@ func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDel
 		end := min(start+trafficSQLBatchSize, len(billed))
 		chunkID := trafficChunkID(batchID, node.ID, len(chunkIDs))
 		chunkIDs = append(chunkIDs, chunkID)
-		if err := d.reportTrafficChunk(node, chunkID, billed[start:end], now); err != nil {
+		if err := d.reportTrafficChunk(conn, node, chunkID, billed[start:end], now); err != nil {
 			return fmt.Errorf("traffic chunk %d/%d failed: %w", len(chunkIDs), (len(billed)+trafficSQLBatchSize-1)/trafficSQLBatchSize, err)
 		}
 	}
-	return d.finalizeTrafficBatch(node.ID, batchID, chunkIDs, now)
+	return d.finalizeTrafficBatch(conn, node.ID, batchID, chunkIDs, now)
 }
 
-func (d *Database) trafficBatchCommitted(nodeID int, batchID string) (bool, error) {
-	tx, err := d.db.Begin()
+func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Conn, func() error, error) {
+	timeoutSeconds := d.config.MySQLIOTimeoutSeconds
+	if timeoutSeconds < 1 {
+		timeoutSeconds = 30
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+1)*time.Second)
+	defer cancel()
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to reserve traffic reporting connection: %w", err)
+	}
+	lockName := trafficBatchLockName(nodeID, batchID)
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, timeoutSeconds).Scan(&acquired); err != nil {
+		// The server may have granted the lock before the response was lost.
+		// Discard the physical connection instead of returning it to the pool.
+		discardSQLConn(conn)
+		return nil, nil, fmt.Errorf("failed to acquire traffic batch lock: %w", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("timed out acquiring traffic batch lock")
+	}
+	release := func() error {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if releaseErr != nil || !released.Valid || released.Int64 != 1 {
+			// A sql.Conn.Close returns the underlying connection to the pool. Mark it
+			// bad instead so an ambiguously held advisory lock cannot leak into the
+			// pool after a failed RELEASE_LOCK.
+			discardSQLConn(conn)
+			if releaseErr != nil {
+				return fmt.Errorf("failed to release traffic batch lock: %w", releaseErr)
+			}
+			return errors.New("traffic batch lock was not owned at release")
+		}
+		return conn.Close()
+	}
+	return conn, release, nil
+}
+
+func discardSQLConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
+}
+
+func trafficBatchLockName(nodeID int, batchID string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s", nodeID, batchID)))
+	return "sshappy:traffic:" + hex.EncodeToString(sum[:16])
+}
+
+func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID string) (bool, error) {
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return false, err
 	}
@@ -299,8 +386,8 @@ func (d *Database) trafficBatchCommitted(nodeID int, batchID string) (bool, erro
 	return inserted == 0, nil
 }
 
-func (d *Database) reportTrafficChunk(node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
-	tx, err := d.db.Begin()
+func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
@@ -343,8 +430,8 @@ func (d *Database) reportTrafficChunk(node Node, chunkID string, batch []billedT
 	return tx.Commit()
 }
 
-func (d *Database) finalizeTrafficBatch(nodeID int, batchID string, chunkIDs []string, now int64) error {
-	tx, err := d.db.Begin()
+func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID string, chunkIDs []string, now int64) error {
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
@@ -565,6 +652,8 @@ func parseSSSinglePort(value string) (host string, port int, key string, err err
 	switch {
 	case host == "":
 		err = fmt.Errorf("ss_node.server host is empty")
+	case port < 1 || port > 65535:
+		err = fmt.Errorf("ss_node.server port must be between 1 and 65535")
 	case key == "":
 		err = fmt.Errorf("ss_node.server server_key is empty")
 	}

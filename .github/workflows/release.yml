@@ -6,26 +6,32 @@ on:
       - 'v*'
 
 permissions:
-  artifact-metadata: write
-  attestations: write
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  release:
-    name: Release
+  build:
+    name: Verify and build
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: stable
+          go-version-file: go.mod
+
+      - name: Verify release commit
+        run: |
+          go vet ./...
+          go test -count=1 ./...
 
       - name: Build
         run: |
+          sstest_ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v} -X main.commit=${GITHUB_SHA} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
           mkdir package-linux-glibc-x86-64-v2 \
                 package-linux-glibc-x86-64-v3 \
                 package-linux-x86-64-v2 \
@@ -44,6 +50,12 @@ jobs:
           env CGO_ENABLED=0 GOAMD64=v3 go build -v -trimpath -ldflags '-s -w' -o package-linux-x86-64-v3/ ./cmd/shadowsocks-go-domain-set-converter
           env CGO_ENABLED=0 GOARCH=arm64 go build -v -trimpath -ldflags '-s -w' -o package-linux-arm64/ ./cmd/shadowsocks-go-domain-set-converter
 
+          env GOAMD64=v2 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-glibc-x86-64-v2/ ./cmd/sstest
+          env GOAMD64=v3 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-glibc-x86-64-v3/ ./cmd/sstest
+          env CGO_ENABLED=0 GOAMD64=v2 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-x86-64-v2/ ./cmd/sstest
+          env CGO_ENABLED=0 GOAMD64=v3 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-x86-64-v3/ ./cmd/sstest
+          env CGO_ENABLED=0 GOARCH=arm64 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-arm64/ ./cmd/sstest
+
       - name: Package
         env:
           ZSTD_CLEVEL: 19
@@ -60,16 +72,41 @@ jobs:
           cd ../package-linux-arm64/
           tar -acf ../shadowsocks-go-${{ github.ref_name }}-linux-arm64.tar.zst .
 
-      - name: Upload release assets
-        uses: svenstaro/upload-release-action@v2
+      - name: Upload verified release packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: shadowsocks-go-*.tar.zst
-          tag: ${{ github.ref }}
-          file_glob: true
-          draft: true
+          name: release-packages-${{ github.sha }}
+          path: 'shadowsocks-go-*.tar.zst'
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Download verified release packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-packages-${{ github.sha }}
 
       - name: Generate artifact attestation
-        uses: actions/attest@v4
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: 'shadowsocks-go-*.tar.zst'
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" shadowsocks-go-*.tar.zst --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" shadowsocks-go-*.tar.zst --draft --verify-tag --title "${GITHUB_REF_NAME}"
+          fi

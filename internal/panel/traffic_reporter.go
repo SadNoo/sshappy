@@ -15,6 +15,8 @@ const trafficOutboxVersion = 1
 
 const trafficOutboxWriteHeadroom = 1 << 20
 
+var errTrafficOutboxPersistence = errors.New("traffic outbox persistence failed")
+
 type trafficDatabase interface {
 	ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error
 }
@@ -37,16 +39,10 @@ type trafficOutboxMetrics struct {
 	DiskTotalBytes uint64
 }
 
-type trafficOutboxRecovery struct {
-	BackupPath string
-	Cause      error
-}
-
 type trafficReporter struct {
 	path      string
 	pending   []TrafficBatch
 	fileBytes int64
-	recovery  *trafficOutboxRecovery
 }
 
 func newTrafficReporter(path string) (*trafficReporter, error) {
@@ -67,12 +63,7 @@ func newTrafficReporter(path string) (*trafficReporter, error) {
 	}
 	batches, err := decodeTrafficOutbox(data, info.ModTime())
 	if err != nil {
-		backupPath, quarantineErr := quarantineCorruptOutbox(path)
-		if quarantineErr != nil {
-			return nil, fmt.Errorf("failed to quarantine invalid traffic outbox as %q after %v: %w", backupPath, err, quarantineErr)
-		}
-		reporter.recovery = &trafficOutboxRecovery{BackupPath: backupPath, Cause: err}
-		return reporter, nil
+		return nil, fmt.Errorf("invalid traffic outbox at %q; preserve and move it manually after reconciliation: %w", path, err)
 	}
 	reporter.pending = batches
 	reporter.fileBytes = int64(len(data))
@@ -97,7 +88,7 @@ func decodeTrafficOutbox(data []byte, fallbackCreatedAt time.Time) ([]TrafficBat
 			return nil, fmt.Errorf("failed to decode traffic outbox batches: %w", err)
 		}
 	} else {
-		// Version 3.4 through 4.0 persisted one TrafficBatch directly.
+		// Version 3.4 through 4.2 persisted one TrafficBatch directly.
 		var batch TrafficBatch
 		if err := json.Unmarshal(data, &batch); err != nil {
 			return nil, fmt.Errorf("failed to decode legacy traffic outbox: %w", err)
@@ -175,7 +166,7 @@ func (r *trafficReporter) Flush(db trafficDatabase, node Node) error {
 		next := r.pending[1:]
 		fileBytes, err := r.persist(next)
 		if err != nil {
-			return fmt.Errorf("traffic batch committed but outbox update failed: %w", err)
+			return fmt.Errorf("%w after database commit: %v", errTrafficOutboxPersistence, err)
 		}
 		r.pending = next
 		r.fileBytes = fileBytes
@@ -183,12 +174,12 @@ func (r *trafficReporter) Flush(db trafficDatabase, node Node) error {
 	return nil
 }
 
-func (r *trafficReporter) PendingUsers() int {
-	return r.Metrics(time.Now()).Users
+func (r *trafficReporter) PendingBatches() int {
+	return len(r.pending)
 }
 
-func (r *trafficReporter) Recovery() *trafficOutboxRecovery {
-	return r.recovery
+func (r *trafficReporter) PendingUsers() int {
+	return r.Metrics(time.Now()).Users
 }
 
 func (r *trafficReporter) Metrics(now time.Time) trafficOutboxMetrics {
@@ -229,8 +220,7 @@ func (r *trafficReporter) persist(batches []TrafficBatch) (int64, error) {
 	}
 	var value any = trafficOutbox{Version: trafficOutboxVersion, Batches: batches}
 	if len(batches) == 1 {
-		// Keep the common case readable by 4.0 so a healthy-node rollback does
-		// not require manual outbox conversion.
+		// Preserve the exact 4.2 single-batch format for rollback compatibility.
 		value = batches[0]
 	}
 	data, err := json.Marshal(value)
@@ -248,22 +238,6 @@ func (r *trafficReporter) persist(batches []TrafficBatch) (int64, error) {
 		return r.fileBytes, fmt.Errorf("failed to persist traffic outbox: %w", err)
 	}
 	return int64(len(data)), nil
-}
-
-func quarantineCorruptOutbox(path string) (string, error) {
-	backupPath := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-	if err := os.Rename(path, backupPath); err != nil {
-		return "", err
-	}
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return backupPath, err
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return backupPath, err
-	}
-	return backupPath, nil
 }
 
 func newTrafficBatchID() (string, error) {

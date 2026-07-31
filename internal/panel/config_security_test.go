@@ -15,6 +15,7 @@ func TestMySQLTLSMode(t *testing.T) {
 		want string
 	}{
 		{name: "local auto", host: "127.0.0.1", mode: "auto", want: "false"},
+		{name: "localhost auto case insensitive", host: "LOCALHOST", mode: "auto", want: "false"},
 		{name: "remote auto", host: "db.example", mode: "auto", want: "true"},
 		{name: "disabled", host: "db.example", mode: "disabled", want: "false"},
 		{name: "preferred", host: "db.example", mode: "preferred", want: "preferred"},
@@ -34,11 +35,19 @@ func TestMySQLTLSMode(t *testing.T) {
 	}
 }
 
-func TestDefaultMySQLTLSModeIsDisabled(t *testing.T) {
+func TestDefaultMySQLTLSModeIsAuto(t *testing.T) {
 	t.Setenv("MYSQL_TLS_MODE", "")
 	t.Setenv("MYSQL_TLS", "")
-	if got := LoadConfig().MySQLTLSMode; got != "disabled" {
-		t.Fatalf("default MySQL TLS mode = %q, want disabled", got)
+	if got := LoadConfig().MySQLTLSMode; got != "auto" {
+		t.Fatalf("default MySQL TLS mode = %q, want auto", got)
+	}
+}
+
+func TestInvalidIntegerEnvironmentIsRejected(t *testing.T) {
+	t.Setenv("NODE_ID", "1")
+	t.Setenv("SYNC_INTERVAL_SECONDS", "sixty")
+	if err := LoadConfig().Validate(); err == nil {
+		t.Fatal("invalid integer environment variable was silently accepted")
 	}
 }
 

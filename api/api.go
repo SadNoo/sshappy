@@ -2,15 +2,18 @@ package api
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/netip"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/database64128/shadowsocks-go"
 	"github.com/database64128/shadowsocks-go/api/certmgr"
@@ -20,6 +23,13 @@ import (
 	"github.com/database64128/shadowsocks-go/tlscerts"
 	"github.com/gaissmai/bart"
 	"go.uber.org/zap"
+)
+
+const (
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultIdleTimeout       = 2 * time.Minute
+	defaultShutdownTimeout   = 10 * time.Second
+	defaultMaxHeaderBytes    = 1 << 20
 )
 
 // Config stores the configuration for the RESTful API.
@@ -285,8 +295,11 @@ func (c *Config) NewServer(
 		logger: logger,
 		lcs:    lcs,
 		server: http.Server{
-			Handler:  mux,
-			ErrorLog: errorLog,
+			Handler:           mux,
+			ErrorLog:          errorLog,
+			ReadHeaderTimeout: defaultReadHeaderTimeout,
+			IdleTimeout:       defaultIdleTimeout,
+			MaxHeaderBytes:    defaultMaxHeaderBytes,
 		},
 	}, nil
 }
@@ -367,14 +380,11 @@ func newRealIPMiddleware(logger *zap.Logger, trustedProxies []netip.Prefix, real
 			if v := r.Header[realIPHeaderKey]; len(v) > 0 {
 				proxyAddrPort, err := netip.ParseAddrPort(r.RemoteAddr)
 				if err != nil {
-					logger.Error("Failed to parse HTTP request remote address",
+					logger.Warn("Failed to parse HTTP request remote address; ignoring real IP header",
 						zap.String("remoteAddr", r.RemoteAddr),
 						zap.Error(err),
 					)
-					return
-				}
-
-				if proxySet.Contains(proxyAddrPort.Addr()) {
+				} else if proxySet.Contains(proxyAddrPort.Addr()) {
 					r.RemoteAddr = fmt.Sprintf("%s (%s: %v)", r.RemoteAddr, realIPHeaderKey, v)
 				}
 			}
@@ -437,9 +447,11 @@ type listenConfig struct {
 
 // Server is the RESTful API server.
 type Server struct {
-	logger *zap.Logger
-	lcs    []listenConfig
-	server http.Server
+	logger    *zap.Logger
+	lcs       []listenConfig
+	server    http.Server
+	listeners []net.Listener
+	serveWg   sync.WaitGroup
 }
 
 var _ shadowsocks.Service = (*Server)(nil)
@@ -457,29 +469,61 @@ func (s *Server) Start(ctx context.Context) error {
 		lc := &s.lcs[i]
 		ln, _, err := lc.listenConfig.Listen(ctx, lc.network, lc.address)
 		if err != nil {
-			return err
+			return errors.Join(err, s.rollbackStart())
 		}
 
 		if lc.tlsConfig != nil {
 			ln = tls.NewListener(ln, lc.tlsConfig)
 		}
+		s.listeners = append(s.listeners, ln)
 
-		go func() {
-			if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+		s.serveWg.Go(func() {
+			if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed && !errors.Is(err, net.ErrClosed) {
 				s.logger.Error("Failed to serve API", zap.Error(err))
 			}
-		}()
+		})
 
 		s.logger.Info("Started API server listener", zap.Stringer("listenAddress", ln.Addr()))
 	}
 	return nil
 }
 
+func (s *Server) closeListeners() error {
+	var errs []error
+	for _, ln := range s.listeners {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) rollbackStart() error {
+	listenerErr := s.closeListeners()
+	serverErr := s.server.Close()
+	if errors.Is(serverErr, http.ErrServerClosed) || errors.Is(serverErr, net.ErrClosed) {
+		serverErr = nil
+	}
+	s.serveWg.Wait()
+	return errors.Join(listenerErr, serverErr)
+}
+
 // Stop stops the API server.
 //
 // Stop implements [shadowsocks.Service.Stop].
 func (s *Server) Stop() error {
-	if err := s.server.Close(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancel()
+
+	shutdownErr := s.server.Shutdown(ctx)
+	var closeErr error
+	if shutdownErr != nil {
+		closeErr = s.server.Close()
+	}
+	listenerErr := s.closeListeners()
+	s.serveWg.Wait()
+
+	if err := errors.Join(shutdownErr, closeErr, listenerErr); err != nil {
 		return err
 	}
 	s.logger.Info("Stopped API server")

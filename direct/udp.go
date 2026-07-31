@@ -19,22 +19,19 @@ import (
 // DirectUDPClient implements [zerocopy.UDPClient].
 type DirectUDPClient struct {
 	info    zerocopy.UDPClientSessionInfo
-	session zerocopy.UDPClientSession
+	network string
+	mtu     int
 }
 
 // NewDirectUDPClient creates a new UDP client that makes no changes to the packets.
 func NewDirectUDPClient(name, network string, mtu int, listenConfig conn.ListenConfig) *DirectUDPClient {
 	return &DirectUDPClient{
+		network: network,
+		mtu:     mtu,
 		info: zerocopy.UDPClientSessionInfo{
 			Name:         name,
 			MTU:          mtu,
 			ListenConfig: listenConfig,
-		},
-		session: zerocopy.UDPClientSession{
-			MaxPacketSize: zerocopy.MaxPacketSizeForAddr(mtu, netip.IPv4Unspecified()),
-			Packer:        NewDirectPacketClientPacker(network, mtu),
-			Unpacker:      DirectPacketClientUnpacker{},
-			Close:         zerocopy.NoopClose,
 		},
 	}
 }
@@ -48,7 +45,12 @@ func (c *DirectUDPClient) Info() zerocopy.UDPClientInfo {
 
 // NewSession implements [zerocopy.UDPClient.NewSession].
 func (c *DirectUDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSessionInfo, zerocopy.UDPClientSession, error) {
-	return c.info, c.session, nil
+	return c.info, zerocopy.UDPClientSession{
+		MaxPacketSize: zerocopy.MaxPacketSizeForAddr(c.mtu, netip.IPv4Unspecified()),
+		Packer:        NewDirectPacketClientPacker(c.network, c.mtu),
+		Unpacker:      DirectPacketClientUnpacker{},
+		Close:         zerocopy.NoopClose,
+	}, nil
 }
 
 // ShadowsocksNoneUDPClient is a Shadowsocks none UDP client.
@@ -189,7 +191,9 @@ func (c *Socks5UDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSes
 		return c.info, zerocopy.UDPClientSession{}, fmt.Errorf("failed to dial SOCKS5 server: %w", err)
 	}
 
-	addr, err := socks5.ClientUDPAssociate(tc, conn.Addr{})
+	addr, err := socks5UDPAssociateContext(ctx, tc, func() (conn.Addr, error) {
+		return socks5.ClientUDPAssociate(tc, conn.Addr{})
+	})
 	if err != nil {
 		_ = tc.Close()
 		return c.info, zerocopy.UDPClientSession{}, fmt.Errorf("failed to request UDP association: %w", err)
@@ -197,6 +201,29 @@ func (c *Socks5UDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSes
 
 	session, err := c.newSession(ctx, tc, addr)
 	return c.info, session, err
+}
+
+// socks5UDPAssociateContext interrupts a SOCKS5 negotiation by closing tc when
+// ctx is canceled. If cancellation races with a successful negotiation, a
+// callback that has started wins the race: tc is closed and the context error
+// is returned instead of publishing a connection that may be closing.
+func socks5UDPAssociateContext(ctx context.Context, tc *net.TCPConn, associate func() (conn.Addr, error)) (conn.Addr, error) {
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = tc.Close()
+	})
+
+	addr, err := associate()
+	if stopClose() {
+		return addr, err
+	}
+
+	// The cancellation callback has started or completed. Close synchronously as
+	// well so callers never receive a connection whose ownership is ambiguous.
+	_ = tc.Close()
+	if cause := context.Cause(ctx); cause != nil {
+		return conn.Addr{}, cause
+	}
+	return conn.Addr{}, context.Canceled
 }
 
 func (c *Socks5UDPClient) newSession(ctx context.Context, tc *net.TCPConn, addr conn.Addr) (zerocopy.UDPClientSession, error) {
@@ -249,7 +276,9 @@ func (c *Socks5AuthUDPClient) NewSession(ctx context.Context) (zerocopy.UDPClien
 		return c.plainClient.info, zerocopy.UDPClientSession{}, fmt.Errorf("failed to dial SOCKS5 server: %w", err)
 	}
 
-	addr, err := socks5.ClientUDPAssociateUsernamePassword(tc, c.authMsg, conn.Addr{})
+	addr, err := socks5UDPAssociateContext(ctx, tc, func() (conn.Addr, error) {
+		return socks5.ClientUDPAssociateUsernamePassword(tc, c.authMsg, conn.Addr{})
+	})
 	if err != nil {
 		_ = tc.Close()
 		return c.plainClient.info, zerocopy.UDPClientSession{}, fmt.Errorf("failed to request UDP association: %w", err)

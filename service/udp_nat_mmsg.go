@@ -161,7 +161,8 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 				continue
 			}
 
-			entry, ok := s.table[clientAddrPort]
+			key := udpNATKey{serverConn: lnc.serverConn, clientAddrPort: clientAddrPort}
+			entry, ok := s.table[key]
 			if !ok {
 				entry = &natEntry{
 					serverConn: lnc.serverConn,
@@ -226,7 +227,7 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 			if !ok {
 				natConnSendCh := make(chan *natQueuedPacket, lnc.sendChannelCapacity)
 				entry.natConnSendCh = natConnSendCh
-				s.table[clientAddrPort] = entry
+				s.table[key] = entry
 
 				s.wg.Go(func() {
 					var sendChClean bool
@@ -234,7 +235,7 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 					defer func() {
 						s.mu.Lock()
 						close(natConnSendCh)
-						delete(s.table, clientAddrPort)
+						delete(s.table, key)
 						s.mu.Unlock()
 
 						if !sendChClean {
@@ -316,6 +317,7 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 
 					// No more early returns!
 					sendChClean = true
+					s.collector.CollectUDPSessionStart("")
 
 					lnc.logger.Info("UDP NAT relay started",
 						zap.Stringer("clientAddress", clientAddrPort),
@@ -684,5 +686,7 @@ func (s *UDPNATRelay) relayNatConnToServerConnSendmmsg(downlink natDownlinkMmsg)
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
 
-	s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	if packetsSent != 0 || payloadBytesSent != 0 {
+		s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	}
 }

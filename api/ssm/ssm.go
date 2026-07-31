@@ -160,8 +160,17 @@ func handleGetUser(w http.ResponseWriter, r *http.Request, s Server) (int, error
 
 	return restapi.EncodeResponse(w, http.StatusOK, userDetailResponse{
 		Username: userCred.Name,
-		Traffic:  s.StatsCollector.Snapshot().Traffic,
+		Traffic:  userTraffic(s.StatsCollector, userCred.Name),
 	})
+}
+
+func userTraffic(collector stats.Collector, username string) stats.Traffic {
+	for _, user := range collector.Snapshot().Users {
+		if user.Name == username {
+			return user.Traffic
+		}
+	}
+	return stats.Traffic{}
 }
 
 func handleUpdateUser(w http.ResponseWriter, r *http.Request, s Server) (int, error) {

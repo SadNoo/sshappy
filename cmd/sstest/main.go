@@ -13,18 +13,34 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+var (
+	version   = "4.3-dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	logger, err := logging.NewZapLogger("console-nocolor", zapcore.InfoLevel)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
+	logger.Info("sshappy build",
+		zap.String("version", version),
+		zap.String("commit", commit),
+		zap.String("buildTime", buildTime),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := panel.Run(ctx, panel.LoadConfig(), logger); err != nil {
 		logger.Error("sshappy stopped", zap.Error(err))
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }

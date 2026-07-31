@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/database64128/shadowsocks-go/netio"
@@ -50,6 +51,12 @@ func (c *ShadowStreamServerConn) WriteTo(w io.Writer) (n int64, err error) {
 
 // Write implements [netio.Conn.Write].
 func (c *ShadowStreamServerConn) Write(b []byte) (n int, err error) {
+	c.ShadowStreamConn.writeMu.Lock()
+	defer c.ShadowStreamConn.writeMu.Unlock()
+	return c.writeUnlocked(b)
+}
+
+func (c *ShadowStreamServerConn) writeUnlocked(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -63,13 +70,13 @@ func (c *ShadowStreamServerConn) Write(b []byte) (n int, err error) {
 		n += payloadLen
 		if payloadLen < len(b) {
 			var nn int
-			nn, err = c.ShadowStreamConn.Write(b[payloadLen:])
+			nn, err = c.ShadowStreamConn.writeUnlocked(b[payloadLen:])
 			n += nn
 		}
 		return n, err
 	}
 
-	return c.ShadowStreamConn.Write(b)
+	return c.ShadowStreamConn.writeUnlocked(b)
 }
 
 // ReadFrom implements [io.ReaderFrom].
@@ -81,37 +88,12 @@ func (c *ShadowStreamServerConn) ReadFrom(r io.Reader) (n int64, err error) {
 }
 
 func (c *ShadowStreamServerConn) readFromGeneric(r io.Reader) (n int64, err error) {
-	if c.ShadowStreamConn.writeCipher == nil { // first write
-		hb, payloadBuf := c.prepareInitWriteBufs()
-
-		for {
-			nr, err := r.Read(payloadBuf)
-			if nr > 0 {
-				n = int64(nr)
-				if err = c.initWrite(hb, payloadBuf[:nr]); err != nil {
-					return n, err
-				}
-				break
-			}
-			if err != nil {
-				if err == io.EOF {
-					return n, nil
-				}
-				return n, err
-			}
-		}
-
-		nn, err := c.ShadowStreamConn.ReadFrom(r)
-		n += nn
-		return n, err
-	}
-
-	return c.ShadowStreamConn.ReadFrom(r)
+	return readFromWriter(r, c.Write)
 }
 
 func (c *ShadowStreamServerConn) prepareInitWriteBufs() (hb, payloadBuf []byte) {
 	urspLen := len(c.unsafeResponseStreamPrefix)
-	saltLen := len(c.cipherConfig.PSK)
+	saltLen := c.cipherConfig.keyLength()
 	responseHeaderStart := urspLen + saltLen
 	responseHeaderEnd := responseHeaderStart + TCPRequestFixedLengthHeaderLength + saltLen
 	payloadBufStart := responseHeaderEnd + tagSize
@@ -133,7 +115,7 @@ func (c *ShadowStreamServerConn) initWrite(hb, payload []byte) error {
 	hb = append(hb, c.unsafeResponseStreamPrefix...)
 
 	// Append random salt.
-	dst := hb[:len(hb)+len(c.cipherConfig.PSK)]
+	dst := hb[:len(hb)+c.cipherConfig.keyLength()]
 	salt := dst[len(hb):]
 	rand.Read(salt)
 
@@ -173,6 +155,12 @@ type ShadowStreamClientConn struct {
 
 // Read implements [netio.Conn.Read].
 func (c *ShadowStreamClientConn) Read(b []byte) (n int, err error) {
+	c.ShadowStreamConn.readMu.Lock()
+	defer c.ShadowStreamConn.readMu.Unlock()
+	return c.readUnlocked(b)
+}
+
+func (c *ShadowStreamClientConn) readUnlocked(b []byte) (n int, err error) {
 	if c.ShadowStreamConn.readCipher == nil { // first read
 		payloadLen, err := c.initRead(b)
 		if err != nil {
@@ -202,7 +190,7 @@ func (c *ShadowStreamClientConn) Read(b []byte) (n int, err error) {
 		return n, nil
 	}
 
-	return c.ShadowStreamConn.Read(b)
+	return c.ShadowStreamConn.readUnlocked(b)
 }
 
 // WriteTo implements [io.WriterTo].
@@ -214,6 +202,11 @@ func (c *ShadowStreamClientConn) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (c *ShadowStreamClientConn) writeToServerConn(w *ShadowStreamServerConn) (n int64, err error) {
+	c.ShadowStreamConn.readMu.Lock()
+	defer c.ShadowStreamConn.readMu.Unlock()
+	w.ShadowStreamConn.writeMu.Lock()
+	defer w.ShadowStreamConn.writeMu.Unlock()
+
 	if c.ShadowStreamConn.readCipher == nil { // first read
 		b := w.writeBuf
 
@@ -229,19 +222,22 @@ func (c *ShadowStreamClientConn) writeToServerConn(w *ShadowStreamServerConn) (n
 		if err = c.readFirstPayloadChunk(readBuf); err != nil {
 			return 0, err
 		}
-		if _, err = w.Write(readBuf[:payloadLen]); err != nil {
+		if _, err = w.writeUnlocked(readBuf[:payloadLen]); err != nil {
 			return 0, err
 		}
 
-		n, err = c.ShadowStreamConn.writeToShadowStreamConn(&w.ShadowStreamConn)
+		n, err = c.ShadowStreamConn.writeToShadowStreamConnUnlocked(&w.ShadowStreamConn)
 		n += int64(payloadLen)
 		return n, err
 	}
 
-	return c.ShadowStreamConn.writeToShadowStreamConn(&w.ShadowStreamConn)
+	return c.ShadowStreamConn.writeToShadowStreamConnUnlocked(&w.ShadowStreamConn)
 }
 
 func (c *ShadowStreamClientConn) writeToGeneric(w io.Writer) (n int64, err error) {
+	c.ShadowStreamConn.readMu.Lock()
+	defer c.ShadowStreamConn.readMu.Unlock()
+
 	if c.ShadowStreamConn.readCipher == nil { // first read
 		payloadLen, err := c.initRead(nil)
 		if err != nil {
@@ -261,17 +257,17 @@ func (c *ShadowStreamClientConn) writeToGeneric(w io.Writer) (n int64, err error
 			return n, err
 		}
 
-		nn, err := c.ShadowStreamConn.WriteTo(w)
+		nn, err := c.ShadowStreamConn.writeToUnlocked(w)
 		n += nn
 		return n, err
 	}
 
-	return c.ShadowStreamConn.WriteTo(w)
+	return c.ShadowStreamConn.writeToUnlocked(w)
 }
 
 func (c *ShadowStreamClientConn) initRead(b []byte) (payloadLen int, err error) {
 	urspLen := len(c.unsafeResponseStreamPrefix)
-	saltLen := len(c.cipherConfig.PSK)
+	saltLen := c.cipherConfig.keyLength()
 	fixedLengthHeaderStart := urspLen + saltLen
 	bufferLen := fixedLengthHeaderStart + TCPRequestFixedLengthHeaderLength + saltLen + tagSize
 
@@ -351,15 +347,25 @@ func (c *ShadowStreamClientConn) ReadFrom(r io.Reader) (n int64, err error) {
 type ShadowStreamConn struct {
 	netio.Conn
 
+	readMu     sync.Mutex
 	readBuf    []byte // lazily allocated; length is readEnd
 	readStart  int
 	readCipher *ShadowStreamCipher
 
+	writeMu     sync.Mutex
 	writeBuf    []byte // non-nil; length is always 0
 	writeCipher *ShadowStreamCipher
 }
 
 func (c *ShadowStreamConn) writeToShadowStreamConn(w *ShadowStreamConn) (n int64, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return c.writeToShadowStreamConnUnlocked(w)
+}
+
+func (c *ShadowStreamConn) writeToShadowStreamConnUnlocked(w *ShadowStreamConn) (n int64, err error) {
 	writeBuf := w.writeBuf
 	readBuf := writeBuf[2+tagSize : 2+tagSize]
 
@@ -388,6 +394,12 @@ func (c *ShadowStreamConn) getReadBuf() []byte {
 
 // Read implements [netio.Conn.Read].
 func (c *ShadowStreamConn) Read(b []byte) (n int, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	return c.readUnlocked(b)
+}
+
+func (c *ShadowStreamConn) readUnlocked(b []byte) (n int, err error) {
 	if c.readStart == len(c.readBuf) {
 		// Happy path: b is large enough for the read.
 		if len(b) >= streamReadMinBufferSize {
@@ -412,6 +424,12 @@ func (c *ShadowStreamConn) Read(b []byte) (n int, err error) {
 
 // WriteTo implements [io.WriterTo].
 func (c *ShadowStreamConn) WriteTo(w io.Writer) (n int64, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	return c.writeToUnlocked(w)
+}
+
+func (c *ShadowStreamConn) writeToUnlocked(w io.Writer) (n int64, err error) {
 	b := c.getReadBuf()
 
 	for {
@@ -469,6 +487,12 @@ func (c *ShadowStreamConn) read(b []byte) (n int, err error) {
 
 // Write implements [netio.Conn.Write].
 func (c *ShadowStreamConn) Write(b []byte) (n int, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.writeUnlocked(b)
+}
+
+func (c *ShadowStreamConn) writeUnlocked(b []byte) (n int, err error) {
 	writeBuf := c.writeBuf
 
 	for len(b) > 0 {
@@ -487,22 +511,32 @@ func (c *ShadowStreamConn) Write(b []byte) (n int, err error) {
 
 // ReadFrom implements [io.ReaderFrom].
 func (c *ShadowStreamConn) ReadFrom(r io.Reader) (n int64, err error) {
-	writeBuf := c.writeBuf
-	payloadBuf := writeBuf[2+tagSize : 2+tagSize+streamMaxPayloadSize]
+	return readFromWriter(r, c.Write)
+}
 
+// readFromWriter deliberately performs the external Read without holding the
+// destination stream's write lock. The write method serializes each resulting
+// plaintext chunk, preserving net.Conn's concurrent-write contract without
+// introducing a destination-write/source-read lock inversion with WriteTo.
+func readFromWriter(r io.Reader, write func([]byte) (int, error)) (n int64, err error) {
+	payloadBuf := make([]byte, streamMaxPayloadSize)
 	for {
-		nr, err := r.Read(payloadBuf)
+		nr, readErr := r.Read(payloadBuf)
 		if nr > 0 {
-			n += int64(nr)
-			if err := c.write(writeBuf, payloadBuf[:nr]); err != nil {
-				return n, err
+			nw, writeErr := write(payloadBuf[:nr])
+			n += int64(nw)
+			if writeErr != nil {
+				return n, writeErr
+			}
+			if nw != nr {
+				return n, io.ErrShortWrite
 			}
 		}
-		if err != nil {
-			if err == io.EOF {
+		if readErr != nil {
+			if readErr == io.EOF {
 				return n, nil
 			}
-			return n, err
+			return n, readErr
 		}
 	}
 }

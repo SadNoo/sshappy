@@ -109,7 +109,7 @@ func (c *StreamClient) DialStream(ctx context.Context, targetAddr conn.Addr, pay
 	}
 
 	urspLen := len(c.unsafeRequestStreamPrefix)
-	saltLen := len(c.cipherConfig.PSK)
+	saltLen := c.cipherConfig.keyLength()
 	eihPSKHashes := c.cipherConfig.EIHPSKHashes()
 	identityHeadersLen := IdentityHeaderLength * len(eihPSKHashes)
 	identityHeadersStart := urspLen + saltLen
@@ -268,9 +268,9 @@ func (s *StreamServer) StreamServerInfo() netio.StreamServerInfo {
 func (s *StreamServer) HandleStream(rawRW netio.Conn, logger *zap.Logger) (req netio.ConnRequest, err error) {
 	var identityHeaderLen int
 	userCipherConfig := s.userCipherConfig
-	saltLen := len(userCipherConfig.PSK)
+	saltLen := userCipherConfig.keyLength()
 	if saltLen == 0 {
-		saltLen = len(s.identityCipherConfig.IPSK)
+		saltLen = s.identityCipherConfig.keyLength()
 		identityHeaderLen = IdentityHeaderLength
 	}
 

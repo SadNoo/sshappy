@@ -180,7 +180,8 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 				continue
 			}
 
-			entry, ok := s.table[csid]
+			key := udpSessionKey{serverConn: lnc.serverConn, clientSessionID: csid}
+			entry, ok := s.table[key]
 			if !ok {
 				entry = &session{
 					serverConn: lnc.serverConn,
@@ -279,7 +280,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 				}
 				natConnSendCh := make(chan *sessionQueuedPacket, lnc.sendChannelCapacity)
 				entry.natConnSendCh = natConnSendCh
-				s.table[csid] = entry
+				s.table[key] = entry
 				s.updatePeakSessions(len(s.table))
 
 				s.wg.Go(func() {
@@ -288,8 +289,8 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 					defer func() {
 						s.mu.Lock()
 						close(natConnSendCh)
-						delete(s.table, csid)
-						s.releaseSession(entry.username)
+						delete(s.table, key)
+						s.releaseSession(entry.serverConn, entry.username)
 						s.mu.Unlock()
 
 						if !sendChClean {
@@ -382,6 +383,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 
 					// No more early returns!
 					sendChClean = true
+					s.collector.CollectUDPSessionStart(entry.username)
 
 					lnc.logger.Debug("UDP session relay started",
 						zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),

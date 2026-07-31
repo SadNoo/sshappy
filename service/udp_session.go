@@ -34,6 +34,19 @@ type sessionClientAddrInfo struct {
 	pktinfo  []byte
 }
 
+// udpSessionKey keeps client session IDs in the namespace of the listener that
+// received them. Session IDs are client-generated and can collide across
+// independently exposed listeners.
+type udpSessionKey struct {
+	serverConn      *net.UDPConn
+	clientSessionID uint64
+}
+
+type udpSessionUserKey struct {
+	serverConn *net.UDPConn
+	username   string
+}
+
 // session keeps track of a UDP session.
 type session struct {
 	// state synchronizes session initialization and shutdown.
@@ -99,12 +112,14 @@ type UDPSessionRelay struct {
 	observer               RuntimeObserver
 	router                 *router.Router
 	logger                 *zap.Logger
+	lifecycle              serviceLifecycle
 	queuedPacketPool       sync.Pool
 	mu                     sync.Mutex
 	wg                     sync.WaitGroup
 	mwg                    sync.WaitGroup
-	table                  map[uint64]*session
-	sessionsByUser         map[string]int
+	table                  map[udpSessionKey]*session
+	sessionsByListener     map[*net.UDPConn]int
+	sessionsByUser         map[udpSessionUserKey]int
 	lastLimitedUser        string
 	rxPackets              atomic.Uint64
 	rxBytes                atomic.Uint64
@@ -145,34 +160,46 @@ func NewUDPSessionRelay(
 				}
 			},
 		},
-		table:          make(map[uint64]*session),
-		sessionsByUser: make(map[string]int),
+		table:              make(map[udpSessionKey]*session),
+		sessionsByListener: make(map[*net.UDPConn]int),
+		sessionsByUser:     make(map[udpSessionUserKey]int),
 	}
 }
 
 // reserveSession reserves capacity for a new session. The caller must hold s.mu.
 func (s *UDPSessionRelay) reserveSession(username string, lnc *udpRelayServerConn) bool {
-	if lnc.maxSessions > 0 && len(s.table) >= lnc.maxSessions {
+	serverConn := lnc.serverConn
+	if lnc.maxSessions > 0 && s.sessionsByListener[serverConn] >= lnc.maxSessions {
 		s.dropSessionLimit.Add(1)
 		return false
 	}
-	if lnc.maxSessionsPerUser > 0 && s.sessionsByUser[username] >= lnc.maxSessionsPerUser {
+	userKey := udpSessionUserKey{serverConn: serverConn, username: username}
+	if lnc.maxSessionsPerUser > 0 && s.sessionsByUser[userKey] >= lnc.maxSessionsPerUser {
 		s.dropUserSessionLimit.Add(1)
 		s.lastLimitedUser = username
 		return false
 	}
-	s.sessionsByUser[username]++
+	s.sessionsByListener[serverConn]++
+	s.sessionsByUser[userKey]++
 	return true
 }
 
 // releaseSession releases a session reservation. The caller must hold s.mu.
-func (s *UDPSessionRelay) releaseSession(username string) {
-	remaining := s.sessionsByUser[username] - 1
+func (s *UDPSessionRelay) releaseSession(serverConn *net.UDPConn, username string) {
+	listenerRemaining := s.sessionsByListener[serverConn] - 1
+	if listenerRemaining <= 0 {
+		delete(s.sessionsByListener, serverConn)
+	} else {
+		s.sessionsByListener[serverConn] = listenerRemaining
+	}
+
+	userKey := udpSessionUserKey{serverConn: serverConn, username: username}
+	remaining := s.sessionsByUser[userKey] - 1
 	if remaining <= 0 {
-		delete(s.sessionsByUser, username)
+		delete(s.sessionsByUser, userKey)
 		return
 	}
-	s.sessionsByUser[username] = remaining
+	s.sessionsByUser[userKey] = remaining
 }
 
 func (s *UDPSessionRelay) updatePeakSessions(active int) {
@@ -193,12 +220,13 @@ func (s *UDPSessionRelay) ZapField() zap.Field {
 
 // Start implements [shadowsocks.Service.Start].
 func (s *UDPSessionRelay) Start(ctx context.Context) error {
+	runCtx := s.lifecycle.start(ctx)
 	for i := range s.listeners {
-		if err := s.start(ctx, i, &s.listeners[i]); err != nil {
-			return err
+		if err := s.start(runCtx, i, &s.listeners[i]); err != nil {
+			return errors.Join(err, s.Stop())
 		}
 	}
-	go s.logMetrics(ctx)
+	go s.logMetrics(runCtx)
 	return nil
 }
 
@@ -217,9 +245,9 @@ func (s *UDPSessionRelay) logMetrics(ctx context.Context) {
 			lastLimitedUser := s.lastLimitedUser
 			var busiestUser string
 			var busiestUserSessions int
-			for username, sessions := range s.sessionsByUser {
+			for userKey, sessions := range s.sessionsByUser {
 				if sessions > busiestUserSessions {
-					busiestUser = username
+					busiestUser = userKey.username
 					busiestUserSessions = sessions
 				}
 			}
@@ -354,7 +382,8 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 		s.mu.Lock()
 
-		entry, ok := s.table[csid]
+		key := udpSessionKey{serverConn: lnc.serverConn, clientSessionID: csid}
+		entry, ok := s.table[key]
 		if !ok {
 			entry = &session{
 				serverConn: lnc.serverConn,
@@ -459,7 +488,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 			}
 			natConnSendCh := make(chan *sessionQueuedPacket, lnc.sendChannelCapacity)
 			entry.natConnSendCh = natConnSendCh
-			s.table[csid] = entry
+			s.table[key] = entry
 			s.updatePeakSessions(len(s.table))
 
 			s.wg.Go(func() {
@@ -468,8 +497,8 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 				defer func() {
 					s.mu.Lock()
 					close(natConnSendCh)
-					delete(s.table, csid)
-					s.releaseSession(entry.username)
+					delete(s.table, key)
+					s.releaseSession(entry.serverConn, entry.username)
 					s.mu.Unlock()
 
 					if !sendChClean {
@@ -562,6 +591,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 				// No more early returns!
 				sendChClean = true
+				s.collector.CollectUDPSessionStart(entry.username)
 
 				lnc.logger.Debug("UDP session relay started",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
@@ -836,10 +866,15 @@ func (s *UDPSessionRelay) putQueuedPacket(queuedPacket *sessionQueuedPacket) {
 
 // Stop implements [shadowsocks.Service.Stop].
 func (s *UDPSessionRelay) Stop() error {
+	s.lifecycle.stop()
+
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
-			lnc.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
+			s.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
 		}
 	}
 
@@ -848,7 +883,7 @@ func (s *UDPSessionRelay) Stop() error {
 	s.mwg.Wait()
 
 	s.mu.Lock()
-	for csid, entry := range s.table {
+	for key, entry := range s.table {
 		natConn := entry.state.Swap(entry.serverConn)
 		if natConn == nil {
 			continue
@@ -856,7 +891,7 @@ func (s *UDPSessionRelay) Stop() error {
 
 		if err := natConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
 			entry.logger.Error("Failed to set read deadline on natConn",
-				zap.Uint64("clientSessionID", csid),
+				zap.Uint64("clientSessionID", key.clientSessionID),
 				zap.Error(err),
 			)
 		}
@@ -869,8 +904,11 @@ func (s *UDPSessionRelay) Stop() error {
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.Close(); err != nil {
-			lnc.logger.Error("Failed to close serverConn", zap.Error(err))
+			s.logger.Error("Failed to close serverConn", zap.Error(err))
 		}
 	}
 

@@ -75,18 +75,108 @@ func TestDefaultOperationalSettings(t *testing.T) {
 	t.Setenv("MYSQL_IO_TIMEOUT_SECONDS", "")
 	t.Setenv("RESOURCE_REPORT_SECONDS", "")
 	t.Setenv("OUTBOX_MIN_FREE_BYTES", "")
+	t.Setenv("AUTH_STALE_GRACE_SECONDS", "")
 	config := LoadConfig()
 	if !config.EnableTCP || !config.EnableUDP ||
 		config.TCPMaxHandshakes != 1024 ||
 		config.TCPMaxConnectionsPerUser != 800 ||
 		config.TCPMaxEstablishedTotal != 0 ||
 		config.TCPTrafficFlushSeconds != 30 ||
-		config.TrafficBatchRetentionDays != 30 ||
+		config.TrafficBatchRetentionDays != 0 ||
+		config.AuthorizationStaleSeconds != 300 ||
 		config.ResourceReportSeconds != 60 ||
 		config.OutboxMinFreeBytes != 256<<20 ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
 		config.MySQLIOTimeoutSeconds != 30 {
 		t.Fatalf("unexpected operational defaults: %+v", config)
+	}
+}
+
+func TestMergeAliveIPsPreservesLastSeen(t *testing.T) {
+	state := NewState()
+	state.AddAliveIP(7, "192.0.2.1")
+	oldLastSeen := time.Now().Add(-time.Hour)
+	state.aliveMu.Lock()
+	state.lastSeen[7] = oldLastSeen
+	state.aliveMu.Unlock()
+
+	alive := state.SnapshotAliveIPs()
+	state.MergeAliveIPs(alive)
+	state.aliveMu.Lock()
+	got := state.lastSeen[7]
+	_, restored := state.alive[7]["192.0.2.1"]
+	state.aliveMu.Unlock()
+	if !got.Equal(oldLastSeen) || !restored {
+		t.Fatalf("merge changed lastSeen or lost IP: lastSeen=%v restored=%v", got, restored)
+	}
+}
+
+func TestFailClosedWindowExpiresIndependently(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	window := newFailClosedWindow(20*time.Millisecond, func() { canceled <- struct{}{} })
+	defer window.Close()
+	cause := errors.New("database unavailable")
+	age, remaining, expired := window.RecordFailure("node authorization refresh", cause, time.Now())
+	if age != 0 || remaining <= 0 || expired {
+		t.Fatalf("unexpected initial window: age=%v remaining=%v expired=%v", age, remaining, expired)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("fail-closed deadline did not cancel the relay independently")
+	}
+	select {
+	case <-window.Expired():
+	case <-time.After(time.Second):
+		t.Fatal("fail-closed deadline did not notify the runner")
+	}
+	if err := window.Err(time.Now()); !errors.Is(err, cause) {
+		t.Fatalf("expiration error = %v, want wrapped cause", err)
+	}
+}
+
+func TestFailClosedWindowRecoversOnlySuccessfulOperation(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	window := newFailClosedWindow(40*time.Millisecond, func() { canceled <- struct{}{} })
+	defer window.Close()
+	window.RecordFailure("node authorization refresh", errors.New("node read failed"), time.Now())
+	window.RecordFailure("traffic accounting", errors.New("traffic write failed"), time.Now())
+	window.RecordSuccess("node authorization refresh", time.Now())
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("remaining accounting failure did not expire")
+	}
+	if err := window.Err(time.Now()); err == nil {
+		t.Fatal("missing accounting expiration error")
+	}
+}
+
+func TestFailClosedWindowSuccessCancelsDeadline(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	window := newFailClosedWindow(20*time.Millisecond, func() { canceled <- struct{}{} })
+	defer window.Close()
+	window.RecordFailure("traffic accounting", errors.New("traffic write failed"), time.Now())
+	window.RecordSuccess("traffic accounting", time.Now())
+	select {
+	case <-canceled:
+		t.Fatal("successful traffic flush did not recover the fail-closed window")
+	case <-time.After(60 * time.Millisecond):
+	}
+}
+
+func TestFailClosedWindowZeroGraceExpiresImmediately(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	window := newFailClosedWindow(0, func() { canceled <- struct{}{} })
+	defer window.Close()
+	_, remaining, expired := window.RecordFailure("traffic accounting", errors.New("write failed"), time.Now())
+	if remaining != 0 || !expired {
+		t.Fatalf("zero-grace failure remaining=%v expired=%v", remaining, expired)
+	}
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("zero-grace failure did not cancel immediately")
 	}
 }
 

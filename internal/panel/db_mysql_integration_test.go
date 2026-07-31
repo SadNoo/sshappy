@@ -1,8 +1,10 @@
 package panel
 
 import (
+	"context"
 	"database/sql"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -46,14 +48,32 @@ func TestMySQLChunkedTrafficRecoveryAndIdempotency(t *testing.T) {
 	database := &Database{db: db}
 	node := Node{ID: 116, TrafficRate: 1}
 	batchID := "0123456789abcdef0123456789abcdef"
-	if err := database.reportTrafficChunk(node, trafficChunkID(batchID, node.ID, 0), billed[:trafficSQLBatchSize], time.Now().Unix()); err != nil {
+	partialConn, err := db.Conn(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.ReportTraffic(node, batchID, traffic); err != nil {
+	if err := database.reportTrafficChunk(partialConn, node, trafficChunkID(batchID, node.ID, 0), billed[:trafficSQLBatchSize], time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.ReportTraffic(node, batchID, traffic); err != nil {
+	if err := partialConn.Close(); err != nil {
 		t.Fatal(err)
+	}
+
+	var waitGroup sync.WaitGroup
+	errors := make(chan error, 4)
+	for range 4 {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			errors <- database.ReportTraffic(node, batchID, traffic)
+		}()
+	}
+	waitGroup.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var upload, download, logs, nodeBandwidth, markers int64

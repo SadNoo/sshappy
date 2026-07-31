@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"maps"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/database64128/shadowsocks-go"
 	"github.com/database64128/shadowsocks-go/mmap"
@@ -23,8 +25,11 @@ import (
 )
 
 var (
-	ErrEmptyUsername   = errors.New("empty username")
-	ErrNonexistentUser = errors.New("nonexistent user")
+	ErrEmptyUsername         = errors.New("empty username")
+	ErrNonexistentUser       = errors.New("nonexistent user")
+	ErrServerStopped         = errors.New("managed credential server is stopped")
+	ErrCredentialPathSymlink = errors.New("credential path must not be a symbolic link")
+	ErrCredentialPathNotFile = errors.New("credential path must be a regular file")
 )
 
 // ManagedServer stores information about a server whose credentials are managed by the credential manager.
@@ -38,8 +43,13 @@ type ManagedServer struct {
 	cachedCredMap       map[string]*cachedUserCredential
 	cachedUserLookupMap ss2022.UserLookupMap
 	mu                  sync.RWMutex
+	fileMu              sync.Mutex
 	wg                  sync.WaitGroup
 	saveQueue           chan struct{}
+	generation          uint64
+	savedGeneration     uint64
+	stopping            bool
+	finalSaveErr        error
 	logger              *zap.Logger
 }
 
@@ -71,7 +81,7 @@ func (s *ManagedServer) Credentials() []UserCredential {
 	for username, cachedCred := range s.cachedCredMap {
 		ucs = append(ucs, UserCredential{
 			Name: username,
-			UPSK: cachedCred.uPSK,
+			UPSK: bytes.Clone(cachedCred.uPSK),
 		})
 	}
 	s.mu.RUnlock()
@@ -83,21 +93,33 @@ func (s *ManagedServer) Credentials() []UserCredential {
 func (s *ManagedServer) GetCredential(username string) (UserCredential, bool) {
 	s.mu.RLock()
 	cachedCred := s.cachedCredMap[username]
-	s.mu.RUnlock()
 	if cachedCred == nil {
+		s.mu.RUnlock()
 		return UserCredential{}, false
 	}
-	return UserCredential{
+	uc := UserCredential{
 		Name: username,
-		UPSK: cachedCred.uPSK,
-	}, true
+		UPSK: bytes.Clone(cachedCred.uPSK),
+	}
+	s.mu.RUnlock()
+	return uc, true
 }
 
 func (s *ManagedServer) saveToFile() error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	s.mu.RLock()
+	if s.savedGeneration == s.generation {
+		s.mu.RUnlock()
+		return nil
+	}
+	generation := s.generation
 	uPSKMap := make(map[string][]byte, len(s.cachedCredMap))
 	for username, uc := range s.cachedCredMap {
-		uPSKMap[username] = uc.uPSK
+		uPSKMap[username] = bytes.Clone(uc.uPSK)
 	}
+	s.mu.RUnlock()
 
 	b, err := json.MarshalIndent(uPSKMap, "", "    ")
 	if err != nil {
@@ -105,12 +127,87 @@ func (s *ManagedServer) saveToFile() error {
 	}
 	b = append(b, '\n') // b has plenty of unused capacity.
 
-	if err = os.WriteFile(s.path, b, 0600); err != nil {
+	if err = writeFileAtomic(s.path, b); err != nil {
 		return err
 	}
 
-	s.cachedContent = unsafe.String(unsafe.SliceData(b), len(b))
+	s.mu.Lock()
+	s.cachedContent = string(b)
+	s.savedGeneration = generation
+	s.mu.Unlock()
 	return nil
+}
+
+func writeFileAtomic(path string, content []byte) (err error) {
+	if err = rejectCredentialSymlink(path, true); err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}()
+
+	if err = temp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = temp.Write(content); err != nil {
+		return err
+	}
+	if err = temp.Sync(); err != nil {
+		return err
+	}
+	if err = temp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer dirFile.Close()
+	return dirFile.Sync()
+}
+
+func rejectCredentialSymlink(path string, allowNotExist bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if allowNotExist && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrCredentialPathSymlink, path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s", ErrCredentialPathNotFile, path)
+	}
+	return nil
+}
+
+func secureCredentialFile(path string) error {
+	// The parent directory must not be writable by an untrusted user. Recheck
+	// after adjusting permissions to catch ordinary symlink replacement; this
+	// path validation is not a substitute for trusted directory ownership.
+	if err := rejectCredentialSymlink(path, false); err != nil {
+		return err
+	}
+	if err := secureCredentialFileMode(path); err != nil {
+		return err
+	}
+	return rejectCredentialSymlink(path, false)
 }
 
 func (s *ManagedServer) dequeueSave(ctx context.Context) {
@@ -119,13 +216,23 @@ func (s *ManagedServer) dequeueSave(ctx context.Context) {
 		select {
 		case <-s.saveQueue:
 		case <-ctx.Done():
+			s.finishSaving()
 			return
 		}
 
 		// Wait for cooldown.
+		timer := time.NewTimer(5 * time.Second)
 		select {
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.finishSaving()
+			return
 		}
 
 		// Clear save queue after cooldown.
@@ -134,16 +241,27 @@ func (s *ManagedServer) dequeueSave(ctx context.Context) {
 		default:
 		}
 
-		// The save operation only reads cachedCredMap and writes cachedContent.
-		// It is without doubt that taking the read lock is enough for cachedCredMap.
-		// As for cachedContent, the only other place that reads and writes it is LoadFromFile,
-		// which takes the write lock. So it is safe to take just the read lock here.
-		s.mu.RLock()
 		if err := s.saveToFile(); err != nil {
 			s.logger.Error("Failed to save credentials", zap.Error(err))
+			// Keep retrying while the service is running. The queue is bounded,
+			// so repeated failures cannot create unbounded work.
+			s.enqueueSave()
 		}
-		s.mu.RUnlock()
 	}
+}
+
+func (s *ManagedServer) finishSaving() {
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+
+	err := s.saveToFile()
+	if err != nil {
+		s.logger.Error("Failed to save credentials during shutdown", zap.Error(err))
+	}
+	s.mu.Lock()
+	s.finalSaveErr = err
+	s.mu.Unlock()
 }
 
 // Start starts the managed server.
@@ -154,8 +272,12 @@ func (s *ManagedServer) Start(ctx context.Context) {
 }
 
 // Stop stops the managed server.
-func (s *ManagedServer) Stop() {
+func (s *ManagedServer) Stop() error {
 	s.wg.Wait()
+	s.mu.RLock()
+	err := s.finalSaveErr
+	s.mu.RUnlock()
+	return err
 }
 
 func (s *ManagedServer) enqueueSave() {
@@ -165,12 +287,12 @@ func (s *ManagedServer) enqueueSave() {
 	}
 }
 
-func (s *ManagedServer) updateProdULM(f func(ss2022.UserLookupMap)) {
+func (s *ManagedServer) replaceProdULMLocked() {
 	if s.tcp != nil {
-		s.tcp.UpdateUserLookupMap(f)
+		s.tcp.ReplaceUserLookupMap(maps.Clone(s.cachedUserLookupMap))
 	}
 	if s.udp != nil {
-		s.udp.UpdateUserLookupMap(f)
+		s.udp.ReplaceUserLookupMap(maps.Clone(s.cachedUserLookupMap))
 	}
 }
 
@@ -182,27 +304,36 @@ func (s *ManagedServer) AddCredential(username string, uPSK []byte) error {
 	if len(uPSK) != s.pskLength {
 		return &ss2022.PSKLengthError{PSK: uPSK, ExpectedLength: s.pskLength}
 	}
+	uPSK = bytes.Clone(uPSK)
+	uPSKHash := ss2022.PSKHash(uPSK)
+	c, err := ss2022.NewServerUserCipherConfig(username, uPSK, s.udp != nil)
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return ErrServerStopped
+	}
 	if s.cachedCredMap[username] != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("user %s already exists", username)
 	}
-	c, err := ss2022.NewServerUserCipherConfig(username, uPSK, s.udp != nil)
-	if err != nil {
+	if existing, ok := s.cachedUserLookupMap[uPSKHash]; ok {
 		s.mu.Unlock()
-		return err
+		return fmt.Errorf("duplicate uPSK for user %s and %s", existing.Name, username)
 	}
 	uc := &cachedUserCredential{
 		uPSK:     uPSK,
-		uPSKHash: ss2022.PSKHash(uPSK),
+		uPSKHash: uPSKHash,
 	}
 	s.cachedCredMap[username] = uc
 	s.cachedUserLookupMap[uc.uPSKHash] = c
+	s.generation++
+	s.replaceProdULMLocked()
 	s.mu.Unlock()
 	s.enqueueSave()
-	s.updateProdULM(func(ulm ss2022.UserLookupMap) {
-		ulm[uc.uPSKHash] = c
-	})
 	return nil
 }
 
@@ -211,7 +342,18 @@ func (s *ManagedServer) UpdateCredential(username string, uPSK []byte) error {
 	if len(uPSK) != s.pskLength {
 		return &ss2022.PSKLengthError{PSK: uPSK, ExpectedLength: s.pskLength}
 	}
+	uPSK = bytes.Clone(uPSK)
+	newUPSKHash := ss2022.PSKHash(uPSK)
+	c, err := ss2022.NewServerUserCipherConfig(username, uPSK, s.udp != nil)
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return ErrServerStopped
+	}
 	uc := s.cachedCredMap[username]
 	if uc == nil {
 		s.mu.Unlock()
@@ -221,28 +363,29 @@ func (s *ManagedServer) UpdateCredential(username string, uPSK []byte) error {
 		s.mu.Unlock()
 		return fmt.Errorf("user %s already has the same uPSK", username)
 	}
-	c, err := ss2022.NewServerUserCipherConfig(username, uPSK, s.udp != nil)
-	if err != nil {
+	if existing, ok := s.cachedUserLookupMap[newUPSKHash]; ok && existing.Name != username {
 		s.mu.Unlock()
-		return err
+		return fmt.Errorf("duplicate uPSK for user %s and %s", existing.Name, username)
 	}
 	oldUPSKHash := uc.uPSKHash
 	uc.uPSK = uPSK
-	uc.uPSKHash = ss2022.PSKHash(uPSK)
+	uc.uPSKHash = newUPSKHash
 	delete(s.cachedUserLookupMap, oldUPSKHash)
-	s.cachedUserLookupMap[uc.uPSKHash] = c
+	s.cachedUserLookupMap[newUPSKHash] = c
+	s.generation++
+	s.replaceProdULMLocked()
 	s.mu.Unlock()
 	s.enqueueSave()
-	s.updateProdULM(func(ulm ss2022.UserLookupMap) {
-		delete(ulm, oldUPSKHash)
-		ulm[uc.uPSKHash] = c
-	})
 	return nil
 }
 
 // DeleteCredential deletes a user credential.
 func (s *ManagedServer) DeleteCredential(username string) error {
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return ErrServerStopped
+	}
 	uc := s.cachedCredMap[username]
 	if uc == nil {
 		s.mu.Unlock()
@@ -250,56 +393,68 @@ func (s *ManagedServer) DeleteCredential(username string) error {
 	}
 	delete(s.cachedCredMap, username)
 	delete(s.cachedUserLookupMap, uc.uPSKHash)
+	s.generation++
+	s.replaceProdULMLocked()
 	s.mu.Unlock()
 	s.enqueueSave()
-	s.updateProdULM(func(ulm ss2022.UserLookupMap) {
-		delete(ulm, uc.uPSKHash)
-	})
 	return nil
 }
 
 // LoadFromFile loads credentials from the configured credential file
 // and applies the changes to the associated credential stores.
 func (s *ManagedServer) LoadFromFile() error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	if err := secureCredentialFile(s.path); err != nil {
+		return err
+	}
 	content, close, err := mmap.ReadFile[string](s.path)
 	if err != nil {
 		return err
 	}
 	defer close()
 
-	s.mu.Lock()
 	// Skip if the file content is unchanged.
+	s.mu.RLock()
 	if content == s.cachedContent {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return nil
 	}
+	s.mu.RUnlock()
 
 	r := strings.NewReader(content)
 	d := json.NewDecoder(r)
 	d.DisallowUnknownFields()
 	var uPSKMap map[string][]byte
 	if err = d.Decode(&uPSKMap); err != nil {
-		s.mu.Unlock()
 		return err
+	}
+	if err = d.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("credential file contains trailing JSON data")
+	}
+	if uPSKMap == nil {
+		uPSKMap = make(map[string][]byte)
 	}
 
 	userLookupMap := make(ss2022.UserLookupMap, len(uPSKMap))
 	credMap := make(map[string]*cachedUserCredential, len(uPSKMap))
 	for username, uPSK := range uPSKMap {
+		if username == "" {
+			return ErrEmptyUsername
+		}
 		if len(uPSK) != s.pskLength {
-			s.mu.Unlock()
 			return &ss2022.PSKLengthError{PSK: uPSK, ExpectedLength: s.pskLength}
 		}
+		uPSK = bytes.Clone(uPSK)
 
 		uPSKHash := ss2022.PSKHash(uPSK)
 		c, ok := userLookupMap[uPSKHash]
 		if ok {
-			s.mu.Unlock()
 			return fmt.Errorf("duplicate uPSK for user %s and %s", c.Name, username)
 		}
 		c, err := ss2022.NewServerUserCipherConfig(username, uPSK, s.udp != nil)
 		if err != nil {
-			s.mu.Unlock()
 			return err
 		}
 
@@ -307,17 +462,18 @@ func (s *ManagedServer) LoadFromFile() error {
 		credMap[username] = &cachedUserCredential{uPSK, uPSKHash}
 	}
 
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return ErrServerStopped
+	}
+	s.generation++
+	s.savedGeneration = s.generation
 	s.cachedContent = strings.Clone(content)
 	s.cachedUserLookupMap = userLookupMap
 	s.cachedCredMap = credMap
+	s.replaceProdULMLocked()
 	s.mu.Unlock()
-
-	if s.tcp != nil {
-		s.tcp.ReplaceUserLookupMap(maps.Clone(s.cachedUserLookupMap))
-	}
-	if s.udp != nil {
-		s.udp.ReplaceUserLookupMap(maps.Clone(s.cachedUserLookupMap))
-	}
 
 	return nil
 }
@@ -384,10 +540,13 @@ func (m *Manager) Start(ctx context.Context) error {
 //
 // Stop implements [shadowsocks.Service.Stop].
 func (m *Manager) Stop() error {
-	for _, s := range m.servers {
-		s.Stop()
+	var errs []error
+	for name, s := range m.servers {
+		if err := s.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to save credentials for server %s: %w", name, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // RegisterServer registers a server to the manager.

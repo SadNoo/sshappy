@@ -96,9 +96,21 @@ func (s *State) SnapshotAliveIPs() map[int]map[string]struct{} {
 }
 
 func (s *State) MergeAliveIPs(alive map[int]map[string]struct{}) {
+	s.aliveMu.Lock()
+	defer s.aliveMu.Unlock()
 	for userID, ips := range alive {
+		if userID <= 0 {
+			continue
+		}
+		current := s.alive[userID]
+		if current == nil {
+			current = make(map[string]struct{})
+			s.alive[userID] = current
+		}
 		for ip := range ips {
-			s.AddAliveIP(userID, ip)
+			if ip != "" {
+				current[ip] = struct{}{}
+			}
 		}
 	}
 }

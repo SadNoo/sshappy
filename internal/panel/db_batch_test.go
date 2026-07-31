@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"testing"
@@ -25,12 +26,44 @@ func TestTrafficBatchStatements(t *testing.T) {
 	}
 }
 
+func TestNodeAuthorizationErrorsAreClassified(t *testing.T) {
+	_, err := validateLoadedNode(Node{ID: 116, Sort: 14}, 100, 100)
+	if !errors.Is(err, ErrNodeNotAuthorized) {
+		t.Fatalf("bandwidth limit error was not authoritative: %v", err)
+	}
+	_, err = validateLoadedNode(Node{ID: 116, Sort: 13}, 0, 0)
+	if !errors.Is(err, ErrNodeNotAuthorized) {
+		t.Fatalf("invalid node type error was not authoritative: %v", err)
+	}
+	_, err = validateLoadedNode(Node{ID: 116, Sort: 14, Server: "example.com;443;sensitive-server-key"}, 0, 0)
+	if !errors.Is(err, ErrNodeNotAuthorized) || strings.Contains(err.Error(), "sensitive-server-key") {
+		t.Fatalf("invalid server key error was not safely classified: %v", err)
+	}
+}
+
+func TestParseSSSinglePortRejectsInvalidPorts(t *testing.T) {
+	for _, value := range []string{"example.com;-1;key", "example.com;65536;key"} {
+		if _, _, _, err := parseSSSinglePort(value); err == nil {
+			t.Fatalf("parseSSSinglePort(%q) accepted an invalid port", value)
+		}
+	}
+}
+
 func TestTrafficChunkIDsAreStableAndDistinct(t *testing.T) {
 	first := trafficChunkID("0123456789abcdef0123456789abcdef", 116, 0)
 	again := trafficChunkID("0123456789abcdef0123456789abcdef", 116, 0)
 	second := trafficChunkID("0123456789abcdef0123456789abcdef", 116, 1)
 	if len(first) != 32 || first != again || first == second {
 		t.Fatalf("chunk IDs first=%q again=%q second=%q", first, again, second)
+	}
+}
+
+func TestTrafficBatchLockNamesAreStableAndDistinct(t *testing.T) {
+	first := trafficBatchLockName(116, "0123456789abcdef0123456789abcdef")
+	again := trafficBatchLockName(116, "0123456789abcdef0123456789abcdef")
+	otherNode := trafficBatchLockName(117, "0123456789abcdef0123456789abcdef")
+	if len(first) > 64 || first != again || first == otherNode {
+		t.Fatalf("lock names first=%q again=%q otherNode=%q", first, again, otherNode)
 	}
 }
 

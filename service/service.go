@@ -336,9 +336,11 @@ func (m *Manager) Run(ctx context.Context) bool {
 		cancel()
 	}
 
-	for _, s := range runningSvcs {
+	for i := len(runningSvcs) - 1; i >= 0; i-- {
+		s := runningSvcs[i]
 		if err := s.Stop(); err != nil {
 			m.logger.Error("Failed to stop service", s.ZapField(), zap.Error(err))
+			ok = false
 		}
 	}
 

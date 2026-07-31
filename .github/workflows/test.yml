@@ -15,7 +15,7 @@ on:
       - 'docs/**'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -23,23 +23,84 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Build
         run: |
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go
           go build -v -trimpath -ldflags '-s -w' ./cmd/shadowsocks-go-domain-set-converter
+          go build -v -trimpath -ldflags '-s -w' ./cmd/sstest
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Test
         run: go test -v ./...
 
       - name: Upload Binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: shadowsocks-go-${{ github.sha }}-linux-${{ runner.arch }}
-          path: shadowsocks-go*
+          path: |
+            shadowsocks-go
+            shadowsocks-go-domain-set-converter
+            sstest
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test concurrent components
+        run: |
+          go test -race -count=1 ./internal/panel ./service ./api/... ./cred ./dns ./direct ./conn ./stats
+          go test -race -count=1 ./ss2022 -run '^(TestShadowStreamConnConcurrentReadsAndWrites|TestShadowStreamBulkCopyWrappedReaderDoesNotDeadlock|TestPSKLengthErrorRedactsPSK|TestCipherConfigsCloneKeyInputsAndSliceOutputs)$'
+
+  mysql:
+    name: MySQL integration
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: sshappy_test
+          MYSQL_ROOT_PASSWORD: test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent --host=127.0.0.1 --password=test-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test traffic accounting against MySQL
+        env:
+          SSHAPPY_TEST_MYSQL_DSN: root:test-password@tcp(127.0.0.1:3306)/sshappy_test?parseTime=true
+        run: go test -count=1 -v ./internal/panel -run '^TestMySQL'

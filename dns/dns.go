@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -249,18 +251,29 @@ func (r *Resolver) sendQueries(ctx context.Context, nameString string, result *r
 
 	qBuf := make([]byte, 2+512+2+512)
 
+	q4ID, q6ID, err := randomTransactionIDs()
+	if err != nil {
+		return fmt.Errorf("failed to generate DNS transaction IDs: %w", err)
+	}
+	q4Question := dnsmessage.Question{
+		Name:  name,
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	q6Question := dnsmessage.Question{
+		Name:  name,
+		Type:  dnsmessage.TypeAAAA,
+		Class: dnsmessage.ClassINET,
+	}
+	result.q4 = dnsQuery{id: q4ID, question: q4Question}
+	result.q6 = dnsQuery{id: q6ID, question: q6Question, ipv6: true}
+
 	q4 := dnsmessage.Message{
 		Header: dnsmessage.Header{
-			ID:               4,
+			ID:               q4ID,
 			RecursionDesired: true,
 		},
-		Questions: []dnsmessage.Question{
-			{
-				Name:  name,
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
-			},
-		},
+		Questions: []dnsmessage.Question{q4Question},
 		Additionals: []dnsmessage.Resource{
 			{
 				Header: rh,
@@ -276,16 +289,10 @@ func (r *Resolver) sendQueries(ctx context.Context, nameString string, result *r
 
 	q6 := dnsmessage.Message{
 		Header: dnsmessage.Header{
-			ID:               6,
+			ID:               q6ID,
 			RecursionDesired: true,
 		},
-		Questions: []dnsmessage.Question{
-			{
-				Name:  name,
-				Type:  dnsmessage.TypeAAAA,
-				Class: dnsmessage.ClassINET,
-			},
-		},
+		Questions: []dnsmessage.Question{q6Question},
 		Additionals: []dnsmessage.Resource{
 			{
 				Header: rh,
@@ -345,6 +352,19 @@ func (r *Resolver) sendQueries(ctx context.Context, nameString string, result *r
 	return nil
 }
 
+func randomTransactionIDs() (q4ID, q6ID uint16, err error) {
+	var ids [4]byte
+	if _, err = rand.Read(ids[:]); err != nil {
+		return 0, 0, err
+	}
+	q4ID = binary.BigEndian.Uint16(ids[:2])
+	q6ID = binary.BigEndian.Uint16(ids[2:])
+	if q4ID == q6ID {
+		q6ID++
+	}
+	return q4ID, q6ID, nil
+}
+
 // sendQueriesUDP sends queries using the resolver's UDP client and returns the result and whether the lookup was successful.
 func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt, q6Pkt []byte, result *resultBuilder) {
 	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
@@ -379,16 +399,34 @@ func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt,
 	})
 	defer stop()
 
-	// Spin up senders.
-	// Each sender will keep sending at 2s intervals until
-	// done unblocks or after 10 iterations.
-	sendFunc := func(pkt []byte, done <-chan struct{}) {
-		b := make([]byte, clientInfo.PackerHeadroom.Front+len(pkt)+clientInfo.PackerHeadroom.Rear)
+	ctx4, cancel4 := context.WithCancel(ctx)
+	ctx6, cancel6 := context.WithCancel(ctx)
+	defer cancel4()
+	defer cancel6()
 
-		for range 10 {
+	// A UDP session's packer may be stateful. Keep both A and AAAA sends on
+	// one goroutine so a single packer is never used concurrently.
+	sendFunc := func() {
+		maxQueryLen := max(len(q4Pkt), len(q6Pkt))
+		b := make([]byte, clientInfo.PackerHeadroom.Front+maxQueryLen+clientInfo.PackerHeadroom.Rear)
+		isDone := func(done <-chan struct{}) bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		}
+		send := func(pkt []byte, done <-chan struct{}) bool {
+			if isDone(done) {
+				return true
+			}
 			copy(b[clientInfo.PackerHeadroom.Front:], pkt)
 			destAddrPort, packetStart, packetLength, err := clientSession.Packer.PackInPlace(ctx, b, r.serverAddr, clientInfo.PackerHeadroom.Front, len(pkt))
 			if err != nil {
+				if ctx.Err() != nil {
+					return false
+				}
 				r.logger.Warn("Failed to pack UDP DNS query packet",
 					zap.String("resolver", r.name),
 					zap.String("client", clientInfo.Name),
@@ -397,11 +435,14 @@ func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt,
 					zap.Error(err),
 				)
 				cancel()
-				return
+				return false
 			}
 
 			_, err = udpConn.WriteToUDPAddrPort(b[packetStart:packetStart+packetLength], destAddrPort)
 			if err != nil {
+				if ctx.Err() != nil {
+					return false
+				}
 				r.logger.Warn("Failed to write UDP DNS query packet",
 					zap.String("resolver", r.name),
 					zap.String("client", clientInfo.Name),
@@ -411,23 +452,45 @@ func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt,
 					zap.Error(err),
 				)
 				cancel()
+				return false
+			}
+			return true
+		}
+
+		for range 10 {
+			if !send(q4Pkt, ctx4.Done()) || !send(q6Pkt, ctx6.Done()) {
 				return
 			}
-
-			select {
-			case <-done:
+			if isDone(ctx4.Done()) && isDone(ctx6.Done()) {
 				return
-			case <-time.After(2 * time.Second):
+			}
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
 			}
 		}
 	}
 
-	ctx4, cancel4 := context.WithCancel(ctx)
-	ctx6, cancel6 := context.WithCancel(ctx)
-	defer cancel4()
-	defer cancel6()
-	go sendFunc(q4Pkt, ctx4.Done())
-	go sendFunc(q6Pkt, ctx6.Done())
+	senderDone := make(chan struct{})
+	go func() {
+		defer close(senderDone)
+		sendFunc()
+	}()
+	// This defer is registered after the session/socket cleanup defers, so it
+	// runs first. Do not close a potentially stateful UDP client session while
+	// its packer is still executing in the sender goroutine.
+	defer func() {
+		cancel()
+		<-senderDone
+	}()
 
 	// Receive replies.
 	recvBuf := make([]byte, clientSession.MaxPacketSize)
@@ -502,7 +565,7 @@ func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt,
 				zap.Stringer("serverAddrPort", r.serverAddrPort),
 				zap.Error(err),
 			)
-			break
+			continue
 		}
 		if header.Truncated {
 			if ce := r.logger.Check(zap.DebugLevel, "Received truncated UDP DNS response"); ce != nil {
@@ -534,9 +597,9 @@ func (r *Resolver) sendQueriesUDP(ctx context.Context, nameString string, q4Pkt,
 		}
 
 		switch header.ID {
-		case 4:
+		case result.q4.id:
 			cancel4()
-		case 6:
+		case result.q6.id:
 			cancel6()
 		}
 	}
@@ -677,68 +740,107 @@ func (r *Resolver) doTCP(
 	}
 }
 
+type dnsQuery struct {
+	id       uint16
+	question dnsmessage.Question
+	ipv6     bool
+}
+
 type resultBuilder struct {
 	Result
+	q4     dnsQuery
+	q6     dnsQuery
 	v4done bool
 	v6done bool
+}
+
+type cnameAnswer struct {
+	owner  string
+	target string
+	ttl    uint32
+}
+
+type addressAnswer struct {
+	owner string
+	addr  netip.Addr
+	ttl   uint32
+}
+
+func canonicalDNSName(name dnsmessage.Name) string {
+	return strings.ToLower(name.String())
+}
+
+func sameQuestion(got, want dnsmessage.Question) bool {
+	return got.Type == want.Type && got.Class == want.Class && strings.EqualFold(got.Name.String(), want.Name.String())
+}
+
+func minExpiry(current time.Time, now time.Time, ttl uint32) time.Time {
+	expiry := now.Add(time.Duration(ttl) * time.Second)
+	if current.IsZero() || current.After(expiry) {
+		return expiry
+	}
+	return current
+}
+
+func (r *resultBuilder) queryForID(id uint16) (dnsQuery, bool) {
+	switch id {
+	case r.q4.id:
+		return r.q4, true
+	case r.q6.id:
+		return r.q6, true
+	default:
+		return dnsQuery{}, false
+	}
 }
 
 func (r *resultBuilder) parseMsg(msg []byte, isUDP bool) (dnsmessage.Header, error) {
 	now := time.Now()
 	var parser dnsmessage.Parser
 
-	// Parse header.
 	header, err := parser.Start(msg)
 	if err != nil {
 		return dnsmessage.Header{}, fmt.Errorf("failed to parse query response header: %w", err)
 	}
-
-	// Check transaction ID.
-	switch header.ID {
-	case 4:
-		if r.v4done {
-			return header, nil
-		}
-		r.a = r.a[:0]
-	case 6:
-		if r.v6done {
-			return header, nil
-		}
-		r.aaaa = r.aaaa[:0]
-	default:
+	query, ok := r.queryForID(header.ID)
+	if !ok {
 		return dnsmessage.Header{}, fmt.Errorf("unexpected transaction ID: %d", header.ID)
 	}
-
-	// Check response bit.
 	if !header.Response {
 		return dnsmessage.Header{}, ErrMessageNotResponse
 	}
-
-	// Continue parsing even if truncated.
-	// The caller may still want to use the result.
-
-	// Check RecursionAvailable.
 	if !header.RecursionAvailable {
 		return dnsmessage.Header{}, ErrResponseNoRecursionAvailable
 	}
 
-	// Check RCode.
+	question, err := parser.Question()
+	if err != nil {
+		return dnsmessage.Header{}, fmt.Errorf("failed to parse response question: %w", err)
+	}
+	if !sameQuestion(question, query.question) {
+		return dnsmessage.Header{}, fmt.Errorf("response question %v does not match query %v", question, query.question)
+	}
+	if _, err = parser.Question(); err == nil {
+		return dnsmessage.Header{}, errors.New("response contains more than one question")
+	} else if err != dnsmessage.ErrSectionDone {
+		return dnsmessage.Header{}, fmt.Errorf("failed to finish response questions: %w", err)
+	}
+
+	if (query.ipv6 && r.v6done) || (!query.ipv6 && r.v4done) {
+		return header, nil
+	}
+
+	var responseExpiresAt time.Time
 	switch header.RCode {
 	case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
 	case dnsmessage.RCodeFormatError, dnsmessage.RCodeServerFailure,
 		dnsmessage.RCodeNotImplemented, dnsmessage.RCodeRefused:
-		// RFC 9520 resolution failure caching.
-		r.expiresAt = now.Add(rcodeFailureCachingDuration)
+		responseExpiresAt = now.Add(rcodeFailureCachingDuration)
 	default:
 		return dnsmessage.Header{}, fmt.Errorf("unknown RCode: %d", header.RCode)
 	}
 
-	// Skip questions.
-	if err = parser.SkipAllQuestions(); err != nil {
-		return dnsmessage.Header{}, fmt.Errorf("failed to skip questions: %w", err)
-	}
-
-	// Parse answers and add to result.
+	var cnames []cnameAnswer
+	var addresses []addressAnswer
 	for {
 		answerHeader, err := parser.AnswerHeader()
 		if err != nil {
@@ -747,29 +849,41 @@ func (r *resultBuilder) parseMsg(msg []byte, isUDP bool) (dnsmessage.Header, err
 			}
 			return dnsmessage.Header{}, fmt.Errorf("failed to parse answer header: %w", err)
 		}
-
-		// Set minimum TTL.
-		ttl := now.Add(time.Duration(answerHeader.TTL) * time.Second)
-		if r.expiresAt.IsZero() || r.expiresAt.After(ttl) {
-			r.expiresAt = ttl
-		}
-
-		// Skip non-A/AAAA RRs.
+		owner := canonicalDNSName(answerHeader.Name)
 		switch answerHeader.Type {
+		case dnsmessage.TypeCNAME:
+			if answerHeader.Class != dnsmessage.ClassINET {
+				return dnsmessage.Header{}, fmt.Errorf("CNAME answer has unexpected class %v", answerHeader.Class)
+			}
+			resource, err := parser.CNAMEResource()
+			if err != nil {
+				return dnsmessage.Header{}, fmt.Errorf("failed to parse CNAME resource: %w", err)
+			}
+			cnames = append(cnames, cnameAnswer{owner: owner, target: canonicalDNSName(resource.CNAME), ttl: answerHeader.TTL})
 		case dnsmessage.TypeA:
-			arr, err := parser.AResource()
+			if answerHeader.Class != dnsmessage.ClassINET {
+				return dnsmessage.Header{}, fmt.Errorf("A answer has unexpected class %v", answerHeader.Class)
+			}
+			resource, err := parser.AResource()
 			if err != nil {
 				return dnsmessage.Header{}, fmt.Errorf("failed to parse A resource: %w", err)
 			}
-			r.a = append(r.a, netip.AddrFrom4(arr.A))
-
+			if query.question.Type != dnsmessage.TypeA {
+				return dnsmessage.Header{}, errors.New("AAAA response contains an A answer")
+			}
+			addresses = append(addresses, addressAnswer{owner: owner, addr: netip.AddrFrom4(resource.A), ttl: answerHeader.TTL})
 		case dnsmessage.TypeAAAA:
-			aaaarr, err := parser.AAAAResource()
+			if answerHeader.Class != dnsmessage.ClassINET {
+				return dnsmessage.Header{}, fmt.Errorf("AAAA answer has unexpected class %v", answerHeader.Class)
+			}
+			resource, err := parser.AAAAResource()
 			if err != nil {
 				return dnsmessage.Header{}, fmt.Errorf("failed to parse AAAA resource: %w", err)
 			}
-			r.aaaa = append(r.aaaa, netip.AddrFrom16(aaaarr.AAAA))
-
+			if query.question.Type != dnsmessage.TypeAAAA {
+				return dnsmessage.Header{}, errors.New("A response contains an AAAA answer")
+			}
+			addresses = append(addresses, addressAnswer{owner: owner, addr: netip.AddrFrom16(resource.AAAA), ttl: answerHeader.TTL})
 		default:
 			if err = parser.SkipAnswer(); err != nil {
 				return dnsmessage.Header{}, fmt.Errorf("failed to skip answer: %w", err)
@@ -777,7 +891,33 @@ func (r *resultBuilder) parseMsg(msg []byte, isUDP bool) (dnsmessage.Header, err
 		}
 	}
 
-	if r.expiresAt.IsZero() {
+	ownedNames := map[string]struct{}{canonicalDNSName(query.question.Name): {}}
+	for changed := true; changed; {
+		changed = false
+		for _, cname := range cnames {
+			if _, ownerIsOwned := ownedNames[cname.owner]; !ownerIsOwned {
+				continue
+			}
+			if _, targetIsOwned := ownedNames[cname.target]; !targetIsOwned {
+				ownedNames[cname.target] = struct{}{}
+				changed = true
+			}
+		}
+	}
+	for _, cname := range cnames {
+		if _, ok := ownedNames[cname.owner]; !ok {
+			return dnsmessage.Header{}, fmt.Errorf("CNAME answer for unrelated name %q", cname.owner)
+		}
+		responseExpiresAt = minExpiry(responseExpiresAt, now, cname.ttl)
+	}
+	for _, address := range addresses {
+		if _, ok := ownedNames[address.owner]; !ok {
+			return dnsmessage.Header{}, fmt.Errorf("address answer for unrelated name %q", address.owner)
+		}
+		responseExpiresAt = minExpiry(responseExpiresAt, now, address.ttl)
+	}
+
+	if responseExpiresAt.IsZero() {
 		// RFC 2308 negative caching: Parse authorities and use SOA record's TTL.
 		for {
 			authorityHeader, err := parser.AuthorityHeader()
@@ -787,25 +927,33 @@ func (r *resultBuilder) parseMsg(msg []byte, isUDP bool) (dnsmessage.Header, err
 				}
 				return dnsmessage.Header{}, fmt.Errorf("failed to parse authority header: %w", err)
 			}
-
 			if authorityHeader.Type == dnsmessage.TypeSOA {
-				r.expiresAt = now.Add(time.Duration(authorityHeader.TTL) * time.Second)
+				responseExpiresAt = minExpiry(responseExpiresAt, now, authorityHeader.TTL)
 			}
-
 			if err := parser.SkipAuthority(); err != nil {
 				return dnsmessage.Header{}, fmt.Errorf("failed to skip authority: %w", err)
 			}
 		}
-		// As recommended in RFC 2308, do nothing about negative responses without SOA records.
 	}
 
-	// Mark v4 or v6 as done.
-	if !header.Truncated || !isUDP {
-		switch header.ID {
-		case 4:
-			r.v4done = true
-		case 6:
+	if r.expiresAt.IsZero() || (!responseExpiresAt.IsZero() && r.expiresAt.After(responseExpiresAt)) {
+		r.expiresAt = responseExpiresAt
+	}
+	if query.ipv6 {
+		r.aaaa = r.aaaa[:0]
+		for _, address := range addresses {
+			r.aaaa = append(r.aaaa, address.addr)
+		}
+		if !header.Truncated || !isUDP {
 			r.v6done = true
+		}
+	} else {
+		r.a = r.a[:0]
+		for _, address := range addresses {
+			r.a = append(r.a, address.addr)
+		}
+		if !header.Truncated || !isUDP {
+			r.v4done = true
 		}
 	}
 

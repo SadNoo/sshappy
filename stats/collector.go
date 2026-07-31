@@ -16,21 +16,27 @@ type trafficCollector struct {
 	udpSessions     atomic.Uint64
 }
 
-func (tc *trafficCollector) collectTCPSession(downlinkBytes, uplinkBytes uint64) {
+func (tc *trafficCollector) collectTCPTraffic(downlinkBytes, uplinkBytes uint64) {
 	tc.downlinkBytes.Add(downlinkBytes)
 	tc.uplinkBytes.Add(uplinkBytes)
+}
+
+func (tc *trafficCollector) collectUDPTrafficDownlink(downlinkPackets, downlinkBytes uint64) {
+	tc.downlinkPackets.Add(downlinkPackets)
+	tc.downlinkBytes.Add(downlinkBytes)
+}
+
+func (tc *trafficCollector) collectUDPTrafficUplink(uplinkPackets, uplinkBytes uint64) {
+	tc.uplinkPackets.Add(uplinkPackets)
+	tc.uplinkBytes.Add(uplinkBytes)
+}
+
+func (tc *trafficCollector) collectTCPSessionStart() {
 	tc.tcpSessions.Add(1)
 }
 
-func (tc *trafficCollector) collectUDPSessionDownlink(downlinkPackets, downlinkBytes uint64) {
-	tc.downlinkPackets.Add(downlinkPackets)
-	tc.downlinkBytes.Add(downlinkBytes)
+func (tc *trafficCollector) collectUDPSessionStart() {
 	tc.udpSessions.Add(1)
-}
-
-func (tc *trafficCollector) collectUDPSessionUplink(uplinkPackets, uplinkBytes uint64) {
-	tc.uplinkPackets.Add(uplinkPackets)
-	tc.uplinkBytes.Add(uplinkBytes)
 }
 
 // Traffic stores the traffic statistics.
@@ -141,17 +147,27 @@ func (sc *serverCollector) trafficCollector(username string) *trafficCollector {
 
 // CollectTCPSession implements the Collector CollectTCPSession method.
 func (sc *serverCollector) CollectTCPSession(username string, downlinkBytes, uplinkBytes uint64) {
-	sc.trafficCollector(username).collectTCPSession(downlinkBytes, uplinkBytes)
+	sc.trafficCollector(username).collectTCPTraffic(downlinkBytes, uplinkBytes)
 }
 
 // CollectUDPSessionDownlink implements the Collector CollectUDPSessionDownlink method.
 func (sc *serverCollector) CollectUDPSessionDownlink(username string, downlinkPackets, downlinkBytes uint64) {
-	sc.trafficCollector(username).collectUDPSessionDownlink(downlinkPackets, downlinkBytes)
+	sc.trafficCollector(username).collectUDPTrafficDownlink(downlinkPackets, downlinkBytes)
 }
 
 // CollectUDPSessionUplink implements the Collector CollectUDPSessionUplink method.
 func (sc *serverCollector) CollectUDPSessionUplink(username string, uplinkPackets, uplinkBytes uint64) {
-	sc.trafficCollector(username).collectUDPSessionUplink(uplinkPackets, uplinkBytes)
+	sc.trafficCollector(username).collectUDPTrafficUplink(uplinkPackets, uplinkBytes)
+}
+
+// CollectTCPSessionStart implements the Collector CollectTCPSessionStart method.
+func (sc *serverCollector) CollectTCPSessionStart(username string) {
+	sc.trafficCollector(username).collectTCPSessionStart()
+}
+
+// CollectUDPSessionStart implements the Collector CollectUDPSessionStart method.
+func (sc *serverCollector) CollectUDPSessionStart(username string) {
+	sc.trafficCollector(username).collectUDPSessionStart()
 }
 
 // Server stores the server's traffic statistics.
@@ -192,14 +208,22 @@ func (sc *serverCollector) SnapshotAndReset() (s Server) {
 
 // Collector collects server traffic statistics.
 type Collector interface {
-	// CollectTCPSession collects the TCP session's traffic statistics.
+	// CollectTCPSession collects a TCP traffic delta without changing the session
+	// count. Session lifecycle is recorded separately by CollectTCPSessionStart.
 	CollectTCPSession(username string, downlinkBytes, uplinkBytes uint64)
 
-	// CollectUDPSessionDownlink collects the UDP session's downlink traffic statistics.
+	// CollectUDPSessionDownlink collects a UDP downlink traffic delta without
+	// changing the session count.
 	CollectUDPSessionDownlink(username string, downlinkPackets, downlinkBytes uint64)
 
 	// CollectUDPSessionUplink collects the UDP session's uplink traffic statistics.
 	CollectUDPSessionUplink(username string, uplinkPackets, uplinkBytes uint64)
+
+	// CollectTCPSessionStart records one successfully established TCP session.
+	CollectTCPSessionStart(username string)
+
+	// CollectUDPSessionStart records one successfully established UDP session.
+	CollectUDPSessionStart(username string)
 
 	// Snapshot returns the server's traffic statistics.
 	Snapshot() Server
@@ -221,6 +245,12 @@ func (NoopCollector) CollectUDPSessionDownlink(username string, downlinkPackets,
 
 // CollectUDPSessionUplink implements the Collector CollectUDPSessionUplink method.
 func (NoopCollector) CollectUDPSessionUplink(username string, uplinkPackets, uplinkBytes uint64) {}
+
+// CollectTCPSessionStart implements the Collector CollectTCPSessionStart method.
+func (NoopCollector) CollectTCPSessionStart(username string) {}
+
+// CollectUDPSessionStart implements the Collector CollectUDPSessionStart method.
+func (NoopCollector) CollectUDPSessionStart(username string) {}
 
 // Snapshot implements the Collector Snapshot method.
 func (NoopCollector) Snapshot() Server {

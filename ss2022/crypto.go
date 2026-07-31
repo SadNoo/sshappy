@@ -1,11 +1,12 @@
 package ss2022
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 
 	"lukechampine.com/blake3"
 )
@@ -46,22 +47,41 @@ func newAESGCM(psk, salt []byte) (cipher.AEAD, error) {
 
 // UserCipherConfig stores cipher configuration for a non-EIH client/server or an EIH user.
 type UserCipherConfig struct {
-	PSK   []byte
+	// PSK is retained for source compatibility and is a detached view of the
+	// configured key. Mutating it does not change the key material used by the
+	// cipher configuration. New code should treat this field as read-only.
+	PSK []byte
+	psk []byte
+
 	block cipher.Block
 }
 
 // NewUserCipherConfig returns a new UserCipherConfig.
 func NewUserCipherConfig(psk []byte, enableUDP bool) (c UserCipherConfig, err error) {
-	c.PSK = psk
+	c.psk = bytes.Clone(psk)
+	c.PSK = bytes.Clone(c.psk)
 	if enableUDP {
-		c.block, err = aes.NewCipher(psk)
+		c.block, err = aes.NewCipher(c.psk)
 	}
 	return
 }
 
+func (c UserCipherConfig) keyMaterial() []byte {
+	if c.psk != nil {
+		return c.psk
+	}
+	// Preserve the behavior of legacy struct literals. Configurations created
+	// by package constructors always use the immutable private copy above.
+	return c.PSK
+}
+
+func (c UserCipherConfig) keyLength() int {
+	return len(c.keyMaterial())
+}
+
 // AEAD derives a subkey from the salt and returns a new AEAD cipher.
 func (c UserCipherConfig) AEAD(salt []byte) (cipher.AEAD, error) {
-	return newAESGCM(c.PSK, salt)
+	return newAESGCM(c.keyMaterial(), salt)
 }
 
 func (c UserCipherConfig) ShadowStreamCipher(salt []byte) (*ShadowStreamCipher, error) {
@@ -102,12 +122,12 @@ func (c *ClientCipherConfig) TCPIdentityHeaderCiphers(salt []byte) ([]cipher.Blo
 
 // UDPIdentityHeaderCiphers returns the block ciphers for a client UDP service's identity headers.
 func (c *ClientCipherConfig) UDPIdentityHeaderCiphers() []cipher.Block {
-	return c.eihCiphers
+	return slices.Clone(c.eihCiphers)
 }
 
 // EIHPSKHashes returns the truncated BLAKE3 hashes of c.iPSKs[1:] and c.PSK.
 func (c *ClientCipherConfig) EIHPSKHashes() [][IdentityHeaderLength]byte {
-	return c.eihPSKHashes
+	return slices.Clone(c.eihPSKHashes)
 }
 
 // UDPSeparateHeaderPackerCipher returns the block cipher used by the client packer to encrypt the separate header.
@@ -152,41 +172,59 @@ func clientPSKHashes(iPSKs [][]byte, psk []byte) [][IdentityHeaderLength]byte {
 
 // NewClientCipherConfig returns a new ClientCipherConfig.
 func NewClientCipherConfig(psk []byte, iPSKs [][]byte, enableUDP bool) (c *ClientCipherConfig, err error) {
+	clonedIPSKs := make([][]byte, len(iPSKs))
+	for i := range iPSKs {
+		clonedIPSKs[i] = bytes.Clone(iPSKs[i])
+	}
+	userCipherConfig, err := NewUserCipherConfig(psk, enableUDP)
+	if err != nil {
+		return nil, err
+	}
 	c = &ClientCipherConfig{
-		UserCipherConfig: UserCipherConfig{
-			PSK: psk,
-		},
-		iPSKs:        iPSKs,
-		eihPSKHashes: clientPSKHashes(iPSKs, psk),
+		UserCipherConfig: userCipherConfig,
+		iPSKs:            clonedIPSKs,
+		eihPSKHashes:     clientPSKHashes(clonedIPSKs, userCipherConfig.keyMaterial()),
 	}
 	if enableUDP {
-		c.block, err = aes.NewCipher(psk)
-		if err != nil {
-			return
-		}
-		c.eihCiphers, err = udpIdentityHeaderClientCiphers(iPSKs)
+		c.eihCiphers, err = udpIdentityHeaderClientCiphers(clonedIPSKs)
 	}
 	return
 }
 
 // ServerIdentityCipherConfig stores cipher configuration for a server's identity header.
 type ServerIdentityCipherConfig struct {
-	IPSK  []byte
+	// IPSK is retained for source compatibility and is detached from the key
+	// material used internally. New code should treat this field as read-only.
+	IPSK []byte
+	iPSK []byte
+
 	block cipher.Block
 }
 
 // NewServerIdentityCipherConfig returns a new ServerIdentityCipherConfig.
 func NewServerIdentityCipherConfig(iPSK []byte, enableUDP bool) (c ServerIdentityCipherConfig, err error) {
-	c.IPSK = iPSK
+	c.iPSK = bytes.Clone(iPSK)
+	c.IPSK = bytes.Clone(c.iPSK)
 	if enableUDP {
-		c.block, err = aes.NewCipher(iPSK)
+		c.block, err = aes.NewCipher(c.iPSK)
 	}
 	return
 }
 
+func (c ServerIdentityCipherConfig) keyMaterial() []byte {
+	if c.iPSK != nil {
+		return c.iPSK
+	}
+	return c.IPSK
+}
+
+func (c ServerIdentityCipherConfig) keyLength() int {
+	return len(c.keyMaterial())
+}
+
 // TCP creates a block cipher for a server TCP session's identity header.
 func (c ServerIdentityCipherConfig) TCP(salt []byte) (cipher.Block, error) {
-	return newAES(c.IPSK, salt, subkeyCtxIdentity)
+	return newAES(c.keyMaterial(), salt, subkeyCtxIdentity)
 }
 
 // UDP returns the block cipher for a server UDP service's identity header.
@@ -231,7 +269,7 @@ type PSKLengthError struct {
 }
 
 func (e PSKLengthError) Error() string {
-	return fmt.Sprintf("expected PSK length %d, got %d from %s", e.ExpectedLength, len(e.PSK), base64.StdEncoding.EncodeToString(e.PSK))
+	return fmt.Sprintf("expected PSK length %d, got %d", e.ExpectedLength, len(e.PSK))
 }
 
 // CheckPSKLength checks that the PSK is the correct length for the given method.

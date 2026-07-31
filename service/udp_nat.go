@@ -48,6 +48,14 @@ type natEntry struct {
 	logger             *zap.Logger
 }
 
+// udpNATKey keeps source addresses in the namespace of the listener that
+// received them. The same client address can legitimately reach more than one
+// listener and must create an independent NAT mapping for each one.
+type udpNATKey struct {
+	serverConn     *net.UDPConn
+	clientAddrPort netip.AddrPort
+}
+
 // natUplinkGeneric is used for passing information about relay uplink to the relay goroutine.
 type natUplinkGeneric struct {
 	clientName     string
@@ -86,11 +94,12 @@ type UDPNATRelay struct {
 	collector              stats.Collector
 	router                 *router.Router
 	logger                 *zap.Logger
+	lifecycle              serviceLifecycle
 	queuedPacketPool       sync.Pool
 	mu                     sync.Mutex
 	wg                     sync.WaitGroup
 	mwg                    sync.WaitGroup
-	table                  map[netip.AddrPort]*natEntry
+	table                  map[udpNATKey]*natEntry
 }
 
 func NewUDPNATRelay(
@@ -120,7 +129,7 @@ func NewUDPNATRelay(
 				}
 			},
 		},
-		table: make(map[netip.AddrPort]*natEntry),
+		table: make(map[udpNATKey]*natEntry),
 	}
 }
 
@@ -133,9 +142,10 @@ func (s *UDPNATRelay) ZapField() zap.Field {
 
 // Start implements [shadowsocks.Service.Start].
 func (s *UDPNATRelay) Start(ctx context.Context) error {
+	runCtx := s.lifecycle.start(ctx)
 	for i := range s.listeners {
-		if err := s.start(ctx, i, &s.listeners[i]); err != nil {
-			return err
+		if err := s.start(runCtx, i, &s.listeners[i]); err != nil {
+			return errors.Join(err, s.Stop())
 		}
 	}
 	return nil
@@ -204,7 +214,8 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 
 		s.mu.Lock()
 
-		entry, ok := s.table[clientAddrPort]
+		key := udpNATKey{serverConn: lnc.serverConn, clientAddrPort: clientAddrPort}
+		entry, ok := s.table[key]
 		if !ok {
 			entry = &natEntry{
 				serverConn: lnc.serverConn,
@@ -274,7 +285,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 		if !ok {
 			natConnSendCh := make(chan *natQueuedPacket, lnc.sendChannelCapacity)
 			entry.natConnSendCh = natConnSendCh
-			s.table[clientAddrPort] = entry
+			s.table[key] = entry
 
 			s.wg.Go(func() {
 				var sendChClean bool
@@ -282,7 +293,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 				defer func() {
 					s.mu.Lock()
 					close(natConnSendCh)
-					delete(s.table, clientAddrPort)
+					delete(s.table, key)
 					s.mu.Unlock()
 
 					if !sendChClean {
@@ -364,6 +375,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 
 				// No more early returns!
 				sendChClean = true
+				s.collector.CollectUDPSessionStart("")
 
 				lnc.logger.Info("UDP NAT relay started",
 					zap.Stringer("clientAddress", clientAddrPort),
@@ -590,7 +602,9 @@ func (s *UDPNATRelay) relayNatConnToServerConnGeneric(downlink natDownlinkGeneri
 		zap.Uint64("payloadBytesSent", payloadBytesSent),
 	)
 
-	s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	if packetsSent != 0 || payloadBytesSent != 0 {
+		s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	}
 }
 
 // getQueuedPacket retrieves a queued packet from the pool.
@@ -605,10 +619,15 @@ func (s *UDPNATRelay) putQueuedPacket(queuedPacket *natQueuedPacket) {
 
 // Stop implements [shadowsocks.Service.Stop].
 func (s *UDPNATRelay) Stop() error {
+	s.lifecycle.stop()
+
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
-			lnc.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
+			s.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
 		}
 	}
 
@@ -617,7 +636,7 @@ func (s *UDPNATRelay) Stop() error {
 	s.mwg.Wait()
 
 	s.mu.Lock()
-	for clientAddrPort, entry := range s.table {
+	for key, entry := range s.table {
 		natConn := entry.state.Swap(entry.serverConn)
 		if natConn == nil {
 			continue
@@ -625,7 +644,7 @@ func (s *UDPNATRelay) Stop() error {
 
 		if err := natConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
 			entry.logger.Error("Failed to set read deadline on natConn",
-				zap.Stringer("clientAddress", clientAddrPort),
+				zap.Stringer("clientAddress", key.clientAddrPort),
 				zap.Error(err),
 			)
 		}
@@ -638,8 +657,11 @@ func (s *UDPNATRelay) Stop() error {
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.Close(); err != nil {
-			lnc.logger.Error("Failed to close serverConn", zap.Error(err))
+			s.logger.Error("Failed to close serverConn", zap.Error(err))
 		}
 	}
 

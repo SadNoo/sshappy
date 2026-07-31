@@ -657,6 +657,9 @@ func (sc *ServerConfig) UDPRelay(logger *zap.Logger, maxClientPackerHeadroom zer
 	if sc.MTU < minimumMTU {
 		return nil, ErrMTUTooSmall
 	}
+	if err := validateUDPSessionLimitSupport(sc.Protocol, sc.UDPListeners); err != nil {
+		return nil, err
+	}
 
 	var (
 		natServer                   zerocopy.UDPNATServer
@@ -731,6 +734,20 @@ func (sc *ServerConfig) UDPRelay(logger *zap.Logger, maxClientPackerHeadroom zer
 	default:
 		return nil, fmt.Errorf("invalid protocol: %s", sc.Protocol)
 	}
+}
+
+func validateUDPSessionLimitSupport(protocol string, listeners []UDPListenerConfig) error {
+	switch protocol {
+	case "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm":
+		return nil
+	}
+	for i := range listeners {
+		lnc := &listeners[i]
+		if lnc.MaxSessions != 0 || lnc.MaxSessionsPerUser != 0 {
+			return fmt.Errorf("UDP listener %d configures session limits, but protocol %q does not support them", i, protocol)
+		}
+	}
+	return nil
 }
 
 // PostInit performs post-initialization tasks.

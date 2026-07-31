@@ -1,12 +1,47 @@
 package service
 
 import (
+	"context"
 	"net/netip"
+	"sync"
 
 	"github.com/database64128/shadowsocks-go/api/ssm"
 	"github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/stats"
 )
+
+// serviceLifecycle owns the context used by one running service instance.
+// Stop paths cancel it before waiting for service goroutines, so work blocked
+// in routing, name resolution, or dialing can return promptly.
+type serviceLifecycle struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+func (l *serviceLifecycle) start(parent context.Context) context.Context {
+	ctx, cancel := context.WithCancel(parent)
+
+	l.mu.Lock()
+	previousCancel := l.cancel
+	l.cancel = cancel
+	l.mu.Unlock()
+
+	if previousCancel != nil {
+		previousCancel()
+	}
+	return ctx
+}
+
+func (l *serviceLifecycle) stop() {
+	l.mu.Lock()
+	cancel := l.cancel
+	l.cancel = nil
+	l.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
 
 // RuntimeObserver applies deployment-specific policy after authentication.
 // Returning false rejects the packet or connection before routing.

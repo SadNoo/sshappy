@@ -96,6 +96,14 @@ func (r *Runtime) addTraffic(username string, upload, download uint64) {
 	r.state.AddTraffic(userID, int64(upload), int64(download))
 }
 
+func (r *Runtime) CollectTCPSessionStart(username string) {
+	r.base.CollectTCPSessionStart(username)
+}
+
+func (r *Runtime) CollectUDPSessionStart(username string) {
+	r.base.CollectUDPSessionStart(username)
+}
+
 func isForbiddenPort(user User, port int) bool {
 	for _, rule := range splitRules(user.ForbiddenPort) {
 		var left, right int

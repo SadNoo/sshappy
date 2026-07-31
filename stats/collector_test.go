@@ -4,29 +4,68 @@ import "testing"
 
 func collect(t *testing.T, c Collector) {
 	t.Helper()
+	c.CollectTCPSessionStart("Steve")
 	c.CollectTCPSession("Steve", 1024, 2048)
+	c.CollectUDPSessionStart("Alex")
 	c.CollectUDPSessionUplink("Alex", 1, 3072)
+	c.CollectUDPSessionStart("Steve")
 	c.CollectUDPSessionDownlink("Steve", 2, 4096)
+	c.CollectTCPSessionStart("Alex")
 	c.CollectTCPSession("Alex", 5120, 6144)
+	c.CollectUDPSessionStart("Alex")
 	c.CollectUDPSessionDownlink("Alex", 4, 7168)
 	c.CollectUDPSessionUplink("Steve", 8, 8192)
+	c.CollectTCPSessionStart("Steve")
 	c.CollectTCPSession("Steve", 9216, 10240)
+	c.CollectUDPSessionStart("Alex")
 	c.CollectUDPSessionDownlink("Alex", 16, 11264)
 	c.CollectUDPSessionDownlink("Steve", 32, 12288)
 	c.CollectUDPSessionDownlink("Alex", 64, 13312)
 	c.CollectUDPSessionUplink("Steve", 128, 14336)
 	c.CollectUDPSessionUplink("Alex", 256, 15360)
 	c.CollectUDPSessionUplink("Alex", 512, 16384)
+	c.CollectTCPSessionStart("Steve")
 	c.CollectTCPSession("Steve", 17408, 18432)
 	c.CollectUDPSessionDownlink("Alex", 1024, 19456)
 	c.CollectUDPSessionUplink("Alex", 2048, 20480)
+	c.CollectUDPSessionStart("Steve")
+	c.CollectUDPSessionStart("Alex")
 }
 
 func collectNoUsername(t *testing.T, c Collector) {
 	t.Helper()
+	c.CollectTCPSessionStart("")
 	c.CollectTCPSession("", 1024, 2048)
+	c.CollectUDPSessionStart("")
 	c.CollectUDPSessionDownlink("", 1, 3072)
 	c.CollectUDPSessionUplink("", 2, 4096)
+}
+
+func TestSessionCountsAreIndependentFromTrafficFlushes(t *testing.T) {
+	c := Config{Enabled: true}.Collector()
+
+	c.CollectTCPSessionStart("alice")
+	c.CollectTCPSession("alice", 0, 0)
+	c.CollectTCPSession("alice", 1, 2)
+	c.CollectTCPSession("alice", 3, 4)
+	c.CollectUDPSessionStart("alice")
+	c.CollectUDPSessionDownlink("alice", 0, 0)
+	c.CollectUDPSessionUplink("alice", 2, 20)
+	c.CollectUDPSessionDownlink("alice", 3, 30)
+	c.CollectUDPSessionDownlink("alice", 4, 40)
+
+	got := c.Snapshot()
+	want := Traffic{
+		DownlinkPackets: 7,
+		DownlinkBytes:   74,
+		UplinkPackets:   2,
+		UplinkBytes:     26,
+		TCPSessions:     1,
+		UDPSessions:     1,
+	}
+	if got.Traffic != want {
+		t.Fatalf("traffic = %+v, want %+v", got.Traffic, want)
+	}
 }
 
 func verify(t *testing.T, s Server) {

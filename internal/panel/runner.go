@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,13 +40,31 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if err != nil {
 		return err
 	}
-	startedAt = time.Now()
-	deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
-	dbHealth.Record("cleanupTrafficBatches", startedAt, err)
+	trafficReporter, err := newTrafficReporter(config.TrafficOutboxPath)
 	if err != nil {
-		logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
-	} else if deleted > 0 {
-		logger.Info("Traffic batch markers cleaned", zap.Int64("deleted", deleted))
+		return err
+	}
+	if outbox := trafficReporter.Metrics(time.Now()); outbox.Batches > 0 {
+		logger.Warn("Recovered pending traffic outbox",
+			zap.Int("batches", outbox.Batches),
+			zap.Int("users", outbox.Users),
+			zap.Int64("fileBytes", outbox.FileBytes),
+			zap.Duration("oldestAge", outbox.OldestAge),
+		)
+	}
+	startedAt = time.Now()
+	if trafficReporter.PendingBatches() > 0 {
+		logger.Warn("Skipped traffic marker cleanup while outbox has pending batches",
+			zap.Int("pendingBatches", trafficReporter.PendingBatches()),
+		)
+	} else {
+		deleted, cleanupErr := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+		dbHealth.Record("cleanupTrafficBatches", startedAt, cleanupErr)
+		if cleanupErr != nil {
+			logger.Warn("Failed to clean traffic batch markers", zap.Error(cleanupErr))
+		} else if deleted > 0 {
+			logger.Info("Traffic batch markers cleaned", zap.Int64("deleted", deleted))
+		}
 	}
 	startedAt = time.Now()
 	users, err := db.LoadUsers(node)
@@ -55,24 +74,6 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	}
 	if err := writeCredentialFile(config.CredentialPath, users); err != nil {
 		return err
-	}
-	trafficReporter, err := newTrafficReporter(config.TrafficOutboxPath)
-	if err != nil {
-		return err
-	}
-	if recovery := trafficReporter.Recovery(); recovery != nil {
-		logger.Error("Invalid traffic outbox quarantined",
-			zap.String("backupPath", recovery.BackupPath),
-			zap.Error(recovery.Cause),
-		)
-	}
-	if outbox := trafficReporter.Metrics(time.Now()); outbox.Batches > 0 {
-		logger.Warn("Recovered pending traffic outbox",
-			zap.Int("batches", outbox.Batches),
-			zap.Int("users", outbox.Users),
-			zap.Int64("fileBytes", outbox.FileBytes),
-			zap.Duration("oldestAge", outbox.OldestAge),
-		)
 	}
 
 	state := NewState()
@@ -86,6 +87,8 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	failures := newFailClosedWindow(time.Duration(config.AuthorizationStaleSeconds)*time.Second, cancel)
+	defer failures.Close()
 	runResult := make(chan bool, 1)
 	go func() {
 		runResult <- manager.Run(runCtx)
@@ -98,6 +101,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		zap.Bool("tcpEnabled", config.EnableTCP),
 		zap.Bool("udpEnabled", config.EnableUDP),
 		zap.Int("trafficBatchRetentionDays", config.TrafficBatchRetentionDays),
+		zap.Int("authorizationStaleGraceSeconds", config.AuthorizationStaleSeconds),
 		zap.Int("trafficSQLBatchSize", trafficSQLBatchSize),
 		zap.Int("resourceReportSeconds", config.ResourceReportSeconds),
 		zap.Int64("outboxMinFreeBytes", config.OutboxMinFreeBytes),
@@ -144,63 +148,125 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		defer cleanupTicker.Stop()
 	}
 
+	var stopErr error
+	var managerStopped, managerOK bool
+
+runLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			cancel()
-			ok := <-runResult
-			if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
-				return err
-			}
-			if !ok {
-				return errors.New("upstream service manager stopped with an error")
-			}
-			return nil
+			break runLoop
 		case ok := <-runResult:
-			if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
-				return err
+			managerStopped = true
+			managerOK = ok
+			if failureErr := failures.Err(time.Now()); failureErr != nil {
+				stopErr = failureErr
+			} else if ctx.Err() == nil {
+				if ok {
+					stopErr = errors.New("upstream service manager stopped unexpectedly")
+				} else {
+					stopErr = errors.New("upstream service manager stopped with an error")
+				}
 			}
-			if !ok {
-				return errors.New("upstream service manager stopped with an error")
-			}
-			return errors.New("upstream service manager stopped unexpectedly")
+			break runLoop
+		case <-failures.Expired():
+			stopErr = failures.Err(time.Now())
+			break runLoop
 		case <-syncTicker.C:
 			startedAt := time.Now()
 			loadedNode, err := db.LoadNode()
 			dbHealth.Record("loadNode", startedAt, err)
 			if err != nil {
-				logger.Error("Failed to load node", zap.Error(err))
+				if errors.Is(err, ErrNodeNotAuthorized) {
+					stopErr = err
+					break runLoop
+				}
+				age, remaining, expired := failures.RecordFailure("node authorization refresh", err, time.Now())
+				logger.Error("Failed to load node",
+					zap.Duration("staleAge", age),
+					zap.Duration("staleGraceRemaining", remaining),
+					zap.Error(err),
+				)
+				if expired {
+					stopErr = failures.Err(time.Now())
+					break runLoop
+				}
 				continue
 			}
+			failures.RecordSuccess("node authorization refresh", time.Now())
 			if loadedNode.ListenPort != node.ListenPort ||
 				!bytes.Equal(loadedNode.ServerKey, node.ServerKey) {
-				return errors.New("node port or server key changed; restart is required")
+				stopErr = errors.New("node port or server key changed; restart is required")
+				break runLoop
 			}
 			startedAt = time.Now()
 			loadedUsers, err := db.LoadUsers(loadedNode)
 			dbHealth.Record("loadUsers", startedAt, err)
 			if err != nil {
-				logger.Error("Failed to load users", zap.Error(err))
+				age, remaining, expired := failures.RecordFailure("user authorization refresh", err, time.Now())
+				logger.Error("Failed to load users",
+					zap.Duration("staleAge", age),
+					zap.Duration("staleGraceRemaining", remaining),
+					zap.Error(err),
+				)
+				if expired {
+					stopErr = failures.Err(time.Now())
+					break runLoop
+				}
 				continue
 			}
+			failures.RecordSuccess("user authorization refresh", time.Now())
 			if err := syncCredentials(managedServer, loadedUsers); err != nil {
-				logger.Error("Failed to synchronize credentials", zap.Error(err))
+				age, remaining, expired := failures.RecordFailure("credential refresh", err, time.Now())
+				logger.Error("Failed to synchronize credentials",
+					zap.Duration("staleAge", age),
+					zap.Duration("staleGraceRemaining", remaining),
+					zap.Error(err),
+				)
+				if expired {
+					stopErr = failures.Err(time.Now())
+					break runLoop
+				}
 				continue
 			}
+			failures.RecordSuccess("credential refresh", time.Now())
 			runtime.ReplaceUsers(loadedUsers)
 			node = loadedNode
 			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
 		case <-trafficTicker.C:
 			startedAt := time.Now()
-			if err := reportTraffic(db, node, state, trafficReporter, dbHealth); err != nil {
+			flushed, err := reportTraffic(db, node, state, trafficReporter, dbHealth)
+			if flushed {
+				// A successful durable flush starts a fresh failure window even if a
+				// later flush in this reporting cycle fails again.
+				failures.RecordSuccess("traffic accounting", time.Now())
+			}
+			if err != nil {
 				outbox := trafficReporter.Metrics(time.Now())
+				if errors.Is(err, errTrafficOutboxPersistence) {
+					logger.Error("Traffic outbox persistence failed; stopping immediately",
+						zap.Duration("duration", time.Since(startedAt)),
+						zap.Int("outboxBatches", outbox.Batches),
+						zap.Int64("outboxFileBytes", outbox.FileBytes),
+						zap.Error(err),
+					)
+					stopErr = err
+					break runLoop
+				}
+				age, remaining, expired := failures.RecordFailure("traffic accounting", err, time.Now())
 				logger.Error("Failed to report traffic",
 					zap.Duration("duration", time.Since(startedAt)),
+					zap.Duration("staleAge", age),
+					zap.Duration("staleGraceRemaining", remaining),
 					zap.Int("outboxBatches", outbox.Batches),
 					zap.Int64("outboxFileBytes", outbox.FileBytes),
 					zap.Duration("outboxOldestAge", outbox.OldestAge),
 					zap.Error(err),
 				)
+				if expired {
+					stopErr = failures.Err(time.Now())
+					break runLoop
+				}
 			} else {
 				logger.Info("Traffic reported",
 					zap.Duration("duration", time.Since(startedAt)),
@@ -238,54 +304,103 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 				state.OnlineUserCount(onlineCountWindow(config)),
 			)
 		case <-cleanupC:
-			startedAt := time.Now()
-			deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
-			dbHealth.Record("cleanupTrafficBatches", startedAt, err)
-			if err != nil {
-				logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
+			if trafficReporter.PendingBatches() > 0 {
+				logger.Warn("Skipped traffic marker cleanup while outbox has pending batches",
+					zap.Int("pendingBatches", trafficReporter.PendingBatches()),
+				)
 			} else {
-				logger.Info("Traffic batch markers cleaned", zap.Int64("deleted", deleted))
+				startedAt := time.Now()
+				deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+				dbHealth.Record("cleanupTrafficBatches", startedAt, err)
+				if err != nil {
+					logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
+				} else {
+					logger.Info("Traffic batch markers cleaned", zap.Int64("deleted", deleted))
+				}
 			}
 		}
 	}
+
+	failures.Close()
+	cancel()
+	if !managerStopped {
+		managerOK = <-runResult
+	}
+	if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
+		return err
+	}
+	if stopErr != nil {
+		return stopErr
+	}
+	if !managerOK {
+		return errors.New("upstream service manager stopped with an error")
+	}
+	return nil
 }
 
-func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) error {
+func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) (flushed bool, err error) {
+	// Drain durable backlog before taking traffic out of memory. This allows a
+	// recovered database to shrink/remove a large outbox before the next append.
+	if len(reporter.pending) > 0 {
+		startedAt := time.Now()
+		flushErr := reporter.Flush(db, node)
+		health.Record("reportTraffic", startedAt, flushErr)
+		if flushErr != nil {
+			return false, flushErr
+		}
+		flushed = true
+	}
+
 	traffic := state.SnapshotTraffic()
 	if err := reporter.Capture(traffic); err != nil {
 		state.MergeTraffic(traffic)
-		return err
+		return flushed, fmt.Errorf("%w: %v", errTrafficOutboxPersistence, err)
 	}
 	if len(reporter.pending) == 0 {
-		return nil
+		return flushed, nil
 	}
 	startedAt := time.Now()
-	err := reporter.Flush(db, node)
-	health.Record("reportTraffic", startedAt, err)
-	return err
+	flushErr := reporter.Flush(db, node)
+	health.Record("reportTraffic", startedAt, flushErr)
+	if flushErr == nil {
+		flushed = true
+	}
+	return flushed, flushErr
 }
 
 func reportFinalTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth, logger *zap.Logger) error {
+	var flushErr error
+	if len(reporter.pending) > 0 {
+		startedAt := time.Now()
+		flushErr = reporter.Flush(db, node)
+		health.Record("reportFinalTraffic", startedAt, flushErr)
+	}
+
 	traffic := state.SnapshotTraffic()
 	if err := reporter.Capture(traffic); err != nil {
 		state.MergeTraffic(traffic)
-		return fmt.Errorf("failed to persist final traffic: %w", err)
+		return fmt.Errorf("%w while persisting final traffic: %v", errTrafficOutboxPersistence, err)
 	}
 	if len(reporter.pending) == 0 {
 		logger.Info("Final traffic reported", zap.Int("pendingUsers", 0))
 		return nil
 	}
-	startedAt := time.Now()
-	err := reporter.Flush(db, node)
-	health.Record("reportFinalTraffic", startedAt, err)
-	if err != nil {
+	if flushErr == nil {
+		startedAt := time.Now()
+		flushErr = reporter.Flush(db, node)
+		health.Record("reportFinalTraffic", startedAt, flushErr)
+	}
+	if errors.Is(flushErr, errTrafficOutboxPersistence) {
+		return fmt.Errorf("final traffic outbox update failed: %w", flushErr)
+	}
+	if flushErr != nil {
 		outbox := reporter.Metrics(time.Now())
 		logger.Warn("Final traffic persisted for retry",
 			zap.Int("pendingBatches", outbox.Batches),
 			zap.Int("pendingUsers", outbox.Users),
 			zap.Int64("outboxFileBytes", outbox.FileBytes),
 			zap.Duration("oldestAge", outbox.OldestAge),
-			zap.Error(err),
+			zap.Error(flushErr),
 		)
 		return nil
 	}
@@ -301,7 +416,7 @@ func newManager(config Config, node Node, runtime *Runtime, logger *zap.Logger) 
 	if err != nil {
 		return nil, nil, err
 	}
-	address := fmt.Sprintf("%s:%d", config.ListenHost, node.ListenPort)
+	address := net.JoinHostPort(config.ListenHost, strconv.Itoa(node.ListenPort))
 	server := service.ServerConfig{
 		Name:          serverName,
 		Protocol:      Method,

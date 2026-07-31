@@ -53,3 +53,13 @@ func TestSocks5UDPWithUserPassAuthIsRejected(t *testing.T) {
 		t.Fatalf("Initialize error = %v, want SOCKS5 UDP authentication error", err)
 	}
 }
+
+func TestUDPSessionLimitsAreRejectedWhenRelayCannotEnforceThem(t *testing.T) {
+	listeners := []UDPListenerConfig{{MaxSessions: 10}}
+	if err := validateUDPSessionLimitSupport("plain", listeners); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("plain protocol validation error = %v, want unsupported error", err)
+	}
+	if err := validateUDPSessionLimitSupport("2022-blake3-aes-256-gcm", listeners); err != nil {
+		t.Fatalf("SS2022 protocol rejected supported limits: %v", err)
+	}
+}

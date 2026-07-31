@@ -23,6 +23,7 @@ type Config struct {
 	EnableTCP                  bool
 	EnableUDP                  bool
 	SyncIntervalSeconds        int
+	AuthorizationStaleSeconds  int
 	TrafficReportSeconds       int
 	NodeReportSeconds          int
 	AliveIPReportSeconds       int
@@ -46,44 +47,47 @@ type Config struct {
 }
 
 func LoadConfig() Config {
+	loader := configEnvLoader{}
 	enableTCP, tcpErr := getenvBool("ENABLE_TCP", true)
 	enableUDP, udpErr := getenvBool("ENABLE_UDP", true)
-	return Config{
+	config := Config{
 		MySQLHost:                  getenv("MYSQLHOST", getenv("MYSQL_HOST", "127.0.0.1")),
-		MySQLPort:                  getenvInt("MYSQLPORT", getenvInt("MYSQL_PORT", 3306)),
+		MySQLPort:                  loader.intAny([]string{"MYSQLPORT", "MYSQL_PORT"}, 3306),
 		MySQLDB:                    getenv("MYSQLDBNAME", getenv("MYSQL_DB", "sspanel")),
 		MySQLUser:                  getenv("MYSQLUSR", getenv("MYSQL_USER", "root")),
 		MySQLPassword:              getenv("MYSQLPASSWD", getenv("MYSQL_PASS", "")),
-		MySQLTLSMode:               getenv("MYSQL_TLS_MODE", getenv("MYSQL_TLS", "disabled")),
+		MySQLTLSMode:               getenv("MYSQL_TLS_MODE", getenv("MYSQL_TLS", "auto")),
 		MySQLTLSCA:                 getenv("MYSQL_TLS_CA", ""),
-		MySQLConnectTimeoutSeconds: getenvInt("MYSQL_CONNECT_TIMEOUT_SECONDS", 10),
-		MySQLIOTimeoutSeconds:      getenvInt("MYSQL_IO_TIMEOUT_SECONDS", 30),
-		NodeID:                     getenvInt("node_id", getenvInt("NODE_ID", 0)),
+		MySQLConnectTimeoutSeconds: loader.int("MYSQL_CONNECT_TIMEOUT_SECONDS", 10),
+		MySQLIOTimeoutSeconds:      loader.int("MYSQL_IO_TIMEOUT_SECONDS", 30),
+		NodeID:                     loader.intAny([]string{"node_id", "NODE_ID"}, 0),
 		ListenHost:                 getenv("LISTEN_HOST", "0.0.0.0"),
 		EnableTCP:                  enableTCP,
 		EnableUDP:                  enableUDP,
-		SyncIntervalSeconds:        getenvInt("SYNC_INTERVAL_SECONDS", 60),
-		TrafficReportSeconds:       getenvInt("TRAFFIC_REPORT_SECONDS", 60),
-		NodeReportSeconds:          getenvInt("NODE_REPORT_SECONDS", 60),
-		AliveIPReportSeconds:       getenvInt("ALIVE_IP_REPORT_SECONDS", 60),
-		UDPMTU:                     getenvInt("UDP_MTU", 1496),
-		UDPRelayBatchSize:          getenvInt("UDP_RELAY_BATCH_SIZE", 8),
-		UDPServerBatchSize:         getenvInt("UDP_SERVER_RECV_BATCH_SIZE", 64),
-		UDPSendQueueSize:           getenvInt("UDP_SEND_CHANNEL_CAPACITY", 1024),
-		UDPNATTimeoutSeconds:       getenvInt("UDP_NAT_TIMEOUT_SECONDS", 60),
-		UDPMaxSessions:             getenvInt("UDP_MAX_SESSIONS", 2048),
-		UDPMaxSessionsPerUser:      getenvInt("UDP_MAX_SESSIONS_PER_USER", 128),
+		SyncIntervalSeconds:        loader.int("SYNC_INTERVAL_SECONDS", 60),
+		AuthorizationStaleSeconds:  loader.int("AUTH_STALE_GRACE_SECONDS", 300),
+		TrafficReportSeconds:       loader.int("TRAFFIC_REPORT_SECONDS", 60),
+		NodeReportSeconds:          loader.int("NODE_REPORT_SECONDS", 60),
+		AliveIPReportSeconds:       loader.int("ALIVE_IP_REPORT_SECONDS", 60),
+		UDPMTU:                     loader.int("UDP_MTU", 1496),
+		UDPRelayBatchSize:          loader.int("UDP_RELAY_BATCH_SIZE", 8),
+		UDPServerBatchSize:         loader.int("UDP_SERVER_RECV_BATCH_SIZE", 64),
+		UDPSendQueueSize:           loader.int("UDP_SEND_CHANNEL_CAPACITY", 1024),
+		UDPNATTimeoutSeconds:       loader.int("UDP_NAT_TIMEOUT_SECONDS", 60),
+		UDPMaxSessions:             loader.int("UDP_MAX_SESSIONS", 2048),
+		UDPMaxSessionsPerUser:      loader.int("UDP_MAX_SESSIONS_PER_USER", 128),
 		CredentialPath:             getenv("UPSK_STORE_PATH", "/var/lib/sshappy/users.json"),
 		TrafficOutboxPath:          getenv("TRAFFIC_OUTBOX_PATH", "/var/lib/sshappy/traffic-outbox.json"),
-		TCPMaxHandshakes:           getenvInt("TCP_MAX_CONCURRENT_HANDSHAKES", 1024),
-		TCPMaxConnectionsPerUser:   getenvInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
-		TCPMaxEstablishedTotal:     getenvInt("TCP_MAX_ESTABLISHED_TOTAL", 0),
-		TCPTrafficFlushSeconds:     getenvInt("TCP_TRAFFIC_FLUSH_SECONDS", 30),
-		TrafficBatchRetentionDays:  getenvInt("TRAFFIC_BATCH_RETENTION_DAYS", 30),
-		ResourceReportSeconds:      getenvInt("RESOURCE_REPORT_SECONDS", 60),
-		OutboxMinFreeBytes:         getenvInt64("OUTBOX_MIN_FREE_BYTES", 256<<20),
-		loadError:                  errors.Join(tcpErr, udpErr),
+		TCPMaxHandshakes:           loader.int("TCP_MAX_CONCURRENT_HANDSHAKES", 1024),
+		TCPMaxConnectionsPerUser:   loader.int("TCP_MAX_CONNECTIONS_PER_USER", 800),
+		TCPMaxEstablishedTotal:     loader.int("TCP_MAX_ESTABLISHED_TOTAL", 0),
+		TCPTrafficFlushSeconds:     loader.int("TCP_TRAFFIC_FLUSH_SECONDS", 30),
+		TrafficBatchRetentionDays:  loader.int("TRAFFIC_BATCH_RETENTION_DAYS", 0),
+		ResourceReportSeconds:      loader.int("RESOURCE_REPORT_SECONDS", 60),
+		OutboxMinFreeBytes:         loader.int64("OUTBOX_MIN_FREE_BYTES", 256<<20),
 	}
+	config.loadError = errors.Join(loader.err, tcpErr, udpErr)
+	return config
 }
 
 func (c Config) Validate() error {
@@ -99,6 +103,10 @@ func (c Config) Validate() error {
 		c.NodeReportSeconds <= 0 ||
 		c.AliveIPReportSeconds <= 0:
 		return fmt.Errorf("report and sync intervals must be positive")
+	case c.AuthorizationStaleSeconds < 0:
+		return fmt.Errorf("AUTH_STALE_GRACE_SECONDS must not be negative")
+	case c.MySQLPort < 1 || c.MySQLPort > 65535:
+		return fmt.Errorf("MySQL port must be between 1 and 65535")
 	case c.EnableUDP && (c.UDPMTU < 1280 || c.UDPMTU > 65535):
 		return fmt.Errorf("UDP_MTU must be between 1280 and 65535")
 	case c.EnableUDP && (c.UDPRelayBatchSize < 1 || c.UDPRelayBatchSize > 1024):
@@ -155,25 +163,40 @@ func getenv(name, fallback string) string {
 	return fallback
 }
 
-func getenvInt(name string, fallback int) int {
+type configEnvLoader struct {
+	err error
+}
+
+func (l *configEnvLoader) int(name string, fallback int) int {
 	value := os.Getenv(name)
 	if value == "" {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
+		l.err = errors.Join(l.err, fmt.Errorf("%s must be an integer, got %q", name, value))
 		return fallback
 	}
 	return parsed
 }
 
-func getenvInt64(name string, fallback int64) int64 {
+func (l *configEnvLoader) intAny(names []string, fallback int) int {
+	for _, name := range names {
+		if os.Getenv(name) != "" {
+			return l.int(name, fallback)
+		}
+	}
+	return fallback
+}
+
+func (l *configEnvLoader) int64(name string, fallback int64) int64 {
 	value := os.Getenv(name)
 	if value == "" {
 		return fallback
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
+		l.err = errors.Join(l.err, fmt.Errorf("%s must be an integer, got %q", name, value))
 		return fallback
 	}
 	return parsed

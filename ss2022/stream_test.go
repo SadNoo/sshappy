@@ -2,9 +2,13 @@ package ss2022
 
 import (
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net/netip"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/netio"
@@ -12,6 +16,161 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
+
+type gatedReader struct {
+	r       io.Reader
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedReader) Read(b []byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return r.r.Read(b)
+}
+
+func TestShadowStreamConnConcurrentReadsAndWrites(t *testing.T) {
+	psk := make([]byte, 32)
+	salt := make([]byte, 32)
+	if _, err := rand.Read(psk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatal(err)
+	}
+	config, err := NewUserCipherConfig(psk, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCipher, err := config.ShadowStreamCipher(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readCipher, err := config.ShadowStreamCipher(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawWriter, rawReader := netio.NewPipe()
+	defer rawWriter.Close()
+	defer rawReader.Close()
+	writer := &ShadowStreamConn{Conn: rawWriter, writeBuf: getWriteBuf(), writeCipher: writeCipher}
+	reader := &ShadowStreamConn{Conn: rawReader, readCipher: readCipher}
+
+	const count = 32
+	results := make(chan string, count)
+	errs := make(chan error, count*2)
+	var readers, writers sync.WaitGroup
+	for range count {
+		readers.Go(func() {
+			buf := make([]byte, streamReadMinBufferSize)
+			n, err := reader.Read(buf)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- string(buf[:n])
+		})
+	}
+	for i := range count {
+		writers.Go(func() {
+			message := fmt.Sprintf("message-%02d", i)
+			if _, err := writer.Write([]byte(message)); err != nil {
+				errs <- err
+			}
+		})
+	}
+	writers.Wait()
+	readers.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	close(results)
+	seen := make(map[string]bool, count)
+	for result := range results {
+		if seen[result] {
+			t.Errorf("received duplicate %q", result)
+		}
+		seen[result] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("received %d messages, want %d", len(seen), count)
+	}
+}
+
+func TestShadowStreamBulkCopyWrappedReaderDoesNotDeadlock(t *testing.T) {
+	rawWriter, rawReader := netio.NewPipe()
+	defer rawWriter.Close()
+	defer rawReader.Close()
+
+	// A non-nil read cipher takes the client directly into the regular stream
+	// read path. The pipe remains empty until the test closes rawWriter.
+	source := &ShadowStreamClientConn{ShadowStreamConn: ShadowStreamConn{
+		Conn:       rawReader,
+		readCipher: new(ShadowStreamCipher),
+	}}
+	destination := &ShadowStreamServerConn{ShadowStreamConn: ShadowStreamConn{
+		writeBuf: getWriteBuf(),
+	}}
+	wrapper := &gatedReader{
+		r:       source,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	readFromResult := make(chan error, 1)
+	go func() {
+		_, err := destination.ReadFrom(wrapper)
+		readFromResult <- err
+	}()
+
+	select {
+	case <-wrapper.entered:
+	case <-time.After(time.Second):
+		t.Fatal("wrapped Reader was not called")
+	}
+
+	writeToResult := make(chan error, 1)
+	go func() {
+		_, err := source.WriteTo(destination)
+		writeToResult <- err
+	}()
+
+	// Before releasing the wrapper, only WriteTo can hold source.readMu.
+	// Waiting for that lock makes the old writeMu -> external Read / readMu ->
+	// writeMu inversion deterministic instead of relying on a scheduler delay.
+	deadline := time.Now().Add(time.Second)
+	for {
+		if !source.ShadowStreamConn.readMu.TryLock() {
+			break
+		}
+		source.ShadowStreamConn.readMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("WriteTo did not acquire the source read lock")
+		}
+		runtime.Gosched()
+	}
+
+	close(wrapper.release)
+	if err := rawWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, result := range map[string]<-chan error{
+		"ReadFrom": readFromResult,
+		"WriteTo":  writeToResult,
+	} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Errorf("%s failed: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s deadlocked", name)
+		}
+	}
+}
 
 func testStreamClientServer(
 	t *testing.T,

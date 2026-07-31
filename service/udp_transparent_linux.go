@@ -45,6 +45,11 @@ type transparentNATEntry struct {
 	logger        *zap.Logger
 }
 
+type transparentNATKey struct {
+	serverConn     *net.UDPConn
+	clientAddrPort netip.AddrPort
+}
+
 // transparentUplink is used for passing information about relay uplink to the relay goroutine.
 type transparentUplink struct {
 	clientName     string
@@ -80,11 +85,12 @@ type UDPTransparentRelay struct {
 	collector                   stats.Collector
 	router                      *router.Router
 	logger                      *zap.Logger
+	lifecycle                   serviceLifecycle
 	queuedPacketPool            sync.Pool
 	mu                          sync.Mutex
 	wg                          sync.WaitGroup
 	mwg                         sync.WaitGroup
-	table                       map[netip.AddrPort]*transparentNATEntry
+	table                       map[transparentNATKey]*transparentNATEntry
 }
 
 func NewUDPTransparentRelay(
@@ -114,7 +120,7 @@ func NewUDPTransparentRelay(
 				}
 			},
 		},
-		table: make(map[netip.AddrPort]*transparentNATEntry),
+		table: make(map[transparentNATKey]*transparentNATEntry),
 	}, nil
 }
 
@@ -127,13 +133,14 @@ func (s *UDPTransparentRelay) ZapField() zap.Field {
 
 // Start implements [shadowsocks.Service.Start].
 func (s *UDPTransparentRelay) Start(ctx context.Context) error {
+	runCtx := s.lifecycle.start(ctx)
 	for i := range s.listeners {
 		index := i
 		lnc := &s.listeners[index]
 
-		serverConn, _, err := lnc.listenConfig.ListenUDPMmsgConn(ctx, lnc.network, lnc.address)
+		serverConn, _, err := lnc.listenConfig.ListenUDPMmsgConn(runCtx, lnc.network, lnc.address)
 		if err != nil {
-			return err
+			return errors.Join(err, s.Stop())
 		}
 		lnc.serverConn = serverConn.UDPConn
 		lnc.address = serverConn.LocalAddr().String()
@@ -144,7 +151,7 @@ func (s *UDPTransparentRelay) Start(ctx context.Context) error {
 		)
 
 		s.mwg.Go(func() {
-			s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())
+			s.recvFromServerConnRecvmmsg(runCtx, lnc, serverConn.NewRConn())
 		})
 
 		lnc.logger.Info("Started UDP transparent relay service listener")
@@ -254,7 +261,8 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 			queuedPacket.msglen = msg.Msglen
 			payloadBytesReceived += uint64(msg.Msglen)
 
-			entry := s.table[clientAddrPort]
+			key := transparentNATKey{serverConn: lnc.serverConn, clientAddrPort: clientAddrPort}
+			entry := s.table[key]
 			if entry == nil {
 				natConnSendCh := make(chan *transparentQueuedPacket, lnc.sendChannelCapacity)
 				entry = &transparentNATEntry{
@@ -262,7 +270,7 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 					serverConn:    lnc.serverConn,
 					logger:        lnc.logger,
 				}
-				s.table[clientAddrPort] = entry
+				s.table[key] = entry
 
 				s.wg.Go(func() {
 					var sendChClean bool
@@ -270,7 +278,7 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 					defer func() {
 						s.mu.Lock()
 						close(natConnSendCh)
-						delete(s.table, clientAddrPort)
+						delete(s.table, key)
 						s.mu.Unlock()
 
 						if !sendChClean {
@@ -339,6 +347,7 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 
 					// No more early returns!
 					sendChClean = true
+					s.collector.CollectUDPSessionStart("")
 
 					lnc.logger.Info("UDP transparent relay started",
 						zap.Stringer("clientAddress", clientAddrPort),
@@ -756,15 +765,22 @@ func (s *UDPTransparentRelay) relayNatConnToTransparentConnSendmmsg(ctx context.
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
 
-	s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	if packetsSent != 0 || payloadBytesSent != 0 {
+		s.collector.CollectUDPSessionDownlink("", packetsSent, payloadBytesSent)
+	}
 }
 
 // Stop implements [shadowsocks.Service.Stop].
 func (s *UDPTransparentRelay) Stop() error {
+	s.lifecycle.stop()
+
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
-			lnc.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
+			s.logger.Error("Failed to set read deadline on serverConn", zap.Error(err))
 		}
 	}
 
@@ -773,7 +789,7 @@ func (s *UDPTransparentRelay) Stop() error {
 	s.mwg.Wait()
 
 	s.mu.Lock()
-	for clientAddrPort, entry := range s.table {
+	for key, entry := range s.table {
 		natConn := entry.state.Swap(entry.serverConn)
 		if natConn == nil {
 			continue
@@ -781,7 +797,7 @@ func (s *UDPTransparentRelay) Stop() error {
 
 		if err := natConn.SetReadDeadline(conn.ALongTimeAgo); err != nil {
 			entry.logger.Error("Failed to set read deadline on natConn",
-				zap.Stringer("clientAddress", clientAddrPort),
+				zap.Stringer("clientAddress", key.clientAddrPort),
 				zap.Error(err),
 			)
 		}
@@ -794,8 +810,11 @@ func (s *UDPTransparentRelay) Stop() error {
 
 	for i := range s.listeners {
 		lnc := &s.listeners[i]
+		if lnc.serverConn == nil {
+			continue
+		}
 		if err := lnc.serverConn.Close(); err != nil {
-			lnc.logger.Error("Failed to close serverConn", zap.Error(err))
+			s.logger.Error("Failed to close serverConn", zap.Error(err))
 		}
 	}
 
