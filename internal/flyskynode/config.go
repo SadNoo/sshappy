@@ -3,6 +3,7 @@ package flyskynode
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +20,7 @@ type Config struct {
 	SyncStatePath            string
 	ReportOutboxPath         string
 	CredentialPath           string
+	ProtectedEgressPrefixes  []netip.Prefix
 	ListenHost               string
 	EnableTCP                bool
 	EnableUDP                bool
@@ -48,6 +50,7 @@ func LoadConfig() Config {
 	enableUDP, udpErr := envBool("ENABLE_UDP", true)
 	udpOuterFragmentation, udpOuterFragmentationErr := envBool("UDP_OUTER_FRAGMENTATION", true)
 	allowHTTP, httpErr := envBool("FLYSKY_ALLOW_INSECURE_HTTP", false)
+	protectedEgressPrefixes, protectedEgressPrefixesErr := parseProtectedEgressPrefixes(os.Getenv("FLYSKY_PROTECTED_EGRESS_PREFIXES"))
 	return Config{
 		ControlPlaneURL:          strings.TrimSpace(os.Getenv("FLYSKY_CONTROL_PLANE_URL")),
 		AllowInsecureHTTP:        allowHTTP,
@@ -57,6 +60,7 @@ func LoadConfig() Config {
 		SyncStatePath:            env("FLYSKY_SYNC_STATE_PATH", "/var/lib/sshappy/flysky-sync.json"),
 		ReportOutboxPath:         env("FLYSKY_REPORT_OUTBOX_PATH", "/var/lib/sshappy/flysky-reports.json"),
 		CredentialPath:           env("UPSK_STORE_PATH", "/var/lib/sshappy/users.json"),
+		ProtectedEgressPrefixes:  protectedEgressPrefixes,
 		ListenHost:               env("LISTEN_HOST", "0.0.0.0"),
 		EnableTCP:                enableTCP,
 		EnableUDP:                enableUDP,
@@ -78,7 +82,9 @@ func LoadConfig() Config {
 		TCPMaxConnectionsPerUser: envInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPMaxEstablishedTotal:   envInt("TCP_MAX_ESTABLISHED_TOTAL", 0),
 		TCPTrafficFlushInterval:  envDurationSeconds("TCP_TRAFFIC_FLUSH_SECONDS", 30),
-		loadError:                errors.Join(tcpErr, udpErr, udpOuterFragmentationErr, httpErr),
+		loadError: errors.Join(
+			tcpErr, udpErr, udpOuterFragmentationErr, httpErr, protectedEgressPrefixesErr,
+		),
 	}
 }
 
@@ -89,6 +95,8 @@ func (config Config) Validate() error {
 	switch {
 	case config.ControlPlaneURL == "":
 		return errors.New("FLYSKY_CONTROL_PLANE_URL must be set")
+	case !validProtectedEgressPrefixes(config.ProtectedEgressPrefixes):
+		return errors.New("FLYSKY_PROTECTED_EGRESS_PREFIXES contains an invalid prefix")
 	case !config.EnableTCP && !config.EnableUDP:
 		return errors.New("ENABLE_TCP and ENABLE_UDP cannot both be false")
 	case config.ChangePollInterval < time.Second:
@@ -181,4 +189,62 @@ func envBool(name string, fallback bool) (bool, error) {
 	default:
 		return fallback, fmt.Errorf("%s must be a boolean (true or false)", name)
 	}
+}
+
+func parseProtectedEgressPrefixes(value string) ([]netip.Prefix, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	entries := strings.Split(value, ",")
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	seen := make(map[netip.Prefix]struct{}, len(entries))
+	for index, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, fmt.Errorf("FLYSKY_PROTECTED_EGRESS_PREFIXES entry %d is empty", index+1)
+		}
+
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			ip, ipErr := netip.ParseAddr(entry)
+			if ipErr != nil || ip.Zone() != "" {
+				return nil, fmt.Errorf("FLYSKY_PROTECTED_EGRESS_PREFIXES entry %d must be an IP address or CIDR prefix", index+1)
+			}
+			prefix = netip.PrefixFrom(ip, ip.BitLen())
+		}
+		prefix, err = normalizeProtectedEgressPrefix(prefix)
+		if err != nil {
+			return nil, fmt.Errorf("FLYSKY_PROTECTED_EGRESS_PREFIXES entry %d is invalid: %w", index+1, err)
+		}
+		if _, ok := seen[prefix]; ok {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
+
+func normalizeProtectedEgressPrefix(prefix netip.Prefix) (netip.Prefix, error) {
+	if !prefix.IsValid() || prefix.Addr().Zone() != "" {
+		return netip.Prefix{}, errors.New("invalid prefix")
+	}
+	if prefix.Addr().Is4In6() {
+		if prefix.Bits() < 96 {
+			return netip.Prefix{}, errors.New("IPv4-mapped prefix length must be at least 96")
+		}
+		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+	}
+	return prefix.Masked(), nil
+}
+
+func validProtectedEgressPrefixes(prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if _, err := normalizeProtectedEgressPrefix(prefix); err != nil {
+			return false
+		}
+	}
+	return true
 }

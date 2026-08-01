@@ -504,6 +504,14 @@ main:
 		for {
 			destAddrPort, packetStart, packetLength, err = uplink.natConnPacker.PackInPlace(ctx, queuedPacket.buf, queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length)
 			if err != nil {
+				if errors.Is(err, router.ErrRejected) {
+					s.dropForbidden.Add(1)
+					s.putQueuedPacket(queuedPacket)
+					if count == 0 {
+						continue main
+					}
+					goto next
+				}
 				uplink.logger.Warn("Failed to pack packet for natConn",
 					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 					zap.String("username", uplink.username),

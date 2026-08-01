@@ -649,6 +649,11 @@ func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, u
 	for queuedPacket := range uplink.natConnSendCh {
 		destAddrPort, packetStart, packetLength, err = uplink.natConnPacker.PackInPlace(ctx, queuedPacket.buf, queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length)
 		if err != nil {
+			if errors.Is(err, router.ErrRejected) {
+				s.dropForbidden.Add(1)
+				s.putQueuedPacket(queuedPacket)
+				continue
+			}
 			uplink.logger.Warn("Failed to pack packet",
 				zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
 				zap.String("username", uplink.username),

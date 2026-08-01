@@ -1,6 +1,7 @@
 package flyskynode
 
 import (
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,6 +35,48 @@ func TestLoadConfigEnablesSafeOuterUDPFragmentationDefaults(t *testing.T) {
 	config := LoadConfig()
 	if config.UDPMTU != 1600 || !config.UDPOuterFragmentation {
 		t.Fatalf("UDP transport defaults = mtu %d, fragmentation %v", config.UDPMTU, config.UDPOuterFragmentation)
+	}
+}
+
+func TestLoadConfigParsesProtectedEgressPrefixes(t *testing.T) {
+	t.Setenv("FLYSKY_CONTROL_PLANE_URL", "https://panel.example")
+	t.Setenv("FLYSKY_PROTECTED_EGRESS_PREFIXES", " 8.8.8.8, 1.1.1.0/24,8.8.8.8/32,::ffff:9.9.9.9 ")
+	config := LoadConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatalf("valid protected prefixes rejected: %v", err)
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("8.8.8.8/32"),
+		netip.MustParsePrefix("1.1.1.0/24"),
+		netip.MustParsePrefix("9.9.9.9/32"),
+	}
+	if len(config.ProtectedEgressPrefixes) != len(want) {
+		t.Fatalf("protected prefixes = %v, want %v", config.ProtectedEgressPrefixes, want)
+	}
+	for index := range want {
+		if config.ProtectedEgressPrefixes[index] != want[index] {
+			t.Fatalf("protected prefix %d = %v, want %v", index, config.ProtectedEgressPrefixes[index], want[index])
+		}
+	}
+}
+
+func TestLoadConfigRejectsInvalidProtectedEgressPrefixes(t *testing.T) {
+	t.Setenv("FLYSKY_CONTROL_PLANE_URL", "https://panel.example")
+	for _, value := range []string{"not-an-ip", "8.8.8.8,,1.1.1.1", "::ffff:8.8.8.8/80"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("FLYSKY_PROTECTED_EGRESS_PREFIXES", value)
+			if err := LoadConfig().Validate(); err == nil || !strings.Contains(err.Error(), "FLYSKY_PROTECTED_EGRESS_PREFIXES") {
+				t.Fatalf("invalid protected prefix error = %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsInvalidProtectedEgressPrefixValue(t *testing.T) {
+	config := testConfig(t)
+	config.ProtectedEgressPrefixes = []netip.Prefix{{}}
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "FLYSKY_PROTECTED_EGRESS_PREFIXES") {
+		t.Fatalf("invalid typed protected prefix error = %v", err)
 	}
 }
 

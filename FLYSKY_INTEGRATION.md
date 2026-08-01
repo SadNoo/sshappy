@@ -68,6 +68,7 @@
 | `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |
 | `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
 | `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
+| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 逗号分隔的禁止出口 IP/CIDR；单个 IPv4 会规范为 `/32`。节点经 NAT 暴露、其公网地址不在本机网卡上时必须显式填写该公网 IP，防止用户经代理回连节点自身 |
 | `FLYSKY_CHANGE_POLL_SECONDS` | 增量同步周期 |
 | `FLYSKY_HEARTBEAT_SECONDS` | 状态心跳周期 |
 | `FLYSKY_USAGE_REPORT_SECONDS` | 流量落盘与上报周期，默认 30 秒 |
@@ -85,6 +86,8 @@
 - Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
+
+先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 设置为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。可同时填写多个 IP/CIDR并以英文逗号分隔。格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
 
 ~~~bash
 install -d -m 0700 /var/lib/flysky/ssbad /etc/flysky/ssbad/secrets
@@ -110,5 +113,7 @@ docker pull sadno/flyskynode:2.0
 ~~~
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
+
+当前管理后台安装命令尚不会自动探测并填入 NAT 公网地址，这是部署自动化的已知残余；在该自动化补齐前，运维必须保留上述 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 设置。若节点公网地址变化，也必须先更新该值并重启容器。
 
 下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。

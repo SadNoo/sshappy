@@ -186,6 +186,17 @@ type ClientConfig struct {
 	networkTCP  string
 	connDialer  conn.Dialer
 	innerClient *netio.TCPClient
+
+	// outboundTargetPolicy is intentionally runtime-only. It is installed by
+	// the Flysky node runtime and is not part of the public JSON configuration.
+	outboundTargetPolicy OutboundTargetPolicy
+}
+
+// SetOutboundTargetPolicy installs the runtime policy used by direct TCP and
+// UDP clients. Proxy clients are not wrapped because their immediate network
+// destination is the configured proxy endpoint, not the requested target.
+func (cc *ClientConfig) SetOutboundTargetPolicy(policy OutboundTargetPolicy) {
+	cc.outboundTargetPolicy = policy
 }
 
 func (cc *ClientConfig) checkAddresses() error {
@@ -320,7 +331,7 @@ func (cc *ClientConfig) TCPClient() (netio.StreamClient, error) {
 
 	switch cc.Protocol {
 	case "direct":
-		return cc.innerClient, nil
+		return wrapStreamClient(cc.innerClient, cc.outboundTargetPolicy), nil
 
 	case "none", "plain":
 		scc := ssnone.StreamClientConfig{
@@ -418,7 +429,10 @@ func (cc *ClientConfig) UDPClient() (zerocopy.UDPClient, error) {
 
 	switch cc.Protocol {
 	case "direct":
-		return direct.NewDirectUDPClient(cc.Name, cc.Network, cc.MTU, listenConfig), nil
+		return wrapUDPClient(
+			direct.NewDirectUDPClient(cc.Name, cc.Network, cc.MTU, listenConfig),
+			cc.outboundTargetPolicy,
+		), nil
 	case "none", "plain":
 		return direct.NewShadowsocksNoneUDPClient(cc.Name, cc.Network, cc.UDPAddress, cc.MTU, listenConfig), nil
 	case "socks5":

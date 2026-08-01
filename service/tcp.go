@@ -80,6 +80,7 @@ type TCPRelay struct {
 	targetDialAttempts       atomic.Uint64
 	targetDialCompleted      atomic.Uint64
 	targetDialErrors         atomic.Uint64
+	rejectedTargetPolicy     atomic.Uint64
 	targetDialNanos          atomic.Uint64
 	relayErrors              atomic.Uint64
 	uplinkBytes              atomic.Uint64
@@ -251,6 +252,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					zap.Int("maxEstablishedConnections", maxEstablishedConnections),
 					zap.Uint64("targetDialAttempts", s.targetDialAttempts.Load()),
 					zap.Uint64("targetDialErrors", s.targetDialErrors.Load()),
+					zap.Uint64("rejectedTargetPolicy", s.rejectedTargetPolicy.Load()),
 					zap.Duration("averageTargetDialLatency", averageDuration(s.targetDialNanos.Load(), s.targetDialCompleted.Load())),
 					zap.Uint64("relayErrors", s.relayErrors.Load()),
 					zap.Uint64("uplinkBytes", s.uplinkBytes.Load()),
@@ -451,6 +453,15 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	s.targetDialCompleted.Add(1)
 	if err != nil {
 		s.targetDialErrors.Add(1)
+		if errors.Is(err, router.ErrRejected) {
+			s.rejectedTargetPolicy.Add(1)
+			if clientConn == nil {
+				// The target is deliberately omitted from logs. Policy denials are
+				// reported only through the aggregate metric above.
+				_ = req.Abort(conn.DialResult{Code: conn.DialResultCodeEACCES})
+			}
+			return
+		}
 		logger.Debug("Failed to create remote connection",
 			zap.Int("initialPayloadLength", len(req.Payload)),
 			zap.Error(err),
