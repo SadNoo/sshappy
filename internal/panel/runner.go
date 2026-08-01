@@ -19,31 +19,47 @@ import (
 	"go.uber.org/zap"
 )
 
-const serverName = "sshappy"
+const (
+	serverName                   = "sshappy"
+	trafficOutboxFlushBatchLimit = 64
+)
 
-func Run(ctx context.Context, config Config, logger *zap.Logger) error {
+func Run(ctx context.Context, config Config, logger *zap.Logger) (runErr error) {
 	if err := config.Validate(); err != nil {
 		return err
 	}
 	dbHealth := &databaseHealth{}
 	dbStartedAt := time.Now()
-	db, err := OpenDatabase(config)
+	openCtx, openCancel := databaseOperationContext(ctx, config.MySQLConnectTimeoutSeconds+config.MySQLIOTimeoutSeconds)
+	db, err := OpenDatabaseContext(openCtx, config)
+	openCancel()
+	dbHealth.Record("open", dbStartedAt, err)
 	if err != nil {
 		return err
 	}
-	dbHealth.Record("open", dbStartedAt, nil)
-	defer db.Close()
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, closeErr)
+		}
+	}()
 
 	startedAt := time.Now()
-	node, err := db.LoadNode()
+	loadNodeCtx, loadNodeCancel := databaseOperationContext(ctx, config.MySQLIOTimeoutSeconds)
+	node, err := db.LoadNodeContext(loadNodeCtx)
+	loadNodeCancel()
 	dbHealth.Record("loadNode", startedAt, err)
 	if err != nil {
 		return err
 	}
-	trafficReporter, err := newTrafficReporter(config.TrafficOutboxPath)
+	trafficReporter, err := newTrafficReporterContext(ctx, config.TrafficOutboxPath)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := trafficReporter.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, closeErr)
+		}
+	}()
 	if outbox := trafficReporter.Metrics(time.Now()); outbox.Batches > 0 {
 		logger.Warn("Recovered pending traffic outbox",
 			zap.Int("batches", outbox.Batches),
@@ -58,7 +74,9 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			zap.Int("pendingBatches", trafficReporter.PendingBatches()),
 		)
 	} else {
-		deleted, cleanupErr := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+		cleanupCtx, cleanupCancel := databaseOperationContext(ctx, config.MySQLIOTimeoutSeconds)
+		deleted, cleanupErr := db.CleanupTrafficBatchesContext(cleanupCtx, node.ID, config.TrafficBatchRetentionDays)
+		cleanupCancel()
 		dbHealth.Record("cleanupTrafficBatches", startedAt, cleanupErr)
 		if cleanupErr != nil {
 			logger.Warn("Failed to clean traffic batch markers", zap.Error(cleanupErr))
@@ -67,7 +85,9 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		}
 	}
 	startedAt = time.Now()
-	users, err := db.LoadUsers(node)
+	loadUsersCtx, loadUsersCancel := databaseOperationContext(ctx, config.MySQLIOTimeoutSeconds)
+	users, err := db.LoadUsersContext(loadUsersCtx, node)
+	loadUsersCancel()
 	dbHealth.Record("loadUsers", startedAt, err)
 	if err != nil {
 		return err
@@ -103,6 +123,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		zap.Int("trafficBatchRetentionDays", config.TrafficBatchRetentionDays),
 		zap.Int("authorizationStaleGraceSeconds", config.AuthorizationStaleSeconds),
 		zap.Int("trafficSQLBatchSize", trafficSQLBatchSize),
+		zap.Int("trafficOutboxFlushBatchLimit", trafficOutboxFlushBatchLimit),
 		zap.Int("resourceReportSeconds", config.ResourceReportSeconds),
 		zap.Int64("outboxMinFreeBytes", config.OutboxMinFreeBytes),
 	}
@@ -174,7 +195,9 @@ runLoop:
 			break runLoop
 		case <-syncTicker.C:
 			startedAt := time.Now()
-			loadedNode, err := db.LoadNode()
+			loadNodeCtx, loadNodeCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+			loadedNode, err := db.LoadNodeContext(loadNodeCtx)
+			loadNodeCancel()
 			dbHealth.Record("loadNode", startedAt, err)
 			if err != nil {
 				if errors.Is(err, ErrNodeNotAuthorized) {
@@ -200,7 +223,9 @@ runLoop:
 				break runLoop
 			}
 			startedAt = time.Now()
-			loadedUsers, err := db.LoadUsers(loadedNode)
+			loadUsersCtx, loadUsersCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+			loadedUsers, err := db.LoadUsersContext(loadUsersCtx, loadedNode)
+			loadUsersCancel()
 			dbHealth.Record("loadUsers", startedAt, err)
 			if err != nil {
 				age, remaining, expired := failures.RecordFailure("user authorization refresh", err, time.Now())
@@ -235,7 +260,9 @@ runLoop:
 			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
 		case <-trafficTicker.C:
 			startedAt := time.Now()
-			flushed, err := reportTraffic(db, node, state, trafficReporter, dbHealth)
+			trafficCtx, trafficCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+			flushed, err := reportTrafficContext(trafficCtx, db, node, state, trafficReporter, dbHealth)
+			trafficCancel()
 			if flushed {
 				// A successful durable flush starts a fresh failure window even if a
 				// later flush in this reporting cycle fails again.
@@ -276,7 +303,9 @@ runLoop:
 		case <-nodeTicker.C:
 			online := state.OnlineUserCount(onlineCountWindow(config))
 			startedAt := time.Now()
-			err := db.ReportNodeStatus(node, online)
+			reportNodeCtx, reportNodeCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+			err := db.ReportNodeStatusContext(reportNodeCtx, node, online)
+			reportNodeCancel()
 			dbHealth.Record("reportNodeStatus", startedAt, err)
 			if err != nil {
 				logger.Error("Failed to report node status", zap.Error(err))
@@ -286,7 +315,9 @@ runLoop:
 		case <-aliveTicker.C:
 			alive := state.SnapshotAliveIPs()
 			startedAt := time.Now()
-			err := db.ReportAliveIPs(node, alive)
+			reportAliveCtx, reportAliveCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+			err := db.ReportAliveIPsContext(reportAliveCtx, node, alive)
+			reportAliveCancel()
 			dbHealth.Record("reportAliveIPs", startedAt, err)
 			if err != nil {
 				state.MergeAliveIPs(alive)
@@ -310,7 +341,9 @@ runLoop:
 				)
 			} else {
 				startedAt := time.Now()
-				deleted, err := db.CleanupTrafficBatches(node.ID, config.TrafficBatchRetentionDays)
+				cleanupCtx, cleanupCancel := databaseOperationContext(runCtx, config.MySQLIOTimeoutSeconds)
+				deleted, err := db.CleanupTrafficBatchesContext(cleanupCtx, node.ID, config.TrafficBatchRetentionDays)
+				cleanupCancel()
 				dbHealth.Record("cleanupTrafficBatches", startedAt, err)
 				if err != nil {
 					logger.Warn("Failed to clean traffic batch markers", zap.Error(err))
@@ -326,8 +359,13 @@ runLoop:
 	if !managerStopped {
 		managerOK = <-runResult
 	}
-	if err := reportFinalTraffic(db, node, state, trafficReporter, dbHealth, logger); err != nil {
-		return err
+	if !errors.Is(stopErr, errTrafficOutboxPersistence) {
+		finalCtx, finalCancel := databaseOperationContext(context.WithoutCancel(ctx), config.MySQLIOTimeoutSeconds)
+		err := reportFinalTrafficContext(finalCtx, db, node, state, trafficReporter, dbHealth, logger)
+		finalCancel()
+		if err != nil {
+			return err
+		}
 	}
 	if stopErr != nil {
 		return stopErr
@@ -339,66 +377,72 @@ runLoop:
 }
 
 func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) (flushed bool, err error) {
+	return reportTrafficContext(context.Background(), db, node, state, reporter, health)
+}
+
+func reportTrafficContext(ctx context.Context, db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) (flushed bool, err error) {
 	// Drain durable backlog before taking traffic out of memory. This allows a
-	// recovered database to shrink/remove a large outbox before the next append.
+	// recovered database to shrink a large outbox before the next append. The
+	// per-cycle limit and context keep authorization refresh and shutdown bounded.
 	// If the database is still unavailable, preserve traffic accumulated since
 	// the previous attempt as a separate durable batch before returning the
 	// database error. Local outbox failures remain immediately fatal.
 	var backlogFlushErr error
-	if len(reporter.pending) > 0 {
+	remainingFlushes := trafficOutboxFlushBatchLimit
+	if reporter.PendingBatches() > 0 {
 		startedAt := time.Now()
-		backlogFlushErr = reporter.Flush(db, node)
+		var flushedBatches int
+		flushedBatches, backlogFlushErr = reporter.FlushContext(ctx, db, remainingFlushes)
+		remainingFlushes -= flushedBatches
 		health.Record("reportTraffic", startedAt, backlogFlushErr)
 		if errors.Is(backlogFlushErr, errTrafficOutboxPersistence) {
 			return false, backlogFlushErr
 		}
-		if backlogFlushErr == nil {
+		if flushedBatches > 0 {
 			flushed = true
 		}
 	}
 
 	traffic := state.SnapshotTraffic()
-	if err := reporter.Capture(traffic); err != nil {
+	if err := reporter.Capture(node, traffic); err != nil {
 		state.MergeTraffic(traffic)
 		return flushed, fmt.Errorf("%w: %v", errTrafficOutboxPersistence, err)
 	}
 	if backlogFlushErr != nil {
 		return flushed, backlogFlushErr
 	}
-	if len(reporter.pending) == 0 {
+	if reporter.PendingBatches() == 0 || remainingFlushes == 0 {
 		return flushed, nil
 	}
 	startedAt := time.Now()
-	flushErr := reporter.Flush(db, node)
+	flushedBatches, flushErr := reporter.FlushContext(ctx, db, remainingFlushes)
 	health.Record("reportTraffic", startedAt, flushErr)
-	if flushErr == nil {
+	if flushedBatches > 0 {
 		flushed = true
 	}
 	return flushed, flushErr
 }
 
 func reportFinalTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth, logger *zap.Logger) error {
-	var flushErr error
-	if len(reporter.pending) > 0 {
-		startedAt := time.Now()
-		flushErr = reporter.Flush(db, node)
-		health.Record("reportFinalTraffic", startedAt, flushErr)
-	}
+	return reportFinalTrafficContext(context.Background(), db, node, state, reporter, health, logger)
+}
 
+func reportFinalTrafficContext(ctx context.Context, db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth, logger *zap.Logger) error {
+	// Capture the newest in-memory counters before attempting remote work. A
+	// large recovered backlog must not consume the shutdown budget before these
+	// deltas are durable.
 	traffic := state.SnapshotTraffic()
-	if err := reporter.Capture(traffic); err != nil {
+	if err := reporter.Capture(node, traffic); err != nil {
 		state.MergeTraffic(traffic)
 		return fmt.Errorf("%w while persisting final traffic: %v", errTrafficOutboxPersistence, err)
 	}
-	if len(reporter.pending) == 0 {
+	if reporter.PendingBatches() == 0 {
 		logger.Info("Final traffic reported", zap.Int("pendingUsers", 0))
 		return nil
 	}
-	if flushErr == nil {
-		startedAt := time.Now()
-		flushErr = reporter.Flush(db, node)
-		health.Record("reportFinalTraffic", startedAt, flushErr)
-	}
+	startedAt := time.Now()
+	_, flushErr := reporter.FlushContext(ctx, db, 0)
+	health.Record("reportFinalTraffic", startedAt, flushErr)
 	if errors.Is(flushErr, errTrafficOutboxPersistence) {
 		return fmt.Errorf("final traffic outbox update failed: %w", flushErr)
 	}
@@ -413,8 +457,12 @@ func reportFinalTraffic(db trafficDatabase, node Node, state *State, reporter *t
 		)
 		return nil
 	}
-	logger.Info("Final traffic reported", zap.Int("pendingUsers", reporter.PendingUsers()))
+	logger.Info("Final traffic reported", zap.Int("pendingUsers", 0))
 	return nil
+}
+
+func databaseOperationContext(parent context.Context, timeoutSeconds int) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, time.Duration(timeoutSeconds)*time.Second)
 }
 
 func newManager(config Config, node Node, runtime *Runtime, logger *zap.Logger) (*service.Manager, *cred.ManagedServer, error) {

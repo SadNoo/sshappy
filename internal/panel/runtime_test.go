@@ -76,6 +76,7 @@ func TestDefaultOperationalSettings(t *testing.T) {
 	t.Setenv("RESOURCE_REPORT_SECONDS", "")
 	t.Setenv("OUTBOX_MIN_FREE_BYTES", "")
 	t.Setenv("AUTH_STALE_GRACE_SECONDS", "")
+	t.Setenv("TRAFFIC_OUTBOX_PATH", "")
 	config := LoadConfig()
 	if !config.EnableTCP || !config.EnableUDP ||
 		config.TCPMaxHandshakes != 1024 ||
@@ -86,6 +87,7 @@ func TestDefaultOperationalSettings(t *testing.T) {
 		config.AuthorizationStaleSeconds != 300 ||
 		config.ResourceReportSeconds != 60 ||
 		config.OutboxMinFreeBytes != 256<<20 ||
+		config.TrafficOutboxPath != "/var/lib/sshappy/traffic-outbox.sqlite3" ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
 		config.MySQLIOTimeoutSeconds != 30 {
 		t.Fatalf("unexpected operational defaults: %+v", config)

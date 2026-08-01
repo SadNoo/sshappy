@@ -2,6 +2,7 @@ package panel
 
 import (
 	"errors"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -23,6 +24,33 @@ func TestTrafficBatchStatements(t *testing.T) {
 	logQuery, logArgs := trafficLogInsertStatement(batch, Node{ID: 3, TrafficRate: 1.5}, 123)
 	if strings.Count(logQuery, "?") != len(logArgs) || len(logArgs) != 14 {
 		t.Fatalf("log placeholders=%d args=%d query=%q", strings.Count(logQuery, "?"), len(logArgs), logQuery)
+	}
+}
+
+func TestPrepareBilledTrafficRejectsIntegerOverflow(t *testing.T) {
+	billed, err := prepareBilledTraffic(1, []TrafficDelta{{UserID: 7, Upload: math.MaxInt64}})
+	if err != nil || len(billed) != 1 || billed[0].BilledUpload != math.MaxInt64 {
+		t.Fatalf("max int64 at rate 1 was not preserved: billed=%+v err=%v", billed, err)
+	}
+
+	tests := []struct {
+		name    string
+		rate    float64
+		traffic []TrafficDelta
+	}{
+		{name: "scaled upload", rate: 2, traffic: []TrafficDelta{{UserID: 7, Upload: math.MaxInt64}}},
+		{name: "per-user raw total", rate: 1, traffic: []TrafficDelta{{UserID: 7, Upload: math.MaxInt64, Download: 1}}},
+		{name: "chunk raw total", rate: 1, traffic: []TrafficDelta{{UserID: 7, Upload: math.MaxInt64/2 + 1}, {UserID: 8, Upload: math.MaxInt64/2 + 1}}},
+		{name: "duplicate merge", rate: 1, traffic: []TrafficDelta{{UserID: 7, Upload: math.MaxInt64}, {UserID: 7, Upload: 1}}},
+		{name: "infinite rate", rate: math.Inf(1), traffic: []TrafficDelta{{UserID: 7, Upload: 1}}},
+		{name: "nan rate", rate: math.NaN(), traffic: []TrafficDelta{{UserID: 7, Upload: 1}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := prepareBilledTraffic(test.rate, test.traffic); err == nil {
+				t.Fatal("overflow or invalid rate was accepted")
+			}
+		})
 	}
 }
 

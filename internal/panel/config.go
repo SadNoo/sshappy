@@ -77,7 +77,7 @@ func LoadConfig() Config {
 		UDPMaxSessions:             loader.int("UDP_MAX_SESSIONS", 2048),
 		UDPMaxSessionsPerUser:      loader.int("UDP_MAX_SESSIONS_PER_USER", 128),
 		CredentialPath:             getenv("UPSK_STORE_PATH", "/var/lib/sshappy/users.json"),
-		TrafficOutboxPath:          getenv("TRAFFIC_OUTBOX_PATH", "/var/lib/sshappy/traffic-outbox.json"),
+		TrafficOutboxPath:          getenv("TRAFFIC_OUTBOX_PATH", "/var/lib/sshappy/traffic-outbox.sqlite3"),
 		TCPMaxHandshakes:           loader.int("TCP_MAX_CONCURRENT_HANDSHAKES", 1024),
 		TCPMaxConnectionsPerUser:   loader.int("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPMaxEstablishedTotal:     loader.int("TCP_MAX_ESTABLISHED_TOTAL", 0),

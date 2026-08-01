@@ -23,6 +23,7 @@ secrets
 **/*.pfx
 **/*.jks
 **/*.sql
+!migrations/mysql/*.sql
 **/*.db
 **/*.sqlite*
 **/users.json

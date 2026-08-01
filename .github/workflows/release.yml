@@ -13,6 +13,20 @@ jobs:
     name: Verify and build
     runs-on: ubuntu-latest
 
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: sshappy_test
+          MYSQL_ROOT_PASSWORD: test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent --host=127.0.0.1 --password=test-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -27,6 +41,11 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 ./...
+
+      - name: Verify MySQL 8.4 migration and accounting
+        env:
+          SSHAPPY_TEST_MYSQL_DSN: root:test-password@tcp(127.0.0.1:3306)/sshappy_test?parseTime=true
+        run: go test -count=1 -v ./internal/panel -run '^TestMySQL'
 
       - name: Build
         run: |
@@ -55,6 +74,12 @@ jobs:
           env CGO_ENABLED=0 GOAMD64=v2 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-x86-64-v2/ ./cmd/sstest
           env CGO_ENABLED=0 GOAMD64=v3 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-x86-64-v3/ ./cmd/sstest
           env CGO_ENABLED=0 GOARCH=arm64 go build -v -trimpath -ldflags "${sstest_ldflags}" -o package-linux-arm64/ ./cmd/sstest
+
+          for package_dir in package-*; do
+            mkdir -p "${package_dir}/migrations/mysql"
+            cp migrations/mysql/*.sql "${package_dir}/migrations/mysql/"
+            cp LICENSE "${package_dir}/"
+          done
 
       - name: Package
         env:

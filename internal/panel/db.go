@@ -13,7 +13,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +28,11 @@ const (
 )
 
 type Database struct {
-	db     *sql.DB
+	db *sql.DB
+	// lockDB keeps advisory-lock sessions separate from cancellable traffic
+	// transactions. The MySQL driver cancels an in-flight query by closing its
+	// connection, which may otherwise delay RELEASE_LOCK behind that query.
+	lockDB *sql.DB
 	config Config
 }
 
@@ -39,6 +42,13 @@ type Database struct {
 var ErrNodeNotAuthorized = errors.New("node is not authorized to serve traffic")
 
 func OpenDatabase(config Config) (*Database, error) {
+	return OpenDatabaseContext(context.Background(), config)
+}
+
+func OpenDatabaseContext(ctx context.Context, config Config) (*Database, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tlsMode, err := mysqlTLSMode(config)
 	if err != nil {
 		return nil, err
@@ -51,15 +61,27 @@ func OpenDatabase(config Config) (*Database, error) {
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(3 * time.Minute)
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := ensureTrafficBatchTable(db, config.MySQLDB); err != nil {
+	if err := validateDatabaseSchemaContext(ctx, db, config.MySQLDB); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Database{db: db, config: config}, nil
+	if err := ctx.Err(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	lockDB, err := sql.Open("mysql", driverConfig.FormatDSN())
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	lockDB.SetMaxOpenConns(4)
+	lockDB.SetMaxIdleConns(1)
+	lockDB.SetConnMaxLifetime(3 * time.Minute)
+	return &Database{db: db, lockDB: lockDB, config: config}, nil
 }
 
 func mysqlDriverConfig(config Config, tlsMode string) *mysql.Config {
@@ -79,30 +101,291 @@ func mysqlDriverConfig(config Config, tlsMode string) *mysql.Config {
 	return driverConfig
 }
 
-func ensureTrafficBatchTable(db *sql.DB, schema string) error {
-	var tableCount int
-	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM information_schema.tables
-		WHERE table_schema = ? AND table_name = 'sshappy_traffic_batch'
-	`, schema).Scan(&tableCount); err != nil {
+const (
+	mysqlSchemaVersion       = 1
+	mysqlSchemaMigrationName = "0001_traffic_batch"
+	mysqlMigrationPath       = "migrations/mysql/0001_traffic_batch.sql"
+)
+
+// ErrDatabaseMigrationRequired marks a missing or incompatible database
+// schema. OpenDatabase only validates the schema; migrations must be applied
+// separately with an account that is allowed to execute DDL.
+var ErrDatabaseMigrationRequired = errors.New("database schema migration required")
+
+type mysqlColumnMetadata struct {
+	dataType   string
+	columnType string
+	nullable   string
+	charset    string
+	collation  string
+}
+
+type mysqlIndexColumnMetadata struct {
+	columnName string
+	nonUnique  bool
+	sequence   int
+	prefix     sql.NullInt64
+	indexType  string
+}
+
+type mysqlTableMetadata struct {
+	engine  string
+	columns map[string]mysqlColumnMetadata
+	indexes map[string][]mysqlIndexColumnMetadata
+}
+
+func validateDatabaseSchemaContext(ctx context.Context, db *sql.DB, schema string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	migrationTable, found, err := inspectMySQLTableContext(ctx, db, schema, "sshappy_schema_migrations")
+	if err != nil {
+		return fmt.Errorf("failed to inspect database migration table: %w", err)
+	}
+	if !found {
+		return databaseMigrationRequired("migration table is missing")
+	}
+	if err := validateMigrationTableMetadata(migrationTable); err != nil {
+		return err
+	}
+
+	var migrationCount, currentVersion int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(version), 0)
+		FROM sshappy_schema_migrations
+	`).Scan(&migrationCount, &currentVersion); err != nil {
+		return fmt.Errorf("failed to read database schema version: %w", err)
+	}
+	if migrationCount != mysqlSchemaVersion || currentVersion != mysqlSchemaVersion {
+		return databaseMigrationRequired(fmt.Sprintf(
+			"schema version is incompatible (expected %d applied migration, found %d, latest version %d)",
+			mysqlSchemaVersion,
+			migrationCount,
+			currentVersion,
+		))
+	}
+
+	var migrationName string
+	if err := db.QueryRowContext(ctx, `
+		SELECT name
+		FROM sshappy_schema_migrations
+		WHERE version = ?
+	`, mysqlSchemaVersion).Scan(&migrationName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return databaseMigrationRequired(fmt.Sprintf("schema migration version %d is missing", mysqlSchemaVersion))
+		}
+		return fmt.Errorf("failed to read database schema migration record: %w", err)
+	}
+	if migrationName != mysqlSchemaMigrationName {
+		return databaseMigrationRequired(fmt.Sprintf("schema migration version %d has an unexpected name", mysqlSchemaVersion))
+	}
+
+	trafficBatchTable, found, err := inspectMySQLTableContext(ctx, db, schema, "sshappy_traffic_batch")
+	if err != nil {
 		return fmt.Errorf("failed to inspect traffic batch table: %w", err)
 	}
-	if tableCount > 0 {
-		return nil
+	if !found {
+		return databaseMigrationRequired("traffic batch table is missing")
 	}
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS sshappy_traffic_batch (
-			batch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-			node_id INT NOT NULL,
-			created_at BIGINT NOT NULL,
-			PRIMARY KEY (batch_id),
-			KEY node_created_at (node_id, created_at)
-		) ENGINE=InnoDB
-	`); err != nil {
-		return fmt.Errorf("failed to initialize traffic batch table: %w", err)
+	return validateTrafficBatchTableMetadata(trafficBatchTable)
+}
+
+func inspectMySQLTableContext(ctx context.Context, db *sql.DB, schema, table string) (mysqlTableMetadata, bool, error) {
+	metadata := mysqlTableMetadata{
+		columns: make(map[string]mysqlColumnMetadata),
+		indexes: make(map[string][]mysqlIndexColumnMetadata),
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT engine
+		FROM information_schema.tables
+		WHERE table_schema = ? AND table_name = ? AND table_type = 'BASE TABLE'
+	`, schema, table).Scan(&metadata.engine); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return metadata, false, nil
+		}
+		return metadata, false, err
+	}
+
+	columnRows, err := db.QueryContext(ctx, `
+		SELECT column_name, data_type, column_type, is_nullable,
+		       COALESCE(character_set_name, ''), COALESCE(collation_name, '')
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+	`, schema, table)
+	if err != nil {
+		return metadata, false, err
+	}
+	for columnRows.Next() {
+		var name string
+		var column mysqlColumnMetadata
+		if err := columnRows.Scan(
+			&name,
+			&column.dataType,
+			&column.columnType,
+			&column.nullable,
+			&column.charset,
+			&column.collation,
+		); err != nil {
+			_ = columnRows.Close()
+			return metadata, false, err
+		}
+		metadata.columns[name] = column
+	}
+	if err := columnRows.Close(); err != nil {
+		return metadata, false, err
+	}
+	if err := columnRows.Err(); err != nil {
+		return metadata, false, err
+	}
+
+	indexRows, err := db.QueryContext(ctx, `
+		SELECT index_name, non_unique, seq_in_index, column_name, sub_part, index_type
+		FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY index_name, seq_in_index
+	`, schema, table)
+	if err != nil {
+		return metadata, false, err
+	}
+	for indexRows.Next() {
+		var name string
+		var nonUnique int
+		var columnName sql.NullString
+		var column mysqlIndexColumnMetadata
+		if err := indexRows.Scan(
+			&name,
+			&nonUnique,
+			&column.sequence,
+			&columnName,
+			&column.prefix,
+			&column.indexType,
+		); err != nil {
+			_ = indexRows.Close()
+			return metadata, false, err
+		}
+		column.columnName = columnName.String
+		column.nonUnique = nonUnique != 0
+		metadata.indexes[name] = append(metadata.indexes[name], column)
+	}
+	if err := indexRows.Close(); err != nil {
+		return metadata, false, err
+	}
+	if err := indexRows.Err(); err != nil {
+		return metadata, false, err
+	}
+	return metadata, true, nil
+}
+
+func validateMigrationTableMetadata(table mysqlTableMetadata) error {
+	if !strings.EqualFold(table.engine, "InnoDB") {
+		return databaseMigrationRequired("migration table must use InnoDB")
+	}
+	expectedColumns := map[string]mysqlColumnMetadata{
+		"version": {
+			dataType:   "bigint",
+			columnType: "bigint unsigned",
+			nullable:   "NO",
+		},
+		"name": {
+			dataType:   "varchar",
+			columnType: "varchar(128)",
+			nullable:   "NO",
+			charset:    "ascii",
+			collation:  "ascii_bin",
+		},
+		"applied_at": {
+			dataType:   "timestamp",
+			columnType: "timestamp(6)",
+			nullable:   "NO",
+		},
+	}
+	if err := validateRequiredColumns(table.columns, expectedColumns); err != nil {
+		return databaseMigrationRequired("migration table " + err.Error())
+	}
+	if !mysqlIndexMatches(table.indexes["PRIMARY"], false, "version") {
+		return databaseMigrationRequired("migration table primary key is incompatible")
 	}
 	return nil
+}
+
+func validateTrafficBatchTableMetadata(table mysqlTableMetadata) error {
+	if !strings.EqualFold(table.engine, "InnoDB") {
+		return databaseMigrationRequired("traffic batch table must use InnoDB")
+	}
+	expectedColumns := map[string]mysqlColumnMetadata{
+		"batch_id": {
+			dataType:   "char",
+			columnType: "char(32)",
+			nullable:   "NO",
+			charset:    "ascii",
+			collation:  "ascii_bin",
+		},
+		"node_id": {
+			dataType:   "int",
+			columnType: "int",
+			nullable:   "NO",
+		},
+		"created_at": {
+			dataType:   "bigint",
+			columnType: "bigint",
+			nullable:   "NO",
+		},
+	}
+	if err := validateRequiredColumns(table.columns, expectedColumns); err != nil {
+		return databaseMigrationRequired("traffic batch table " + err.Error())
+	}
+	if !mysqlIndexMatches(table.indexes["PRIMARY"], false, "batch_id") {
+		return databaseMigrationRequired("traffic batch table primary key is incompatible")
+	}
+	if !mysqlIndexMatches(table.indexes["node_created_at"], true, "node_id", "created_at") {
+		return databaseMigrationRequired("traffic batch table node_created_at index is incompatible")
+	}
+	return nil
+}
+
+func validateRequiredColumns(actual, expected map[string]mysqlColumnMetadata) error {
+	if len(actual) != len(expected) {
+		return fmt.Errorf("has %d columns, want exactly %d", len(actual), len(expected))
+	}
+	for name, expectedColumn := range expected {
+		actualColumn, found := actual[name]
+		if !found {
+			return fmt.Errorf("is missing column %s", name)
+		}
+		if !strings.EqualFold(actualColumn.dataType, expectedColumn.dataType) ||
+			!strings.EqualFold(actualColumn.columnType, expectedColumn.columnType) ||
+			!strings.EqualFold(actualColumn.nullable, expectedColumn.nullable) ||
+			!strings.EqualFold(actualColumn.charset, expectedColumn.charset) ||
+			!strings.EqualFold(actualColumn.collation, expectedColumn.collation) {
+			return fmt.Errorf("has incompatible column %s", name)
+		}
+	}
+	return nil
+}
+
+func mysqlIndexMatches(actual []mysqlIndexColumnMetadata, nonUnique bool, columns ...string) bool {
+	if len(actual) != len(columns) {
+		return false
+	}
+	for index, column := range actual {
+		if column.nonUnique != nonUnique ||
+			column.sequence != index+1 ||
+			column.columnName != columns[index] ||
+			column.prefix.Valid ||
+			!strings.EqualFold(column.indexType, "BTREE") {
+			return false
+		}
+	}
+	return true
+}
+
+func databaseMigrationRequired(reason string) error {
+	return fmt.Errorf(
+		"%w: %s; apply %s with a database migration account before starting sshappy",
+		ErrDatabaseMigrationRequired,
+		reason,
+		mysqlMigrationPath,
+	)
 }
 
 const mysqlTLSConfigName = "sshappy-panel-mysql"
@@ -149,7 +432,11 @@ func mysqlTLSMode(config Config) (string, error) {
 }
 
 func (d *Database) Close() error {
-	return d.db.Close()
+	var lockErr error
+	if d.lockDB != nil && d.lockDB != d.db {
+		lockErr = d.lockDB.Close()
+	}
+	return errors.Join(lockErr, d.db.Close())
 }
 
 func (d *Database) Stats() sql.DBStats {
@@ -157,9 +444,16 @@ func (d *Database) Stats() sql.DBStats {
 }
 
 func (d *Database) LoadNode() (Node, error) {
+	return d.LoadNodeContext(context.Background())
+}
+
+func (d *Database) LoadNodeContext(ctx context.Context) (Node, error) {
 	var node Node
+	if err := ctx.Err(); err != nil {
+		return node, err
+	}
 	var bandwidth, bandwidthLimit int64
-	err := d.db.QueryRow(`
+	err := d.db.QueryRowContext(ctx, `
 		SELECT id, node_group, node_class, node_speedlimit, traffic_rate, sort, server,
 		       node_bandwidth, node_bandwidth_limit
 		FROM ss_node
@@ -212,6 +506,13 @@ func validateLoadedNode(node Node, bandwidth, bandwidthLimit int64) (Node, error
 }
 
 func (d *Database) LoadUsers(node Node) ([]User, error) {
+	return d.LoadUsersContext(context.Background(), node)
+}
+
+func (d *Database) LoadUsersContext(ctx context.Context, node Node) ([]User, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	conditions := []string{"enable = 1", "expire_in > NOW()", "transfer_enable > u + d"}
 	var args []any
 	if node.Group == 0 {
@@ -221,7 +522,7 @@ func (d *Database) LoadUsers(node Node) ([]User, error) {
 		conditions = append(conditions, "((class >= ? AND node_group = ?) OR is_admin = 1)")
 		args = append(args, node.Class, node.Group)
 	}
-	rows, err := d.db.Query(`
+	rows, err := d.db.QueryContext(ctx, `
 		SELECT id, email, passwd, forbidden_ip, forbidden_port, disconnect_ip, node_speedlimit
 		FROM user
 		WHERE `+strings.Join(conditions, " AND "), args...)
@@ -254,21 +555,34 @@ func (d *Database) LoadUsers(node Node) ([]User, error) {
 	return users, rows.Err()
 }
 
-func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) (err error) {
+func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error {
+	return d.ReportTrafficContext(context.Background(), node, batchID, traffic)
+}
+
+func (d *Database) ReportTrafficContext(ctx context.Context, node Node, batchID string, traffic []TrafficDelta) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(traffic) == 0 {
 		return nil
 	}
-	conn, release, err := d.acquireTrafficBatchLock(node.ID, batchID)
+	release, err := d.acquireTrafficBatchLockContext(ctx, node.ID, batchID)
 	if err != nil {
 		return err
 	}
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("failed to reserve traffic reporting connection: %w", err),
+			release(),
+		)
+	}
+	defer conn.Close()
 	defer func() {
-		if releaseErr := release(); err == nil && releaseErr != nil {
-			err = releaseErr
-		}
+		err = errors.Join(err, release())
 	}()
 
-	committed, err := d.trafficBatchCommitted(conn, node.ID, batchID)
+	committed, err := d.trafficBatchCommittedContext(ctx, conn, node.ID, batchID)
 	if err != nil {
 		return err
 	}
@@ -276,59 +590,52 @@ func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDel
 		return nil
 	}
 
-	traffic = mergeTrafficDeltas(traffic)
-	sort.Slice(traffic, func(i, j int) bool {
-		return traffic[i].UserID < traffic[j].UserID
-	})
-	billed := make([]billedTrafficDelta, 0, len(traffic))
-	for _, delta := range traffic {
-		if delta.UserID <= 0 || delta.Upload < 0 || delta.Download < 0 {
-			return fmt.Errorf("invalid traffic delta for user %d", delta.UserID)
-		}
-		billedUpload := int64(float64(delta.Upload) * node.TrafficRate)
-		billedDownload := int64(float64(delta.Download) * node.TrafficRate)
-		billed = append(billed, billedTrafficDelta{
-			TrafficDelta:   delta,
-			BilledUpload:   billedUpload,
-			BilledDownload: billedDownload,
-			TrafficText:    flowAutoShow(int64(float64(delta.Upload+delta.Download) * node.TrafficRate)),
-		})
+	billed, err := prepareBilledTraffic(node.TrafficRate, traffic)
+	if err != nil {
+		return err
 	}
 	now := time.Now().Unix()
 	chunkIDs := make([]string, 0, (len(billed)+trafficSQLBatchSize-1)/trafficSQLBatchSize)
 	for start := 0; start < len(billed); start += trafficSQLBatchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := min(start+trafficSQLBatchSize, len(billed))
 		chunkID := trafficChunkID(batchID, node.ID, len(chunkIDs))
 		chunkIDs = append(chunkIDs, chunkID)
-		if err := d.reportTrafficChunk(conn, node, chunkID, billed[start:end], now); err != nil {
+		if err := d.reportTrafficChunkContext(ctx, conn, node, chunkID, billed[start:end], now); err != nil {
 			return fmt.Errorf("traffic chunk %d/%d failed: %w", len(chunkIDs), (len(billed)+trafficSQLBatchSize-1)/trafficSQLBatchSize, err)
 		}
 	}
-	return d.finalizeTrafficBatch(conn, node.ID, batchID, chunkIDs, now)
+	return d.finalizeTrafficBatchContext(ctx, conn, node.ID, batchID, chunkIDs, now)
 }
 
-func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Conn, func() error, error) {
+func (d *Database) acquireTrafficBatchLockContext(ctx context.Context, nodeID int, batchID string) (func() error, error) {
 	timeoutSeconds := d.config.MySQLIOTimeoutSeconds
 	if timeoutSeconds < 1 {
 		timeoutSeconds = 30
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+1)*time.Second)
+	lockCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+1)*time.Second)
 	defer cancel()
-	conn, err := d.db.Conn(ctx)
+	lockDB := d.lockDB
+	if lockDB == nil {
+		lockDB = d.db
+	}
+	conn, err := lockDB.Conn(lockCtx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to reserve traffic reporting connection: %w", err)
+		return nil, fmt.Errorf("failed to reserve traffic lock connection: %w", err)
 	}
 	lockName := trafficBatchLockName(nodeID, batchID)
 	var acquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, timeoutSeconds).Scan(&acquired); err != nil {
+	if err := conn.QueryRowContext(lockCtx, "SELECT GET_LOCK(?, ?)", lockName, timeoutSeconds).Scan(&acquired); err != nil {
 		// The server may have granted the lock before the response was lost.
 		// Discard the physical connection instead of returning it to the pool.
 		discardSQLConn(conn)
-		return nil, nil, fmt.Errorf("failed to acquire traffic batch lock: %w", err)
+		return nil, fmt.Errorf("failed to acquire traffic batch lock: %w", err)
 	}
 	if !acquired.Valid || acquired.Int64 != 1 {
 		_ = conn.Close()
-		return nil, nil, fmt.Errorf("timed out acquiring traffic batch lock")
+		return nil, fmt.Errorf("timed out acquiring traffic batch lock")
 	}
 	release := func() error {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -347,7 +654,7 @@ func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Con
 		}
 		return conn.Close()
 	}
-	return conn, release, nil
+	return release, nil
 }
 
 func discardSQLConn(conn *sql.Conn) {
@@ -360,12 +667,12 @@ func trafficBatchLockName(nodeID int, batchID string) string {
 	return "sshappy:traffic:" + hex.EncodeToString(sum[:16])
 }
 
-func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID string) (bool, error) {
-	tx, err := conn.BeginTx(context.Background(), nil)
+func (d *Database) trafficBatchCommittedContext(ctx context.Context, conn *sql.Conn, nodeID int, batchID string) (bool, error) {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	result, err := tx.Exec(
+	result, err := tx.ExecContext(ctx,
 		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
 		batchID,
 		nodeID,
@@ -380,19 +687,23 @@ func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID str
 		_ = tx.Rollback()
 		return false, err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback()
+		return false, err
+	}
 	if err := tx.Rollback(); err != nil {
 		return false, err
 	}
 	return inserted == 0, nil
 }
 
-func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
-	tx, err := conn.BeginTx(context.Background(), nil)
+func (d *Database) reportTrafficChunkContext(ctx context.Context, conn *sql.Conn, node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(
+	result, err := tx.ExecContext(ctx,
 		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
 		chunkID,
 		node.ID,
@@ -409,34 +720,37 @@ func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string,
 		return nil
 	}
 	query, args := userTrafficUpdateStatement(batch, now)
-	if _, err := tx.Exec(query, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return err
 	}
 	query, args = trafficLogInsertStatement(batch, node, now)
-	if _, err := tx.Exec(query, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return err
 	}
-	var total int64
-	for _, delta := range batch {
-		total += delta.Upload + delta.Download
+	total, err := checkedRawTrafficTotal(batch)
+	if err != nil {
+		return fmt.Errorf("invalid traffic chunk total: %w", err)
 	}
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE ss_node
 		SET node_heartbeat = ?, node_bandwidth = node_bandwidth + ?
 		WHERE id = ?
 	`, now, total, node.ID); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
-func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID string, chunkIDs []string, now int64) error {
-	tx, err := conn.BeginTx(context.Background(), nil)
+func (d *Database) finalizeTrafficBatchContext(ctx context.Context, conn *sql.Conn, nodeID int, batchID string, chunkIDs []string, now int64) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
 		batchID,
 		nodeID,
@@ -454,9 +768,12 @@ func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID stri
 		for _, chunkID := range chunkIDs {
 			args = append(args, chunkID)
 		}
-		if _, err := tx.Exec(query.String(), args...); err != nil {
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -471,6 +788,90 @@ type billedTrafficDelta struct {
 	BilledUpload   int64
 	BilledDownload int64
 	TrafficText    string
+}
+
+func prepareBilledTraffic(rate float64, traffic []TrafficDelta) ([]billedTrafficDelta, error) {
+	if rate < 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return nil, errors.New("traffic rate must be a finite non-negative number")
+	}
+	canonical, err := canonicalTrafficDeltas(traffic)
+	if err != nil {
+		return nil, err
+	}
+	billed := make([]billedTrafficDelta, 0, len(canonical))
+	for _, delta := range canonical {
+		rawTotal, err := checkedNonnegativeTrafficAdd(delta.Upload, delta.Download)
+		if err != nil {
+			return nil, fmt.Errorf("traffic total overflow for user %d", delta.UserID)
+		}
+		billedUpload, err := checkedScaleTraffic(delta.Upload, rate)
+		if err != nil {
+			return nil, fmt.Errorf("billed upload overflow for user %d: %w", delta.UserID, err)
+		}
+		billedDownload, err := checkedScaleTraffic(delta.Download, rate)
+		if err != nil {
+			return nil, fmt.Errorf("billed download overflow for user %d: %w", delta.UserID, err)
+		}
+		billedTotal, err := checkedScaleTraffic(rawTotal, rate)
+		if err != nil {
+			return nil, fmt.Errorf("billed traffic total overflow for user %d: %w", delta.UserID, err)
+		}
+		billed = append(billed, billedTrafficDelta{
+			TrafficDelta:   delta,
+			BilledUpload:   billedUpload,
+			BilledDownload: billedDownload,
+			TrafficText:    flowAutoShow(billedTotal),
+		})
+	}
+	for start := 0; start < len(billed); start += trafficSQLBatchSize {
+		end := min(start+trafficSQLBatchSize, len(billed))
+		if _, err := checkedRawTrafficTotal(billed[start:end]); err != nil {
+			return nil, fmt.Errorf("traffic chunk %d raw byte total overflow: %w", start/trafficSQLBatchSize+1, err)
+		}
+	}
+	return billed, nil
+}
+
+func checkedScaleTraffic(value int64, rate float64) (int64, error) {
+	if value < 0 || rate < 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return 0, errors.New("traffic value and rate must be finite and non-negative")
+	}
+	if value == 0 || rate == 0 {
+		return 0, nil
+	}
+	if rate == 1 {
+		return value, nil
+	}
+	product := float64(value) * rate
+	// float64(math.MaxInt64) rounds to 2^63, which is already outside the
+	// int64 range. Reject the boundary rather than relying on implementation-
+	// specific out-of-range float-to-integer conversion.
+	if math.IsInf(product, 0) || math.IsNaN(product) || product >= float64(math.MaxInt64) {
+		return 0, errors.New("scaled traffic exceeds int64")
+	}
+	return int64(product), nil
+}
+
+func checkedNonnegativeTrafficAdd(left, right int64) (int64, error) {
+	if left < 0 || right < 0 || left > math.MaxInt64-right {
+		return 0, errors.New("traffic byte total exceeds int64")
+	}
+	return left + right, nil
+}
+
+func checkedRawTrafficTotal(batch []billedTrafficDelta) (int64, error) {
+	var total int64
+	for _, delta := range batch {
+		userTotal, err := checkedNonnegativeTrafficAdd(delta.Upload, delta.Download)
+		if err != nil {
+			return 0, err
+		}
+		total, err = checkedNonnegativeTrafficAdd(total, userTotal)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
 }
 
 func userTrafficUpdateStatement(batch []billedTrafficDelta, now int64) (string, []any) {
@@ -528,6 +929,13 @@ func appendSQLPlaceholders(builder *strings.Builder, rows, columns int) {
 }
 
 func (d *Database) CleanupTrafficBatches(nodeID, retentionDays int) (int64, error) {
+	return d.CleanupTrafficBatchesContext(context.Background(), nodeID, retentionDays)
+}
+
+func (d *Database) CleanupTrafficBatchesContext(ctx context.Context, nodeID, retentionDays int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if retentionDays == 0 {
 		return 0, nil
 	}
@@ -535,7 +943,7 @@ func (d *Database) CleanupTrafficBatches(nodeID, retentionDays int) (int64, erro
 	const deleteBatchSize = 5000
 	var deletedTotal int64
 	for {
-		result, err := d.db.Exec(`
+		result, err := d.db.ExecContext(ctx, `
 			DELETE FROM sshappy_traffic_batch
 			WHERE node_id = ? AND created_at < ?
 			LIMIT ?
@@ -555,11 +963,18 @@ func (d *Database) CleanupTrafficBatches(nodeID, retentionDays int) (int64, erro
 }
 
 func (d *Database) ReportAliveIPs(node Node, alive map[int]map[string]struct{}) error {
+	return d.ReportAliveIPsContext(context.Background(), node, alive)
+}
+
+func (d *Database) ReportAliveIPsContext(ctx context.Context, node Node, alive map[int]map[string]struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(alive) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
-	tx, err := d.db.Begin()
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -571,11 +986,17 @@ func (d *Database) ReportAliveIPs(node Node, alive map[int]map[string]struct{}) 
 		}
 	}
 	for start := 0; start < len(records); start += aliveIPSQLBatchSize {
-		end := min(start+aliveIPSQLBatchSize, len(records))
-		query, args := aliveIPInsertStatement(records[start:end], node.ID, now)
-		if _, err := tx.Exec(query, args...); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
+		end := min(start+aliveIPSQLBatchSize, len(records))
+		query, args := aliveIPInsertStatement(records[start:end], node.ID, now)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -597,6 +1018,13 @@ func aliveIPInsertStatement(records []aliveIPRecord, nodeID int, now int64) (str
 }
 
 func (d *Database) ReportNodeStatus(node Node, online int) error {
+	return d.ReportNodeStatusContext(context.Background(), node, online)
+}
+
+func (d *Database) ReportNodeStatusContext(ctx context.Context, node Node, online int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	uptime := int64(time.Since(processStartedAt).Seconds())
 	load := "0.00"
@@ -606,12 +1034,12 @@ func (d *Database) ReportNodeStatus(node Node, online int) error {
 			load = fields[0]
 		}
 	}
-	tx, err := d.db.Begin()
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO ss_node_online_log (node_id, online_user, log_time) VALUES (?, ?, ?)",
 		node.ID,
 		online,
@@ -619,7 +1047,7 @@ func (d *Database) ReportNodeStatus(node Node, online int) error {
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO ss_node_info (node_id, uptime, `load`, log_time) VALUES (?, ?, ?, ?)",
 		node.ID,
 		uptime,
@@ -628,7 +1056,10 @@ func (d *Database) ReportNodeStatus(node Node, online int) error {
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("UPDATE ss_node SET node_heartbeat = ? WHERE id = ?", now, node.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE ss_node SET node_heartbeat = ? WHERE id = ?", now, node.ID); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return tx.Commit()

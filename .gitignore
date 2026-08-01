@@ -10,3 +10,11 @@
 /.env.*
 !/.env.example
 /secrets/
+/users.json
+/traffic-outbox.json
+/traffic-outbox.sqlite3
+/traffic-outbox.sqlite3-wal
+/traffic-outbox.sqlite3-shm
+/traffic-outbox.sqlite3-journal
+/traffic-outbox.sqlite3.lock
+/traffic-outbox.sqlite3.init

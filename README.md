@@ -1,24 +1,27 @@
-# sshappy 4.3.1
+# sshappy 4.4.0
 
-`sshappy` is a Go implementation of a Shadowsocks 2022 node with an SSPanel-compatible runtime. This repository keeps the upstream `shadowsocks-go` server and domain-set converter, and adds `sstest`, which loads node/user policy from MySQL, enforces runtime limits, reports traffic and online state, and persists unreported traffic locally for retry.
+`sshappy` is a Go implementation of a Shadowsocks 2022 node with an SSPanel-compatible runtime. The repository keeps the upstream `shadowsocks-go` server and domain-set converter, and adds `sstest`, which loads node/user policy from MySQL, enforces runtime restrictions, reports traffic and online state, and durably retries unreported traffic.
 
-Version 4.3.1 is developed on the `4.3.1` branch from the immutable `v4.3.0` baseline. The `4.3` branch, the `v4.3.0` Git tag, and the `sadno/sstest:4.3` and `sadno/sstest:4.3.0` images are frozen rollback references and must not be moved, rebuilt or overwritten. The traffic-outbox JSON remains byte-shape compatible with 4.2 for both its single- and multi-batch forms; as in 4.2, a recovered batch uses the node ID and traffic rate current when it is flushed.
+Version 4.4.0 is developed on the `4.4` branch from the immutable 4.3.1 rollback baseline. Preserve the `4.3.1` branch, `v4.3.1` tag and `sadno/sstest:4.3.1` image; do not move the tag or rebuild/overwrite that image tag.
 
-## 4.3.1 hardening
+## 4.4 changes
 
-- User target restrictions are compiled strictly. An invalid `forbidden_ip`, `forbidden_port` or `disconnect_ip` rule rejects only its owning user instead of being silently ignored or interrupting unrelated users.
-- TCP and UDP domain targets are checked again against `forbidden_ip` after resolution, using the final IP selected for the outbound connection. UDP sessions pin up to 64 resolved domains locally, preventing per-packet DNS amplification and DNS rebinding within a session.
-- Removing a user, changing its key or tightening its security policy cancels that user's existing TCP and UDP sessions at the next successful policy synchronization.
-- When the database backlog cannot be flushed, newly captured traffic is appended to the durable outbox before the reporting cycle returns an error, reducing the hard-stop loss window.
-- UDP decryption failures are counted and emitted as periodic aggregates instead of producing one warning per rejected packet.
-- The release workflow addresses GitHub explicitly and refuses to overwrite existing release assets.
+- The traffic outbox is now a transactional SQLite WAL queue instead of a whole-file JSON rewrite. Each batch freezes the node ID and traffic rate at capture time and carries a canonical SHA-256 payload check.
+- A legacy 4.3.1 JSON outbox is never overwritten or silently converted. Startup preserves a non-SQLite file and fails with a reconciliation error.
+- A private process lock prevents two 4.4 writers from opening one outbox. Existing state with permissive modes, symlinks or hard links is rejected without changing it, and interrupted first-time initialization is recovered through an atomic marker.
+- MySQL schema setup is an explicit, versioned migration. The runtime validates the migration record, table engine, columns and indexes at startup and no longer performs DDL.
+- Runtime MySQL operations have explicit deadlines. Normal accounting cycles replay at most 64 durable batches before returning to other work, final shutdown captures new counters before replay, and billing arithmetic rejects integer overflow instead of wrapping.
+- Release archives and the container image include the exact MySQL migration used by this version.
+- The strict target-policy parsing, resolved-IP checks, active-session revocation and bounded UDP domain cache from 4.3.1 remain in place.
+
+Quota enforcement during accounting outages and node/user speed limiting are intentionally not implemented in 4.4. Their units, scope, multi-node coordination, burst behavior and update semantics require an explicit product contract before a safe implementation can be chosen. See [4.4 release notes](docs/4.4-release-notes.md).
 
 ## Requirements
 
 - Go 1.26 or the exact version declared by `go.mod`.
-- A compatible SSPanel MySQL schema.
+- A compatible SSPanel MySQL schema with [the 4.4 migration](docs/mysql-migration.md) applied before startup.
 - An `ss_node` record whose `sort` is `14` and whose `server` value follows `host;port;base64-server-key`.
-- A writable, persistent data directory for the credential snapshot and traffic outbox. The defaults use `/var/lib/sshappy`.
+- A private, writable and persistent data directory for the credential snapshot and SQLite outbox. Defaults use `/var/lib/sshappy`.
 
 ## Build
 
@@ -34,9 +37,24 @@ go build -trimpath ./cmd/shadowsocks-go
 go build -trimpath ./cmd/shadowsocks-go-domain-set-converter
 ```
 
-## Run
+## Migrate and run
 
-Do not commit real database passwords, node keys or user credentials. Supply them through the process environment or a secret manager.
+Stop 4.3.1 and completely drain and back up its JSON outbox before starting 4.4. Never run both versions against the same state directory. Apply the migration with a separate DDL-capable account; the password is prompted rather than placed on the command line:
+
+```sh
+mysql \
+  --protocol=TCP \
+  --host=127.0.0.1 \
+  --port=3306 \
+  --user=sshappy_migrator \
+  --password \
+  --ssl-mode=DISABLED \
+  sspanel < migrations/mysql/0001_traffic_batch.sql
+```
+
+The database used by this deployment cannot negotiate TLS, so the migration uses `--ssl-mode=DISABLED` and the runtime uses `MYSQL_TLS_MODE=disabled`. Both connections are plaintext: keep them on a trusted private network and prevent public access to MySQL.
+
+Do not commit real database passwords, node keys or user credentials. Supply them through the process environment or a secret manager:
 
 ```sh
 NODE_ID=116 \
@@ -45,17 +63,15 @@ MYSQL_DB=sspanel \
 MYSQL_USER=sshappy \
 MYSQL_PASS='replace-with-a-secret' \
 MYSQL_TLS_MODE=disabled \
+TRAFFIC_OUTBOX_PATH=/var/lib/sshappy/traffic-outbox.sqlite3 \
 ./sstest
 ```
 
-The database used by this deployment cannot negotiate TLS, so its examples explicitly set `MYSQL_TLS_MODE=disabled`. This sends database credentials and queries in plaintext; use it only on a trusted private network with firewall rules that prevent public access. The application default remains `auto` for other deployments.
+See [configuration](docs/configuration.md), [MySQL migration](docs/mysql-migration.md), [operations and rollback](docs/operations.md), and [Docker deployment](docs/docker.md).
 
-See [configuration](docs/configuration.md) for all environment variables and [operations](docs/operations.md) for data durability, shutdown and rollback guidance.
-Known items that require a product contract, schema migration or further deployment work are tracked in [4.3.1 remaining work](docs/4.3.1-remaining-work.md).
+Automatic traffic-marker cleanup remains disabled by default. Do not enable it until the single-writer and recovery-window conditions in the operations guide are satisfied.
 
-Automatic traffic-marker cleanup is disabled by default. Do not enable it without first reading the single-instance and recovery-window requirements in the operations guide.
-
-Downstream Go integrations that provide a custom `stats.Collector` must add the explicit `CollectTCPSessionStart` and `CollectUDPSessionStart` methods introduced in 4.3. Traffic-delta calls no longer double as session-start events.
+Downstream Go integrations that provide a custom `stats.Collector` must implement the explicit `CollectTCPSessionStart` and `CollectUDPSessionStart` methods introduced in 4.3. Traffic-delta calls do not double as session-start events.
 
 ## Test
 
@@ -66,7 +82,7 @@ go test -race -count=1 ./internal/panel ./service ./api/... ./cred ./dns ./direc
 go test -race -count=1 ./ss2022 -run '^(TestShadowStreamConnConcurrentReadsAndWrites|TestShadowStreamBulkCopyWrappedReaderDoesNotDeadlock|TestPSKLengthErrorRedactsPSK|TestCipherConfigsCloneKeyInputsAndSliceOutputs)$'
 ```
 
-The MySQL integration test requires a disposable database/schema and is intentionally opt-in:
+The MySQL integration test requires a disposable database/schema and is intentionally opt-in. It applies the repository migration itself:
 
 ```sh
 SSHAPPY_TEST_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/disposable_database?parseTime=true' \
@@ -78,7 +94,8 @@ Never point this integration test at production: it creates fixed table names.
 ## Repository layout
 
 - `cmd/sstest`: SSPanel-managed node process.
-- `internal/panel`: MySQL adapter, policy, accounting, outbox and operational reporting.
+- `internal/panel`: MySQL adapter, policy, accounting, SQLite outbox and operational reporting.
+- `migrations/mysql`: versioned MySQL migrations applied before runtime startup.
 - `service`: TCP/UDP relay lifecycle and limits.
 - `ss2022`: Shadowsocks 2022 crypto and protocol implementation.
 - `cred`: dynamic user credential manager.
@@ -88,20 +105,21 @@ Never point this integration test at production: it creates fixed table names.
 
 ## Docker image
 
-The reviewed container build is intentionally limited to `linux/amd64`. It uses a minimal Debian 12 distroless/static runtime and is intended for Docker Engine on Debian 11 and newer Linux hosts:
+The reviewed image is intentionally `linux/amd64`, uses Debian 12 distroless/static userland and is intended for Docker Engine on Debian 11 and newer Linux hosts. A real Debian 11 amd64 host has not yet completed production acceptance certification.
 
 ```sh
 docker buildx build \
   --platform linux/amd64 \
-  --build-arg VERSION=4.3.1 \
+  --build-arg VERSION=4.4.0 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load -f Dockerfile.sstest \
-  -t sadno/sstest:4.3.1 .
+  -t sadno/sstest:4.4.0 \
+  -t sadno/sstest:4.4 .
 ```
 
-See [Docker deployment](docs/docker.md) for persistent state, privileged relay ports, optional non-root execution, TCP/UDP publication, MySQL and shutdown requirements.
+The default root user permits panel-managed relay ports below 1024; `sstest` does not impose a low-port restriction. Deployment examples use TCP and UDP port 1023.
 
 ## Security
 
-Please report suspected vulnerabilities privately to the repository owner. Logs and bug reports must redact MySQL DSNs, passwords, PSKs, user credential files and traffic outbox contents.
+Please report suspected vulnerabilities privately to the repository owner. Logs and bug reports must redact MySQL DSNs, passwords, PSKs, user credential files and all outbox contents. The release image and archives contain schema-only migration SQL, never deployment credentials.
