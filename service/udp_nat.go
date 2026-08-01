@@ -91,6 +91,8 @@ type UDPNATRelay struct {
 	wg                     sync.WaitGroup
 	mwg                    sync.WaitGroup
 	table                  map[netip.AddrPort]*natEntry
+	dropForbidden          atomic.Uint64
+	dropPolicyResolution   atomic.Uint64
 }
 
 func NewUDPNATRelay(
@@ -138,7 +140,32 @@ func (s *UDPNATRelay) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	s.mwg.Go(func() { s.logOutboundPolicyMetrics(ctx) })
 	return nil
+}
+
+func (s *UDPNATRelay) logOutboundPolicyMetrics(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	var lastDenied uint64
+	var lastResolution uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			denied := s.dropForbidden.Load()
+			resolution := s.dropPolicyResolution.Load()
+			if denied != lastDenied || resolution != lastResolution {
+				s.logger.Info("UDP outbound policy metrics",
+					zap.Uint64("dropForbidden", denied),
+					zap.Uint64("dropPolicyResolution", resolution),
+				)
+			}
+			lastDenied = denied
+			lastResolution = resolution
+		}
+	}
 }
 
 func (s *UDPNATRelay) startGeneric(ctx context.Context, index int, lnc *udpRelayServerConn) (err error) {
@@ -441,6 +468,10 @@ func (s *UDPNATRelay) relayServerConnToNatConnGeneric(ctx context.Context, uplin
 	for queuedPacket := range uplink.natConnSendCh {
 		destAddrPort, packetStart, packetLength, err = uplink.natConnPacker.PackInPlace(ctx, queuedPacket.buf, queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length)
 		if err != nil {
+			if recordOutboundPolicyDrop(err, &s.dropForbidden, &s.dropPolicyResolution) {
+				s.putQueuedPacket(queuedPacket)
+				continue
+			}
 			uplink.logger.Warn("Failed to pack packet for natConn",
 				zap.Stringer("clientAddress", uplink.clientAddrPort),
 				zap.Stringer("targetAddress", &queuedPacket.targetAddr),

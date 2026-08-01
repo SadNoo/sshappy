@@ -23,6 +23,8 @@ import (
 
 const serverName = "flysky-ss2022"
 
+var ErrRuntimeDrainTimeout = errors.New("Flysky runtime shutdown drain timed out")
+
 type enrollmentClient interface {
 	Enroll(context.Context, string, flyskyapi.CapabilityReport) (flyskyapi.MachineCredential, error)
 }
@@ -45,16 +47,28 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	}
 	credential = rotateCredentialIfNeeded(ctx, client, config, credential, logger)
 
+	var negotiatedUsageLimits *usageReportLimits
 	if capabilities, capabilityErr := client.Capabilities(ctx); capabilityErr != nil {
 		logger.Warn("Flysky capability negotiation failed; cached bootstrap remains available", zap.Error(capabilityErr))
 	} else if err := validateCapabilities(capabilities, config); err != nil {
 		return err
+	} else {
+		limits, err := usageLimitsFromCapabilities(capabilities)
+		if err != nil {
+			return err
+		}
+		negotiatedUsageLimits = &limits
 	}
 
 	state := NewState()
 	reportOutbox, err := newReportOutbox(config.ReportOutboxPath)
 	if err != nil {
 		return fmt.Errorf("open Flysky durable report outbox: %w", err)
+	}
+	if negotiatedUsageLimits != nil {
+		if err := reportOutbox.SetUsageReportLimits(*negotiatedUsageLimits); err != nil {
+			return fmt.Errorf("apply negotiated Flysky usage report limits: %w", err)
+		}
 	}
 	if err := reportOutbox.ValidateNode(credential.NodeID); err != nil {
 		return err
@@ -74,20 +88,16 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		)
 	}
 	if err := reportOutbox.Flush(ctx, client, credential.AccessToken); err != nil {
-		usagePending, alivePending := reportOutbox.Pending()
-		logger.Warn("Flysky pending reports will be retried", zap.Int("usagePending", usagePending),
-			zap.Int("aliveIPPending", alivePending), zap.Error(err))
+		logReportFlushFailure(logger, "Flysky retained report delivery state requires attention", reportOutbox, err)
 	}
 
 	manager, managedServer, err := newManager(config, applied, runtimeHooks, logger)
 	if err != nil {
 		return err
 	}
-	defer manager.Close()
 	syncer.SetCredentialReloader(managedServer)
 
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	runResult := make(chan bool, 1)
 	go func() {
 		runResult <- manager.Run(runCtx)
@@ -111,31 +121,52 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	aliveIPTicker := time.NewTicker(config.AliveIPReportInterval)
 	defer aliveIPTicker.Stop()
 	usageWindowStart := time.Now().UTC()
-	defer func() {
-		captureUsageReport(state, reportOutbox, applied, &usageWindowStart, logger)
-		captureAliveIPReport(state, reportOutbox, applied, config.AliveIPReportInterval, logger)
-		flushContext, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelFlush()
-		if err := reportOutbox.Flush(flushContext, client, credential.AccessToken); err != nil {
-			usagePending, alivePending := reportOutbox.Pending()
-			logger.Warn("Flysky shutdown retained pending reports on disk", zap.Int("usagePending", usagePending),
-				zap.Int("aliveIPPending", alivePending), zap.Error(err))
+	finish := func(baseErr error, managerResult *bool) error {
+		drain := func() (bool, error) {
+			if managerResult != nil {
+				return *managerResult, nil
+			}
+			return waitForManagerDrain(runResult, config.ShutdownDrainTimeout)
 		}
-	}()
+		result := shutdownRuntime(
+			cancel,
+			drain,
+			manager.Close,
+			func() error {
+				return errors.Join(
+					captureUsageReport(state, reportOutbox, applied, &usageWindowStart, logger),
+					captureAliveIPReport(state, reportOutbox, applied, config.AliveIPReportInterval, logger),
+				)
+			},
+			func() error {
+				flushContext, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelFlush()
+				return reportOutbox.Flush(flushContext, client, credential.AccessToken)
+			},
+		)
+		if result.drainErr != nil {
+			baseErr = errors.Join(baseErr, result.drainErr)
+			logger.Error("Flysky manager drain exceeded its safety deadline; final capture may omit writes still inside the stuck relay",
+				zap.Duration("timeout", config.ShutdownDrainTimeout), zap.Error(result.drainErr))
+		}
+		if !result.managerOK && result.drainErr == nil {
+			baseErr = errors.Join(baseErr, errors.New("SS2022 service manager stopped with an error"))
+		}
+		if result.flushErr != nil {
+			logReportFlushFailure(logger, "Flysky shutdown report delivery state requires attention", reportOutbox, result.flushErr)
+		}
+		return errors.Join(baseErr, result.captureErr)
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			cancel()
-			if ok := <-runResult; !ok {
-				return errors.New("SS2022 service manager stopped with an error")
-			}
-			return nil
+			return finish(nil, nil)
 		case ok := <-runResult:
 			if !ok {
-				return errors.New("SS2022 service manager stopped with an error")
+				return finish(nil, &ok)
 			}
-			return errors.New("SS2022 service manager stopped unexpectedly")
+			return finish(errors.New("SS2022 service manager stopped unexpectedly"), &ok)
 		case <-changeTicker.C:
 			updated, changeErr := syncer.PollChanges(ctx, credential.AccessToken)
 			switch {
@@ -150,7 +181,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 				applied = updated
 				logger.Info("Flysky cursor recovered from a full snapshot", zap.String("configVersion", applied.Wire.ConfigVersion))
 			case errors.Is(changeErr, ErrRestartRequired):
-				return changeErr
+				return finish(changeErr, nil)
 			default:
 				logger.Warn("Flysky incremental synchronization failed", zap.Error(changeErr))
 			}
@@ -160,7 +191,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			}
 			updated, snapshotErr := syncer.FetchAndInstallSnapshot(ctx, credential.AccessToken, credential.NodeID)
 			if errors.Is(snapshotErr, ErrRestartRequired) {
-				return snapshotErr
+				return finish(snapshotErr, nil)
 			}
 			if snapshotErr != nil {
 				logger.Warn("Flysky snapshot refresh failed; new sessions will fail closed at expiry",
@@ -174,12 +205,54 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 			nextInterval := reportStatus(ctx, client, config, credential.AccessToken, applied, logger)
 			heartbeatTimer.Reset(nextInterval)
 		case <-usageTicker.C:
-			captureUsageReport(state, reportOutbox, applied, &usageWindowStart, logger)
+			if err := captureUsageReport(state, reportOutbox, applied, &usageWindowStart, logger); err != nil {
+				logger.Error("Flysky usage report could not be persisted; traffic remains in memory", zap.Error(err))
+			}
 			flushReports(ctx, reportOutbox, client, credential.AccessToken, logger)
 		case <-aliveIPTicker.C:
-			captureAliveIPReport(state, reportOutbox, applied, config.AliveIPReportInterval, logger)
+			if err := captureAliveIPReport(state, reportOutbox, applied, config.AliveIPReportInterval, logger); err != nil {
+				logger.Error("Flysky online IP aggregate could not be persisted", zap.Error(err))
+			}
 			flushReports(ctx, reportOutbox, client, credential.AccessToken, logger)
 		}
+	}
+}
+
+type runtimeShutdownResult struct {
+	managerOK  bool
+	drainErr   error
+	captureErr error
+	flushErr   error
+}
+
+func shutdownRuntime(
+	cancel func(),
+	drain func() (bool, error),
+	closeManager func(),
+	capture func() error,
+	flush func() error,
+) runtimeShutdownResult {
+	// Stop acceptance first. Manager.Run then drains every relay and its final
+	// accounting. Only after that barrier (or its bounded timeout) may durable
+	// capture and the best-effort network flush run.
+	cancel()
+	managerOK, drainErr := drain()
+	closeManager()
+	captureErr := capture()
+	flushErr := flush()
+	return runtimeShutdownResult{
+		managerOK: managerOK, drainErr: drainErr, captureErr: captureErr, flushErr: flushErr,
+	}
+}
+
+func waitForManagerDrain(runResult <-chan bool, timeout time.Duration) (bool, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ok := <-runResult:
+		return ok, nil
+	case <-timer.C:
+		return false, ErrRuntimeDrainTimeout
 	}
 }
 
@@ -189,19 +262,19 @@ func captureUsageReport(
 	applied AppliedSnapshot,
 	windowStart *time.Time,
 	logger *zap.Logger,
-) {
+) error {
 	now := time.Now().UTC()
 	deltas := state.SnapshotTraffic()
 	if len(deltas) == 0 {
 		*windowStart = now
-		return
+		return nil
 	}
 	if err := outbox.CaptureUsage(applied.Wire.Node.NodeID, applied.Wire.ConfigVersion, *windowStart, now, deltas); err != nil {
 		state.MergeTraffic(deltas)
-		logger.Error("Flysky usage report could not be persisted; traffic remains in memory", zap.Error(err))
-		return
+		return fmt.Errorf("persist Flysky usage report: %w", err)
 	}
 	*windowStart = now
+	return nil
 }
 
 func captureAliveIPReport(
@@ -210,15 +283,16 @@ func captureAliveIPReport(
 	applied AppliedSnapshot,
 	window time.Duration,
 	logger *zap.Logger,
-) {
+) error {
 	now := time.Now().UTC()
 	onlineIPs, activeUsers := state.AliveSummary(window, now)
 	if err := outbox.CaptureAliveIP(flyskyapi.AliveIPReport{
 		NodeID: applied.Wire.Node.NodeID, ObservedAt: now, WindowSeconds: int(window / time.Second),
 		OnlineIPCount: int64(onlineIPs), ActiveUsers: int64(activeUsers), Connections: 0,
 	}); err != nil {
-		logger.Error("Flysky online IP aggregate could not be persisted", zap.Error(err))
+		return fmt.Errorf("persist Flysky online IP aggregate: %w", err)
 	}
+	return nil
 }
 
 func flushReports(
@@ -229,10 +303,20 @@ func flushReports(
 	logger *zap.Logger,
 ) {
 	if err := outbox.Flush(ctx, client, accessToken); err != nil {
-		usagePending, alivePending := outbox.Pending()
-		logger.Warn("Flysky report delivery failed; durable retry is pending", zap.Int("usagePending", usagePending),
-			zap.Int("aliveIPPending", alivePending), zap.Error(err))
+		logReportFlushFailure(logger, "Flysky report delivery state requires attention", outbox, err)
 	}
+}
+
+func logReportFlushFailure(logger *zap.Logger, message string, outbox *reportOutbox, err error) {
+	usagePending, alivePending := outbox.Pending()
+	usageReconciliation, aliveReconciliation := outbox.Reconciliation()
+	logger.Warn(message,
+		zap.Int("usagePending", usagePending),
+		zap.Int("aliveIPPending", alivePending),
+		zap.Int("usageReconciliation", usageReconciliation),
+		zap.Int("aliveIPReconciliation", aliveReconciliation),
+		zap.Error(err),
+	)
 }
 
 func loadOrEnroll(
@@ -348,7 +432,21 @@ func validateCapabilities(capabilities flyskyapi.Capabilities, config Config) er
 			return fmt.Errorf("Flysky control plane is missing required feature %s", feature)
 		}
 	}
+	if _, err := usageLimitsFromCapabilities(capabilities); err != nil {
+		return err
+	}
 	return nil
+}
+
+func usageLimitsFromCapabilities(capabilities flyskyapi.Capabilities) (usageReportLimits, error) {
+	limits, err := normalizeUsageReportLimits(usageReportLimits{
+		MaxItems:        capabilities.Limits.UsageReportMaxItems,
+		MaxEncodedBytes: capabilities.Limits.UsageReportMaxBytes,
+	})
+	if err != nil {
+		return usageReportLimits{}, fmt.Errorf("invalid Flysky usage report capability limits: %w", err)
+	}
+	return limits, nil
 }
 
 func reportStatus(

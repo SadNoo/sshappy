@@ -7,9 +7,12 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/router"
+	"github.com/database64128/shadowsocks-go/service"
 )
 
 // ipResolver is kept small so policy behavior, including DNS rebinding
@@ -30,7 +33,34 @@ type outboundACL struct {
 	resolver             ipResolver
 	controlPlaneHostname string
 	protectedPrefixes    []netip.Prefix
+	now                  func() time.Time
+
+	dnsMu       sync.Mutex
+	dnsCache    map[string]outboundDNSCacheEntry
+	dnsInflight map[string]*outboundDNSLookup
+	dnsSequence uint64
 }
+
+type outboundDNSCacheEntry struct {
+	addresses []netip.Addr
+	err       error
+	expiresAt time.Time
+	lastUsed  uint64
+}
+
+type outboundDNSLookup struct {
+	done      chan struct{}
+	addresses []netip.Addr
+	err       error
+}
+
+const (
+	outboundDNSPositiveTTL   = 30 * time.Second
+	outboundDNSNegativeTTL   = 5 * time.Second
+	outboundDNSLookupTimeout = 5 * time.Second
+	outboundDNSCacheMax      = 256
+	outboundDNSInflightMax   = 256
+)
 
 var (
 	blockedIPv4Prefixes = []netip.Prefix{
@@ -85,6 +115,9 @@ func newOutboundACLWithDependencies(
 		resolver:             resolver,
 		controlPlaneHostname: controlHost,
 		protectedPrefixes:    make([]netip.Prefix, 0, len(protectedPrefixes)+8),
+		now:                  time.Now,
+		dnsCache:             make(map[string]outboundDNSCacheEntry),
+		dnsInflight:          make(map[string]*outboundDNSLookup),
 	}
 	for _, prefix := range protectedPrefixes {
 		if err := acl.addProtectedPrefix(prefix); err != nil {
@@ -116,38 +149,153 @@ func newOutboundACLWithDependencies(
 }
 
 // ResolveAndAuthorize implements service.OutboundTargetPolicy.
-func (a *outboundACL) ResolveAndAuthorize(ctx context.Context, target conn.Addr) (conn.Addr, error) {
+func (a *outboundACL) ResolveAndAuthorize(ctx context.Context, target conn.Addr) ([]conn.Addr, error) {
 	if !target.IsValid() {
-		return conn.Addr{}, router.ErrRejected
+		return nil, router.ErrRejected
 	}
 
 	if target.IsIP() {
 		ip := target.IP()
 		if !a.allowIP(ip) {
-			return conn.Addr{}, router.ErrRejected
+			return nil, router.ErrRejected
 		}
-		return conn.AddrFromIPAndPort(ip, target.Port()), nil
+		return []conn.Addr{conn.AddrFromIPAndPort(ip, target.Port())}, nil
 	}
 
 	hostname := canonicalHostname(target.Domain())
 	if hostname == "" || hostname == a.controlPlaneHostname {
-		return conn.Addr{}, router.ErrRejected
+		return nil, router.ErrRejected
 	}
-	resolved, err := a.resolver.LookupNetIP(ctx, "ip4", hostname)
+	resolved, err := a.lookupIPv4(ctx, hostname)
 	if err != nil {
-		return conn.Addr{}, err
-	}
-	if len(resolved) == 0 {
-		return conn.Addr{}, errors.New("outbound target resolved without addresses")
+		return nil, err
 	}
 
-	// Use exactly the address that was checked. The service wrapper passes this
-	// IP target to the socket dialer/packet packer, preventing a second lookup.
-	ip := resolved[0]
-	if !a.allowIP(ip) {
-		return conn.Addr{}, router.ErrRejected
+	// Check every resolver answer, preserve its order, and skip protected or
+	// duplicate candidates. A mixed answer set remains usable through its
+	// public addresses; no unchecked hostname is ever passed to the dialer.
+	candidates := make([]conn.Addr, 0, len(resolved))
+	seen := make(map[netip.Addr]struct{}, len(resolved))
+	for _, ip := range resolved {
+		if !a.allowIP(ip) {
+			continue
+		}
+		ip = ip.Unmap()
+		if _, exists := seen[ip]; exists {
+			continue
+		}
+		seen[ip] = struct{}{}
+		candidates = append(candidates, conn.AddrFromIPAndPort(ip, target.Port()))
 	}
-	return conn.AddrFromIPAndPort(ip, target.Port()), nil
+	if len(candidates) == 0 {
+		return nil, router.ErrRejected
+	}
+	return candidates, nil
+}
+
+// lookupIPv4 provides a small, shared positive and negative DNS cache. It
+// deliberately owns the resolver call rather than leaving it to a socket
+// dialer: that both prevents DNS rebinding and avoids per-packet lookups for
+// UDP domain targets. Concurrent misses for the same canonical hostname share
+// one lookup; the global in-flight cap bounds random-domain amplification.
+func (a *outboundACL) lookupIPv4(ctx context.Context, hostname string) ([]netip.Addr, error) {
+	hostname = canonicalHostname(hostname)
+	if hostname == "" {
+		return nil, router.ErrRejected
+	}
+
+	now := a.now()
+	a.dnsMu.Lock()
+	if cached, ok := a.dnsCache[hostname]; ok {
+		if now.Before(cached.expiresAt) {
+			a.dnsSequence++
+			cached.lastUsed = a.dnsSequence
+			a.dnsCache[hostname] = cached
+			addresses := append([]netip.Addr(nil), cached.addresses...)
+			a.dnsMu.Unlock()
+			return addresses, cached.err
+		}
+		delete(a.dnsCache, hostname)
+	}
+	if lookup, ok := a.dnsInflight[hostname]; ok {
+		a.dnsMu.Unlock()
+		return waitOutboundDNSLookup(ctx, lookup)
+	}
+	if len(a.dnsInflight) >= outboundDNSInflightMax {
+		a.dnsMu.Unlock()
+		return nil, service.ErrOutboundPolicyResolution
+	}
+	lookup := &outboundDNSLookup{done: make(chan struct{})}
+	a.dnsInflight[hostname] = lookup
+	a.dnsMu.Unlock()
+
+	go a.resolveIPv4(hostname, lookup)
+	return waitOutboundDNSLookup(ctx, lookup)
+}
+
+func waitOutboundDNSLookup(ctx context.Context, lookup *outboundDNSLookup) ([]netip.Addr, error) {
+	select {
+	case <-lookup.done:
+		return append([]netip.Addr(nil), lookup.addresses...), lookup.err
+	case <-ctx.Done():
+		return nil, errors.Join(service.ErrOutboundPolicyResolution, ctx.Err())
+	}
+}
+
+func (a *outboundACL) resolveIPv4(hostname string, lookup *outboundDNSLookup) {
+	lookupCtx, cancel := context.WithTimeout(context.Background(), outboundDNSLookupTimeout)
+	addresses, err := a.resolver.LookupNetIP(lookupCtx, "ip4", hostname)
+	cancel()
+	if err != nil || len(addresses) == 0 {
+		addresses = nil
+		err = service.ErrOutboundPolicyResolution
+	} else {
+		addresses = append([]netip.Addr(nil), addresses...)
+		err = nil
+	}
+
+	now := a.now()
+	ttl := outboundDNSPositiveTTL
+	if err != nil {
+		ttl = outboundDNSNegativeTTL
+	}
+
+	a.dnsMu.Lock()
+	lookup.addresses = addresses
+	lookup.err = err
+	a.insertDNSCacheLocked(hostname, outboundDNSCacheEntry{
+		addresses: append([]netip.Addr(nil), addresses...),
+		err:       err,
+		expiresAt: now.Add(ttl),
+	})
+	delete(a.dnsInflight, hostname)
+	close(lookup.done)
+	a.dnsMu.Unlock()
+}
+
+func (a *outboundACL) insertDNSCacheLocked(hostname string, entry outboundDNSCacheEntry) {
+	now := a.now()
+	for key, cached := range a.dnsCache {
+		if !now.Before(cached.expiresAt) {
+			delete(a.dnsCache, key)
+		}
+	}
+	if _, exists := a.dnsCache[hostname]; !exists && len(a.dnsCache) >= outboundDNSCacheMax {
+		var oldestKey string
+		var oldestSequence uint64
+		first := true
+		for key, cached := range a.dnsCache {
+			if first || cached.lastUsed < oldestSequence {
+				oldestKey = key
+				oldestSequence = cached.lastUsed
+				first = false
+			}
+		}
+		delete(a.dnsCache, oldestKey)
+	}
+	a.dnsSequence++
+	entry.lastUsed = a.dnsSequence
+	a.dnsCache[hostname] = entry
 }
 
 func (a *outboundACL) allowIP(ip netip.Addr) bool {

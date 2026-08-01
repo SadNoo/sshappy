@@ -276,7 +276,7 @@ func applyChanges(current flyskyapi.Snapshot, set flyskyapi.Changes, now time.Ti
 func writeCredentials(path string, users []User) error {
 	credentials := make(map[string][]byte, len(users))
 	for _, user := range users {
-		credentials[user.ID] = user.Key
+		credentials[credentialLabel(user)] = user.Key
 	}
 	data, err := json.Marshal(credentials)
 	if err != nil {

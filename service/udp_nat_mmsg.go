@@ -429,6 +429,13 @@ main:
 		for {
 			destAddrPort, packetStart, packetLength, err = uplink.natConnPacker.PackInPlace(ctx, queuedPacket.buf, queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length)
 			if err != nil {
+				if recordOutboundPolicyDrop(err, &s.dropForbidden, &s.dropPolicyResolution) {
+					s.putQueuedPacket(queuedPacket)
+					if count == 0 {
+						continue main
+					}
+					goto next
+				}
 				uplink.logger.Warn("Failed to pack packet for natConn",
 					zap.Stringer("clientAddress", uplink.clientAddrPort),
 					zap.Stringer("targetAddress", &queuedPacket.targetAddr),

@@ -94,7 +94,7 @@ func TestSynchronizerInstallsSnapshotAndAppliesUUIDChanges(t *testing.T) {
 	if err := json.Unmarshal(credentialData, &credentials); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(credentials[user1], bytes.Repeat([]byte{0x22}, keyLen)) {
+	if !bytes.Equal(credentials[credentialLabel(applied.Users[0])], bytes.Repeat([]byte{0x22}, keyLen)) {
 		t.Fatalf("credential file = %+v", credentials)
 	}
 
@@ -111,10 +111,10 @@ func TestSynchronizerInstallsSnapshotAndAppliesUUIDChanges(t *testing.T) {
 		t.Fatalf("credential reload calls = %d", reloader.calls)
 	}
 	source := netip.MustParseAddrPort("192.0.2.10:12345")
-	if runtime.Accept("tcp", user1, source, conn.Addr{}) {
+	if runtime.Accept("tcp", credentialLabel(applied.Users[0]), source, conn.Addr{}) {
 		t.Fatal("revoked user remained active")
 	}
-	if !runtime.Accept("tcp", user2, source, conn.Addr{}) {
+	if !runtime.Accept("tcp", credentialLabel(updated.Users[0]), source, conn.Addr{}) {
 		t.Fatal("upserted user was not activated")
 	}
 	persisted, err := flyskyapi.LoadSnapshot(snapshotPath)

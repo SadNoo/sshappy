@@ -57,6 +57,7 @@ type TCPRelay struct {
 	server                   netio.StreamServer
 	collector                stats.Collector
 	observer                 RuntimeObserver
+	sessionFactory           RuntimeSessionFactory
 	router                   *router.Router
 	logger                   *zap.Logger
 	metricsWg                sync.WaitGroup
@@ -81,6 +82,7 @@ type TCPRelay struct {
 	targetDialCompleted      atomic.Uint64
 	targetDialErrors         atomic.Uint64
 	rejectedTargetPolicy     atomic.Uint64
+	targetPolicyResolution   atomic.Uint64
 	targetDialNanos          atomic.Uint64
 	relayErrors              atomic.Uint64
 	uplinkBytes              atomic.Uint64
@@ -104,6 +106,7 @@ func NewTCPRelay(
 		server:            server,
 		collector:         collector,
 		observer:          observer,
+		sessionFactory:    runtimeSessionFactory(observer),
 		router:            router,
 		logger:            logger,
 		connections:       make(map[net.Conn]struct{}),
@@ -253,6 +256,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					zap.Uint64("targetDialAttempts", s.targetDialAttempts.Load()),
 					zap.Uint64("targetDialErrors", s.targetDialErrors.Load()),
 					zap.Uint64("rejectedTargetPolicy", s.rejectedTargetPolicy.Load()),
+					zap.Uint64("targetPolicyResolution", s.targetPolicyResolution.Load()),
 					zap.Duration("averageTargetDialLatency", averageDuration(s.targetDialNanos.Load(), s.targetDialCompleted.Load())),
 					zap.Uint64("relayErrors", s.relayErrors.Load()),
 					zap.Uint64("uplinkBytes", s.uplinkBytes.Load()),
@@ -334,9 +338,26 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		logger.Warn("Failed to clear handshake read deadline", zap.Error(err))
 		return
 	}
-	if s.observer != nil && !s.observer.Accept("tcp", req.Username, clientAddrPort, req.Addr) {
+	var runtimeSession RuntimeSession
+	if s.sessionFactory != nil {
+		var accepted bool
+		runtimeSession, accepted = s.sessionFactory.OpenRuntimeSession("tcp", req.Username, clientAddrPort, req.Addr)
+		if !accepted {
+			logger.Debug("Rejected TCP connection by runtime policy", zap.String("username", req.Username))
+			return
+		}
+		defer runtimeSession.Close()
+	} else if s.observer != nil && !s.observer.Accept("tcp", req.Username, clientAddrPort, req.Addr) {
 		logger.Debug("Rejected TCP connection by runtime policy", zap.String("username", req.Username))
 		return
+	}
+	relayCtx := ctx
+	if runtimeSession != nil {
+		var cancel context.CancelFunc
+		relayCtx, cancel = context.WithCancel(ctx)
+		stopRuntimeCancellation := context.AfterFunc(runtimeSession.Context(), cancel)
+		defer stopRuntimeCancellation()
+		defer cancel()
 	}
 	if !s.reserveUserConnection(req.Username, lnc.maxConnectionsPerUser, lnc.maxEstablishedConnections) {
 		logger.Debug("Rejected TCP connection by connection limit",
@@ -350,7 +371,9 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		return
 	}
 	defer s.releaseUserConnection(req.Username)
-	if s.observer != nil {
+	if runtimeSession != nil {
+		runtimeSession.Observe(clientAddrPort)
+	} else if s.observer != nil {
 		s.observer.Observe("tcp", req.Username, clientAddrPort)
 	}
 
@@ -358,7 +381,7 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	targetAddress := req.Addr.String()
 
 	// Route.
-	c, err := s.router.GetTCPClient(ctx, router.RequestInfo{
+	c, err := s.router.GetTCPClient(relayCtx, router.RequestInfo{
 		ServerIndex:    s.serverIndex,
 		Username:       req.Username,
 		SourceAddrPort: clientAddrPort,
@@ -445,20 +468,54 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		}
 	}
 
+	// Reserve the initial payload after the outbound target policy authorizes and
+	// pins the target, but before the first network dial. This avoids letting a
+	// denied DNS/ACL attempt temporarily starve valid sessions of shared quota.
+	var initialReservation RuntimeTrafficReservation
+	reserveInitialPayload := func() error {
+		if runtimeSession == nil || len(req.Payload) == 0 {
+			return nil
+		}
+		initialReservation = runtimeSession.ReserveTraffic(RuntimeTrafficUplink, 0, uint64(len(req.Payload)))
+		if initialReservation == nil || initialReservation.Bytes() != uint64(len(req.Payload)) {
+			if initialReservation != nil {
+				initialReservation.Refund()
+				initialReservation = nil
+			}
+			return errRuntimeTrafficRejected
+		}
+		return nil
+	}
+
 	// Create remote connection.
 	dialStartedAt := time.Now()
 	s.targetDialAttempts.Add(1)
-	remoteConn, err := dialer.DialStream(ctx, req.Addr, req.Payload)
+	var remoteConn netio.Conn
+	if policyDialer, ok := dialer.(streamDialerAfterAuthorize); ok {
+		remoteConn, err = policyDialer.dialStreamAfterAuthorize(relayCtx, req.Addr, req.Payload, reserveInitialPayload)
+	} else if err = reserveInitialPayload(); err == nil {
+		remoteConn, err = dialer.DialStream(relayCtx, req.Addr, req.Payload)
+	}
 	s.targetDialNanos.Add(uint64(time.Since(dialStartedAt)))
 	s.targetDialCompleted.Add(1)
 	if err != nil {
+		if initialReservation != nil {
+			initialReservation.Refund()
+		}
+		if errors.Is(err, errRuntimeTrafficRejected) {
+			logger.Debug("Rejected TCP initial payload by runtime quota", zap.String("username", req.Username))
+			return
+		}
 		s.targetDialErrors.Add(1)
-		if errors.Is(err, router.ErrRejected) {
-			s.rejectedTargetPolicy.Add(1)
+		if recordOutboundPolicyDrop(err, &s.rejectedTargetPolicy, &s.targetPolicyResolution) {
 			if clientConn == nil {
-				// The target is deliberately omitted from logs. Policy denials are
-				// reported only through the aggregate metric above.
-				_ = req.Abort(conn.DialResult{Code: conn.DialResultCodeEACCES})
+				// The target is deliberately omitted from logs. Policy denials and
+				// resolver failures are reported only through aggregate metrics.
+				result := conn.DialResultFromError(err)
+				if errors.Is(err, router.ErrRejected) {
+					result = conn.DialResult{Code: conn.DialResultCodeEACCES}
+				}
+				_ = req.Abort(result)
 			}
 			return
 		}
@@ -474,6 +531,10 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		}
 		return
 	}
+	if initialReservation != nil {
+		defer initialReservation.Refund()
+		initialReservation.Commit(uint64(len(req.Payload)))
+	}
 	defer remoteConn.Close()
 	if !s.registerConnection(remoteConn) {
 		return
@@ -487,18 +548,32 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 			return
 		}
 	}
+	if runtimeSession != nil {
+		stopRuntimeClose := closeConnectionsOnRuntimeEnd(runtimeSession, clientConn, remoteConn)
+		defer stopRuntimeClose()
+	}
 
 	logger.Debug("Bidirectional copy started",
 		zap.Int("initialPayloadLength", len(req.Payload)),
 	)
 
-	accounting := newTCPSessionAccounting(s, req.Username, uint64(len(req.Payload)))
+	initialUplink := uint64(len(req.Payload))
+	if runtimeSession != nil {
+		initialUplink = 0
+	}
+	accounting := newTCPSessionAccounting(s, req.Username, initialUplink, runtimeSession != nil)
 	stopAccounting := accounting.start(lnc.trafficFlushInterval)
 	defer stopAccounting()
 
 	// Count bytes only after a successful write to each side.
-	meteredClientConn := meteredTCPConn{Conn: clientConn, written: &accounting.downlink}
-	meteredRemoteConn := meteredTCPConn{Conn: remoteConn, written: &accounting.uplink}
+	meteredClientConn := meteredTCPConn{
+		Conn: clientConn, written: &accounting.downlink,
+		session: runtimeSession, direction: RuntimeTrafficDownlink,
+	}
+	meteredRemoteConn := meteredTCPConn{
+		Conn: remoteConn, written: &accounting.uplink,
+		session: runtimeSession, direction: RuntimeTrafficUplink,
+	}
 	nl2r, nr2l, err := netio.BidirectionalCopy(&meteredClientConn, &meteredRemoteConn)
 	nl2r += int64(len(req.Payload))
 	if err != nil {
@@ -519,24 +594,51 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 
 type meteredTCPConn struct {
 	netio.Conn
-	written *atomic.Uint64
+	written   *atomic.Uint64
+	session   RuntimeSession
+	direction RuntimeTrafficDirection
 }
 
 func (c *meteredTCPConn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.session == nil {
+		n, err := c.Conn.Write(p)
+		c.written.Add(uint64(n))
+		return n, err
+	}
+	reservation := c.session.ReserveTraffic(c.direction, 0, uint64(len(p)))
+	if reservation == nil || reservation.Bytes() == 0 {
+		return 0, errRuntimeTrafficRejected
+	}
+	defer reservation.Refund()
+	allowed := int(reservation.Bytes())
+	n, err := c.Conn.Write(p[:allowed])
+	if n > 0 {
+		reservation.Commit(uint64(n))
+	} else {
+		reservation.Refund()
+	}
 	c.written.Add(uint64(n))
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
 	return n, err
 }
 
+var errRuntimeTrafficRejected = errors.New("runtime session rejected traffic")
+
 type tcpSessionAccounting struct {
-	relay    *TCPRelay
-	username string
-	uplink   atomic.Uint64
-	downlink atomic.Uint64
+	relay        *TCPRelay
+	username     string
+	uplink       atomic.Uint64
+	downlink     atomic.Uint64
+	sessionAware bool
 }
 
-func newTCPSessionAccounting(relay *TCPRelay, username string, initialUplink uint64) *tcpSessionAccounting {
-	a := &tcpSessionAccounting{relay: relay, username: username}
+func newTCPSessionAccounting(relay *TCPRelay, username string, initialUplink uint64, sessionAware bool) *tcpSessionAccounting {
+	a := &tcpSessionAccounting{relay: relay, username: username, sessionAware: sessionAware}
 	a.uplink.Store(initialUplink)
 	return a
 }
@@ -571,7 +673,9 @@ func (a *tcpSessionAccounting) flush() {
 	}
 	a.relay.uplinkBytes.Add(uplink)
 	a.relay.downlinkBytes.Add(downlink)
-	a.relay.collector.CollectTCPSession(a.username, downlink, uplink)
+	if !a.sessionAware {
+		a.relay.collector.CollectTCPSession(a.username, downlink, uplink)
+	}
 }
 
 func (s *TCPRelay) registerConnection(connection net.Conn) bool {

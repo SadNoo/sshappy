@@ -42,6 +42,7 @@ type Config struct {
 	TCPMaxConnectionsPerUser int
 	TCPMaxEstablishedTotal   int
 	TCPTrafficFlushInterval  time.Duration
+	ShutdownDrainTimeout     time.Duration
 	loadError                error
 }
 
@@ -82,6 +83,7 @@ func LoadConfig() Config {
 		TCPMaxConnectionsPerUser: envInt("TCP_MAX_CONNECTIONS_PER_USER", 800),
 		TCPMaxEstablishedTotal:   envInt("TCP_MAX_ESTABLISHED_TOTAL", 0),
 		TCPTrafficFlushInterval:  envDurationSeconds("TCP_TRAFFIC_FLUSH_SECONDS", 30),
+		ShutdownDrainTimeout:     envDurationSeconds("FLYSKY_SHUTDOWN_DRAIN_SECONDS", 30),
 		loadError: errors.Join(
 			tcpErr, udpErr, udpOuterFragmentationErr, httpErr, protectedEgressPrefixesErr,
 		),
@@ -135,6 +137,8 @@ func (config Config) Validate() error {
 		return errors.New("TCP_MAX_ESTABLISHED_TOTAL must not be negative")
 	case config.EnableTCP && config.TCPTrafficFlushInterval < time.Second:
 		return errors.New("TCP_TRAFFIC_FLUSH_SECONDS must be positive")
+	case config.ShutdownDrainTimeout < time.Second || config.ShutdownDrainTimeout > 2*time.Minute:
+		return errors.New("FLYSKY_SHUTDOWN_DRAIN_SECONDS must be between 1 and 120")
 	}
 
 	paths := []string{

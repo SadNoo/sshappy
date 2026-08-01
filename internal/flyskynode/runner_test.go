@@ -14,6 +14,8 @@ import (
 	"github.com/database64128/shadowsocks-go/internal/flyskyapi"
 	"github.com/database64128/shadowsocks-go/service"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type enrollmentClientStub struct {
@@ -117,6 +119,127 @@ func TestServerListenAddressSupportsIPv4AndIPv6(t *testing.T) {
 	}
 }
 
+func TestWaitForManagerDrainIsBounded(t *testing.T) {
+	t.Parallel()
+	result := make(chan bool, 1)
+	started := time.Now()
+	if ok, err := waitForManagerDrain(result, 20*time.Millisecond); ok || !errors.Is(err, ErrRuntimeDrainTimeout) {
+		t.Fatalf("waitForManagerDrain() = %v, %v", ok, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded drain took %s", elapsed)
+	}
+	// The buffered production channel remains safe if the manager finishes
+	// after the supervisor has already returned on timeout.
+	result <- true
+}
+
+func TestWaitForManagerDrainReturnsManagerResult(t *testing.T) {
+	t.Parallel()
+	result := make(chan bool, 1)
+	result <- true
+	ok, err := waitForManagerDrain(result, time.Second)
+	if err != nil || !ok {
+		t.Fatalf("waitForManagerDrain() = %v, %v", ok, err)
+	}
+}
+
+func TestShutdownRuntimeOrdersDrainBeforeDurableCaptureAndFlush(t *testing.T) {
+	t.Parallel()
+	var steps []string
+	captureErr := errors.New("capture failed")
+	result := shutdownRuntime(
+		func() { steps = append(steps, "cancel") },
+		func() (bool, error) { steps = append(steps, "drain"); return true, nil },
+		func() { steps = append(steps, "close") },
+		func() error { steps = append(steps, "capture"); return captureErr },
+		func() error { steps = append(steps, "flush"); return nil },
+	)
+	if got, want := strings.Join(steps, ","), "cancel,drain,close,capture,flush"; got != want {
+		t.Fatalf("shutdown order = %s, want %s", got, want)
+	}
+	if !result.managerOK || result.drainErr != nil || !errors.Is(result.captureErr, captureErr) || result.flushErr != nil {
+		t.Fatalf("shutdown result = %+v", result)
+	}
+}
+
+func TestShutdownRuntimeStillCapturesAfterBoundedDrainTimeout(t *testing.T) {
+	t.Parallel()
+	var captured, flushed bool
+	result := shutdownRuntime(
+		func() {},
+		func() (bool, error) { return false, ErrRuntimeDrainTimeout },
+		func() {},
+		func() error { captured = true; return nil },
+		func() error { flushed = true; return nil },
+	)
+	if !errors.Is(result.drainErr, ErrRuntimeDrainTimeout) || !captured || !flushed {
+		t.Fatalf("timeout shutdown result=%+v captured=%v flushed=%v", result, captured, flushed)
+	}
+}
+
+func TestCaptureUsageReportPropagatesPersistenceFailureAndRestoresTraffic(t *testing.T) {
+	t.Parallel()
+	outbox, err := newReportOutbox(filepath.Join(t.TempDir(), "reports.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistErr := errors.New("fsync failed")
+	outbox.write = func(string, []byte) error { return persistErr }
+	state := NewState()
+	state.AddTraffic(reportTestUserID(0), 1, 7, 11)
+	windowStart := time.Now().UTC().Add(-time.Minute)
+	originalWindowStart := windowStart
+	applied := AppliedSnapshot{Wire: flyskyapi.Snapshot{
+		ConfigVersion: "config-42",
+		Node:          flyskyapi.SnapshotNode{NodeID: reportTestNodeID},
+	}}
+	if err := captureUsageReport(state, outbox, applied, &windowStart, zap.NewNop()); !errors.Is(err, persistErr) {
+		t.Fatalf("captureUsageReport() error = %v", err)
+	}
+	if !windowStart.Equal(originalWindowStart) {
+		t.Fatalf("window start advanced after failed capture: %s", windowStart)
+	}
+	deltas := state.SnapshotTraffic()
+	if len(deltas) != 1 || deltas[0].UploadBytes != 7 || deltas[0].DownloadBytes != 11 {
+		t.Fatalf("traffic was not restored after failed capture: %+v", deltas)
+	}
+}
+
+func TestCaptureAliveIPReportPropagatesPersistenceFailure(t *testing.T) {
+	t.Parallel()
+	outbox, err := newReportOutbox(filepath.Join(t.TempDir(), "reports.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistErr := errors.New("fsync failed")
+	outbox.write = func(string, []byte) error { return persistErr }
+	applied := AppliedSnapshot{Wire: flyskyapi.Snapshot{
+		Node: flyskyapi.SnapshotNode{NodeID: reportTestNodeID},
+	}}
+	if err := captureAliveIPReport(NewState(), outbox, applied, time.Minute, zap.NewNop()); !errors.Is(err, persistErr) {
+		t.Fatalf("captureAliveIPReport() error = %v", err)
+	}
+}
+
+func TestLogReportFlushFailureIncludesReconciliationCounts(t *testing.T) {
+	t.Parallel()
+	core, observed := observer.New(zapcore.WarnLevel)
+	outbox := &reportOutbox{state: persistedReportOutbox{
+		UsageReports:          make([]flyskyapi.UsageReport, 1),
+		AliveIPReports:        make([]flyskyapi.AliveIPReport, 2),
+		UsageReconciliation:   make([]usageReportReconciliation, 3),
+		AliveIPReconciliation: make([]aliveIPReportReconciliation, 4),
+	}}
+	logReportFlushFailure(zap.New(core), "flush failed", outbox, errors.New("boom"))
+	if observed.FilterField(zap.Int("usagePending", 1)).Len() != 1 ||
+		observed.FilterField(zap.Int("aliveIPPending", 2)).Len() != 1 ||
+		observed.FilterField(zap.Int("usageReconciliation", 3)).Len() != 1 ||
+		observed.FilterField(zap.Int("aliveIPReconciliation", 4)).Len() != 1 {
+		t.Fatalf("flush log fields = %+v", observed.All())
+	}
+}
+
 func TestOuterUDPPathMTUDiscovery(t *testing.T) {
 	t.Parallel()
 
@@ -134,6 +257,7 @@ func TestValidateCapabilities(t *testing.T) {
 	config := testConfig(t)
 	capabilities := flyskyapi.Capabilities{
 		APIVersion: "v1", SchemaVersions: []int{1},
+		Limits: flyskyapi.CapabilitiesLimits{UsageReportMaxItems: 10000, UsageReportMaxBytes: 4 << 20},
 		Features: []string{
 			"snapshot_v1", "cursor_changes_v1", "status_report_v1", "usage_batch_v1", "alive_ip_aggregate_v1",
 		},
@@ -147,6 +271,21 @@ func TestValidateCapabilities(t *testing.T) {
 	capabilities.Protocols["ss2022"] = flyskyapi.ProtocolCapability{Methods: []string{method}, TCP: true}
 	if err := validateCapabilities(capabilities, config); err == nil {
 		t.Fatal("incompatible capabilities were accepted")
+	}
+}
+
+func TestUsageLimitsFromCapabilities(t *testing.T) {
+	t.Parallel()
+	capabilities := flyskyapi.Capabilities{Limits: flyskyapi.CapabilitiesLimits{
+		UsageReportMaxItems: 2, UsageReportMaxBytes: 4096,
+	}}
+	limits, err := usageLimitsFromCapabilities(capabilities)
+	if err != nil || limits.MaxItems != 2 || limits.MaxEncodedBytes != 4096 {
+		t.Fatalf("usageLimitsFromCapabilities() = %+v, %v", limits, err)
+	}
+	capabilities.Limits.UsageReportMaxItems = 0
+	if _, err := usageLimitsFromCapabilities(capabilities); err == nil {
+		t.Fatal("zero negotiated item limit was accepted")
 	}
 }
 
@@ -190,7 +329,7 @@ func TestManagedServerAtomicallyReloadsUUIDCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	if credentials := managed.Credentials(); len(credentials) != 1 || credentials[0].Name != initial.Users[0].UserID {
+	if credentials := managed.Credentials(); len(credentials) != 1 || credentials[0].Name != credentialLabel(applied.Users[0]) {
 		t.Fatalf("initial managed credentials = %+v", credentials)
 	}
 	syncer.SetCredentialReloader(managed)
@@ -198,7 +337,11 @@ func TestManagedServerAtomicallyReloadsUUIDCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	credentials := managed.Credentials()
-	if len(credentials) != 1 || credentials[0].Name != user2 || !bytes.Equal(credentials[0].UPSK, bytes.Repeat([]byte{0x33}, keyLen)) {
+	updated, ok := syncer.Current()
+	if !ok {
+		t.Fatal("updated snapshot is unavailable")
+	}
+	if len(credentials) != 1 || credentials[0].Name != credentialLabel(updated.Users[0]) || !bytes.Equal(credentials[0].UPSK, bytes.Repeat([]byte{0x33}, keyLen)) {
 		t.Fatalf("reloaded managed credentials = %+v", credentials)
 	}
 }

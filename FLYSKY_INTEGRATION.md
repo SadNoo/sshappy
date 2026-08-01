@@ -68,11 +68,12 @@
 | `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |
 | `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
 | `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
-| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 必填的逗号分隔禁止出口 IP/CIDR；至少包含节点实际公网地址，单个 IPv4 会规范为 `/32`。缺失或格式错误时节点拒绝启动，防止用户经代理回连节点自身 |
+| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 必填的逗号分隔禁止出口 IP/CIDR；必须包含节点实际公网地址，以及任何专用 Panel origin 地址，单个 IPv4 会规范为 `/32`。缺失或格式错误时节点拒绝启动，防止用户经代理回连节点自身；不要加入 Cloudflare 共享 Anycast 网段 |
 | `FLYSKY_CHANGE_POLL_SECONDS` | 增量同步周期 |
 | `FLYSKY_HEARTBEAT_SECONDS` | 状态心跳周期 |
 | `FLYSKY_USAGE_REPORT_SECONDS` | 流量落盘与上报周期，默认 30 秒 |
 | `FLYSKY_ALIVE_IP_REPORT_SECONDS` | 在线 IP 汇总周期，默认 60 秒 |
+| `FLYSKY_SHUTDOWN_DRAIN_SECONDS` | 关机时等待会话完成最终计费的上限，默认 30 秒，允许 1–120 秒 |
 
 原先的 `FLYSKY_INTEGRATION_MODE` 临时未计费 Gate 已移除。Flysky 路径现在必须成功打开持久 Outbox 才能启动；损坏、权限过宽或无法读取的 Outbox 会阻止启动，不能静默丢弃待计费数据。`FLYSKY_ALLOW_INSECURE_HTTP=true` 只允许本机回环联调，远程控制面始终要求 HTTPS。
 
@@ -87,7 +88,9 @@
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
-先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 的占位符替换为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。这是所有部署的必填项；可同时填写多个 IP/CIDR并以英文逗号分隔。缺失或格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
+先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 的占位符替换为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。这是所有部署的必填项；如果 Panel 有不与其他站点共享的专用 origin IP，也必须一并填写，并以英文逗号分隔。缺失或格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
+
+控制面使用 Cloudflare 代理时，节点只自动拒绝 `FLYSKY_CONTROL_PLANE_URL` 中的精确主机名。Cloudflare 的公网 A/Anycast 地址由大量无关站点共享，因此不能把整段共享地址加入禁止出口网段，否则会误伤正常代理目标。若需要防止用户绕过主机名直连 Panel，请为 Panel origin 保留专用公网地址并加入 `FLYSKY_PROTECTED_EGRESS_PREFIXES`；没有专用 origin 时，这项共享 Anycast 风险必须作为部署取舍明确记录，不能用全局封禁 Cloudflare 地址替代。
 
 ~~~bash
 install -d -m 0700 /var/lib/flysky/ssbad /etc/flysky/ssbad/secrets

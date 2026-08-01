@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -57,6 +59,34 @@ func (e *APIError) Error() string {
 		code = "HTTP_ERROR"
 	}
 	return fmt.Sprintf("flysky node API: status %d (%s)", e.StatusCode, code)
+}
+
+// RetryDelay parses Retry-After using either delta-seconds or an HTTP date.
+// A date in the past is treated as an immediate retry. The boolean result is
+// false when the server did not provide a valid Retry-After value.
+func (e *APIError) RetryDelay(now time.Time) (time.Duration, bool) {
+	if e == nil {
+		return 0, false
+	}
+	value := strings.TrimSpace(e.RetryAfter)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds < 0 || seconds > int64(math.MaxInt64)/int64(time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
 }
 
 func NewClient(config Config) (*Client, error) {
@@ -230,6 +260,7 @@ func decodeAPIError(response *http.Response, data []byte) error {
 	apiErr := &APIError{
 		StatusCode: response.StatusCode,
 		Code:       http.StatusText(response.StatusCode),
+		Retryable:  retryableHTTPStatus(response.StatusCode),
 		RetryAfter: response.Header.Get("Retry-After"),
 	}
 	var envelope errorEnvelope
@@ -237,10 +268,15 @@ func decodeAPIError(response *http.Response, data []byte) error {
 		if strings.TrimSpace(envelope.Error.Code) != "" {
 			apiErr.Code = envelope.Error.Code
 		}
-		apiErr.Retryable = envelope.Error.Retryable
+		apiErr.Retryable = apiErr.Retryable || envelope.Error.Retryable
 		apiErr.RequestID = envelope.Meta.RequestID
 	}
 	return apiErr
+}
+
+func retryableHTTPStatus(statusCode int) bool {
+	return statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooEarly ||
+		statusCode == http.StatusTooManyRequests || statusCode >= 500 && statusCode <= 599
 }
 
 func validateBaseURL(baseURL *url.URL, allowInsecureHTTP bool) error {

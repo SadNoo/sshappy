@@ -2,20 +2,30 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/netip"
-	"sync"
+	"strings"
+	"sync/atomic"
 
 	"github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/netio"
+	"github.com/database64128/shadowsocks-go/router"
 	"github.com/database64128/shadowsocks-go/zerocopy"
 )
 
+// ErrOutboundPolicyResolution classifies resolver failures raised while an
+// outbound target policy is pinning a domain to authorized IP candidates.
+// Relays account for this error in aggregate instead of logging a user and
+// target for every failed TCP attempt or UDP packet.
+var ErrOutboundPolicyResolution = errors.New("outbound target policy resolution failed")
+
 // OutboundTargetPolicy resolves and authorizes an outbound target before the
-// target is handed to a direct network client. Implementations must return an
-// IP target so the authorization decision and the subsequent dial/send cannot
-// be separated by another DNS lookup.
+// target is handed to a direct network client. Implementations must return
+// only IP targets so the authorization decision and the subsequent dial/send
+// cannot be separated by another DNS lookup. A domain can yield more than one
+// candidate; each returned address must have been checked independently.
 type OutboundTargetPolicy interface {
-	ResolveAndAuthorize(context.Context, conn.Addr) (conn.Addr, error)
+	ResolveAndAuthorize(context.Context, conn.Addr) ([]conn.Addr, error)
 }
 
 type policyStreamClient struct {
@@ -45,11 +55,52 @@ type policyStreamDialer struct {
 }
 
 func (d *policyStreamDialer) DialStream(ctx context.Context, target conn.Addr, payload []byte) (netio.Conn, error) {
-	resolved, err := d.policy.ResolveAndAuthorize(ctx, target)
+	return d.dialStreamAfterAuthorize(ctx, target, payload, nil)
+}
+
+// dialStreamAfterAuthorize lets the authenticated relay reserve quota only
+// after DNS pinning and the outbound ACL have accepted the target. A denied or
+// unresolved target therefore never temporarily consumes a user's shared
+// allowance while another legitimate connection is trying to reserve it.
+func (d *policyStreamDialer) dialStreamAfterAuthorize(
+	ctx context.Context,
+	target conn.Addr,
+	payload []byte,
+	afterAuthorize func() error,
+) (netio.Conn, error) {
+	candidates, err := d.policy.ResolveAndAuthorize(ctx, canonicalOutboundTarget(target))
 	if err != nil {
 		return nil, err
 	}
-	return d.inner.DialStream(ctx, resolved, payload)
+	if len(candidates) == 0 {
+		return nil, ErrOutboundPolicyResolution
+	}
+	if afterAuthorize != nil {
+		if err := afterAuthorize(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Keep resolver order and try every independently authorized, already
+	// pinned IP. A blocked or unreachable first A record must not prevent a
+	// later public address from being used, and the direct dialer never sees the
+	// original hostname (so it cannot perform a second lookup).
+	var lastErr error
+	for _, candidate := range candidates {
+		remoteConn, dialErr := d.inner.DialStream(ctx, candidate, payload)
+		if dialErr == nil {
+			return remoteConn, nil
+		}
+		lastErr = dialErr
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
+type streamDialerAfterAuthorize interface {
+	dialStreamAfterAuthorize(context.Context, conn.Addr, []byte, func() error) (netio.Conn, error)
 }
 
 type policyUDPClient struct {
@@ -77,17 +128,14 @@ func (c *policyUDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSes
 	return info, session, nil
 }
 
-// policyClientPacker pins the most recently used domain to the authorized IP
-// for the lifetime of this UDP client session. Other domains are always
-// resolved and checked again; an authorization decision is never followed by
-// a second resolver lookup in the direct packet packer.
+// policyClientPacker passes only authorized IP targets to the direct packet
+// packer. DNS caching and lookup de-duplication belong to the policy because a
+// policy instance is shared by sessions. The packer deliberately uses the
+// first candidate throughout one positive-cache generation: rotating the
+// remote IP per packet would change the 5-tuple and break QUIC/UDP sessions.
 type policyClientPacker struct {
 	inner  zerocopy.ClientPacker
 	policy OutboundTargetPolicy
-
-	mu             sync.Mutex
-	cachedDomain   string
-	cachedIPTarget conn.Addr
 }
 
 func (p *policyClientPacker) ClientPackerInfo() zerocopy.ClientPackerInfo {
@@ -108,27 +156,37 @@ func (p *policyClientPacker) PackInPlace(
 }
 
 func (p *policyClientPacker) resolveAndAuthorize(ctx context.Context, target conn.Addr) (conn.Addr, error) {
-	if !target.IsDomain() {
-		return p.policy.ResolveAndAuthorize(ctx, target)
-	}
-
-	domain := target.Domain()
-	p.mu.Lock()
-	if domain == p.cachedDomain {
-		cached := p.cachedIPTarget
-		p.mu.Unlock()
-		return conn.AddrFromIPAndPort(cached.IP(), target.Port()), nil
-	}
-	p.mu.Unlock()
-
-	resolved, err := p.policy.ResolveAndAuthorize(ctx, target)
+	candidates, err := p.policy.ResolveAndAuthorize(ctx, canonicalOutboundTarget(target))
 	if err != nil {
 		return conn.Addr{}, err
 	}
+	if len(candidates) == 0 {
+		return conn.Addr{}, ErrOutboundPolicyResolution
+	}
+	return candidates[0], nil
+}
 
-	p.mu.Lock()
-	p.cachedDomain = domain
-	p.cachedIPTarget = resolved
-	p.mu.Unlock()
-	return resolved, nil
+func canonicalOutboundTarget(target conn.Addr) conn.Addr {
+	if !target.IsDomain() {
+		return target
+	}
+	domain := strings.ToLower(strings.TrimRight(strings.TrimSpace(target.Domain()), "."))
+	canonical, err := conn.AddrFromDomainPort(domain, target.Port())
+	if err != nil {
+		return conn.Addr{}
+	}
+	return canonical
+}
+
+func recordOutboundPolicyDrop(err error, denied, resolution *atomic.Uint64) bool {
+	switch {
+	case errors.Is(err, router.ErrRejected):
+		denied.Add(1)
+		return true
+	case errors.Is(err, ErrOutboundPolicyResolution):
+		resolution.Add(1)
+		return true
+	default:
+		return false
+	}
 }

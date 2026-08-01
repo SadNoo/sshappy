@@ -3,12 +3,18 @@ package flyskynode
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/database64128/shadowsocks-go/conn"
 	"github.com/database64128/shadowsocks-go/router"
+	"github.com/database64128/shadowsocks-go/service"
 )
 
 type staticIPResolver struct {
@@ -89,7 +95,7 @@ func TestOutboundACLIPv4DefaultPolicy(t *testing.T) {
 				if err != nil {
 					t.Fatalf("allowed target rejected: %v", err)
 				}
-				if !resolved.IsIP() || resolved.IP() != target.IP() {
+				if len(resolved) != 1 || !resolved[0].IsIP() || resolved[0].IP() != target.IP() {
 					t.Fatalf("resolved target = %v, want %v", resolved, target)
 				}
 				return
@@ -135,7 +141,7 @@ func TestOutboundACLProtectsControlPlaneLocalAndInjectedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allowed domain rejected: %v", err)
 	}
-	if !resolved.IsIP() || resolved.IP() != netip.MustParseAddr("8.8.4.4") {
+	if len(resolved) != 1 || !resolved[0].IsIP() || resolved[0].IP() != netip.MustParseAddr("8.8.4.4") {
 		t.Fatalf("allowed domain resolved to %v", resolved)
 	}
 }
@@ -156,7 +162,36 @@ func TestOutboundACLProtectsLiteralControlPlane(t *testing.T) {
 	}
 }
 
+func TestOutboundACLBlocksExactControlHostWithoutBlockingSharedAnycastIP(t *testing.T) {
+	sharedAnycast := netip.MustParseAddr("104.16.0.1")
+	resolver := &staticIPResolver{answers: map[string][][]netip.Addr{
+		"unrelated.example": {{sharedAnycast}},
+	}}
+	acl := newTestOutboundACL(t, resolver)
+
+	if _, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort("PANEL.EXAMPLE.", 443)); !errors.Is(err, router.ErrRejected) {
+		t.Fatalf("exact control hostname error = %v, want ErrRejected", err)
+	}
+	candidates, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort("unrelated.example", 443))
+	if err != nil || len(candidates) != 1 || candidates[0].IP() != sharedAnycast {
+		t.Fatalf("unrelated shared-Anycast target = %v, %v", candidates, err)
+	}
+}
+
+func TestOutboundACLRequiresDedicatedPanelOriginInProtectedPrefixes(t *testing.T) {
+	dedicatedOrigin := netip.MustParseAddr("93.184.216.34")
+	resolver := &staticIPResolver{answers: map[string][][]netip.Addr{
+		"origin.example": {{dedicatedOrigin}},
+	}}
+	acl := newTestOutboundACL(t, resolver, netip.PrefixFrom(dedicatedOrigin, 32))
+
+	if _, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort("origin.example", 443)); !errors.Is(err, router.ErrRejected) {
+		t.Fatalf("dedicated Panel origin error = %v, want ErrRejected", err)
+	}
+}
+
 func TestOutboundACLPinsEachCheckedDNSAnswer(t *testing.T) {
+	now := time.Unix(1_000, 0)
 	resolver := &staticIPResolver{answers: map[string][][]netip.Addr{
 		"rebind.example": {
 			{netip.MustParseAddr("8.8.8.8")},
@@ -164,17 +199,186 @@ func TestOutboundACLPinsEachCheckedDNSAnswer(t *testing.T) {
 		},
 	}}
 	acl := newTestOutboundACL(t, resolver)
+	acl.now = func() time.Time { return now }
 	target := conn.MustAddrFromDomainPort("rebind.example", 443)
 
 	first, err := acl.ResolveAndAuthorize(t.Context(), target)
 	if err != nil {
 		t.Fatalf("first lookup: %v", err)
 	}
-	if !first.IsIP() || first.IP() != netip.MustParseAddr("8.8.8.8") {
+	if len(first) != 1 || !first[0].IsIP() || first[0].IP() != netip.MustParseAddr("8.8.8.8") {
 		t.Fatalf("first lookup was not pinned to checked IP: %v", first)
 	}
+	second, err := acl.ResolveAndAuthorize(t.Context(), target)
+	if err != nil || len(second) != 1 || second[0].IP() != netip.MustParseAddr("8.8.8.8") {
+		t.Fatalf("positive cache did not pin first answer: %v, %v", second, err)
+	}
+	if resolver.calls["rebind.example"] != 1 {
+		t.Fatalf("resolver calls within positive TTL = %d, want 1", resolver.calls["rebind.example"])
+	}
+
+	now = now.Add(outboundDNSPositiveTTL + time.Nanosecond)
 	if _, err := acl.ResolveAndAuthorize(t.Context(), target); !errors.Is(err, router.ErrRejected) {
-		t.Fatalf("rebound private answer error = %v, want ErrRejected", err)
+		t.Fatalf("rebound private answer after TTL error = %v, want ErrRejected", err)
+	}
+	if resolver.calls["rebind.example"] != 2 {
+		t.Fatalf("resolver calls after positive TTL = %d, want 2", resolver.calls["rebind.example"])
+	}
+}
+
+func TestOutboundACLChecksAllDNSAnswersAndKeepsAllowedOrder(t *testing.T) {
+	resolver := &staticIPResolver{answers: map[string][][]netip.Addr{
+		"multi.example": {{
+			netip.MustParseAddr("10.0.0.1"),
+			netip.MustParseAddr("8.8.8.8"),
+			netip.MustParseAddr("8.8.8.8"),
+			netip.MustParseAddr("1.1.1.1"),
+		}},
+	}}
+	acl := newTestOutboundACL(t, resolver)
+	candidates, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort("multi.example", 443))
+	if err != nil {
+		t.Fatalf("mixed DNS answers rejected: %v", err)
+	}
+	if len(candidates) != 2 || candidates[0].IP() != netip.MustParseAddr("8.8.8.8") || candidates[1].IP() != netip.MustParseAddr("1.1.1.1") {
+		t.Fatalf("authorized candidates = %v", candidates)
+	}
+}
+
+func TestOutboundACLRefreshesPinnedAllowedCandidateAfterTTL(t *testing.T) {
+	now := time.Unix(1_500, 0)
+	resolver := &staticIPResolver{answers: map[string][][]netip.Addr{
+		"rotate.example": {
+			{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("1.1.1.1")},
+			{netip.MustParseAddr("9.9.9.9"), netip.MustParseAddr("1.0.0.1")},
+		},
+	}}
+	acl := newTestOutboundACL(t, resolver)
+	acl.now = func() time.Time { return now }
+	target := conn.MustAddrFromDomainPort("rotate.example", 443)
+
+	first, err := acl.ResolveAndAuthorize(t.Context(), target)
+	if err != nil || len(first) != 2 || first[0].IP() != netip.MustParseAddr("8.8.8.8") {
+		t.Fatalf("first cache generation = %v, %v", first, err)
+	}
+	now = now.Add(outboundDNSPositiveTTL + time.Nanosecond)
+	second, err := acl.ResolveAndAuthorize(t.Context(), target)
+	if err != nil || len(second) != 2 || second[0].IP() != netip.MustParseAddr("9.9.9.9") {
+		t.Fatalf("refreshed cache generation = %v, %v", second, err)
+	}
+}
+
+type resolverFunc func(context.Context, string, string) ([]netip.Addr, error)
+
+func (f resolverFunc) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return f(ctx, network, host)
+}
+
+func TestOutboundACLCanonicalizesAndNegativeCachesDNSFailures(t *testing.T) {
+	now := time.Unix(2_000, 0)
+	var calls atomic.Int64
+	var badResolverInput atomic.Bool
+	acl := newTestOutboundACL(t, resolverFunc(func(_ context.Context, network, host string) ([]netip.Addr, error) {
+		if network != "ip4" || host != "missing.example" {
+			badResolverInput.Store(true)
+			return nil, errors.New("unexpected resolver input")
+		}
+		calls.Add(1)
+		return nil, errors.New("host-specific resolver detail must not escape")
+	}))
+	acl.now = func() time.Time { return now }
+
+	for _, domain := range []string{"Missing.Example.", "missing.example", "MISSING.EXAMPLE.."} {
+		_, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort(domain, 53))
+		if !errors.Is(err, service.ErrOutboundPolicyResolution) {
+			t.Fatalf("domain %q error = %v, want aggregate resolution error", domain, err)
+		}
+		if strings.Contains(err.Error(), "host-specific") || strings.Contains(err.Error(), domain) {
+			t.Fatalf("resolver detail leaked through policy error: %v", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("resolver calls within negative TTL = %d, want 1", calls.Load())
+	}
+	if badResolverInput.Load() {
+		t.Fatal("resolver did not receive the canonical hostname and ip4 network")
+	}
+
+	now = now.Add(outboundDNSNegativeTTL + time.Nanosecond)
+	_, _ = acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort("missing.example", 53))
+	if calls.Load() != 2 {
+		t.Fatalf("resolver calls after negative TTL = %d, want 2", calls.Load())
+	}
+}
+
+func TestOutboundACLDeduplicatesConcurrentCanonicalLookups(t *testing.T) {
+	var calls atomic.Int64
+	var badResolverHost atomic.Bool
+	started := make(chan struct{})
+	release := make(chan struct{})
+	acl := newTestOutboundACL(t, resolverFunc(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "singleflight.example" {
+			badResolverHost.Store(true)
+			return nil, errors.New("unexpected resolver host")
+		}
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}))
+
+	const workers = 32
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(index int) {
+			defer wg.Done()
+			domain := "singleflight.example"
+			if index%2 == 0 {
+				domain = "SINGLEFLIGHT.EXAMPLE."
+			}
+			_, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort(domain, 443))
+			errs <- err
+		}(i)
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent lookup failed: %v", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("concurrent resolver calls = %d, want 1", calls.Load())
+	}
+	if badResolverHost.Load() {
+		t.Fatal("concurrent lookup did not use the canonical hostname")
+	}
+}
+
+func TestOutboundACLDNSCacheIsBounded(t *testing.T) {
+	acl := newTestOutboundACL(t, resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+	}))
+	for index := 0; index < outboundDNSCacheMax+64; index++ {
+		domain := fmt.Sprintf("host-%d.example", index)
+		if _, err := acl.ResolveAndAuthorize(t.Context(), conn.MustAddrFromDomainPort(domain, 443)); err != nil {
+			t.Fatalf("resolve %s: %v", domain, err)
+		}
+	}
+	acl.dnsMu.Lock()
+	cacheSize := len(acl.dnsCache)
+	acl.dnsMu.Unlock()
+	if cacheSize > outboundDNSCacheMax {
+		t.Fatalf("DNS cache size = %d, max %d", cacheSize, outboundDNSCacheMax)
 	}
 }
 

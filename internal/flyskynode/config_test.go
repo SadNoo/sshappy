@@ -88,6 +88,18 @@ func TestConfigRejectsInvalidProtectedEgressPrefixValue(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsUnboundedShutdownDrain(t *testing.T) {
+	config := testConfig(t)
+	config.ShutdownDrainTimeout = 0
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "FLYSKY_SHUTDOWN_DRAIN_SECONDS") {
+		t.Fatalf("zero shutdown drain error = %v", err)
+	}
+	config.ShutdownDrainTimeout = 121 * time.Second
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "FLYSKY_SHUTDOWN_DRAIN_SECONDS") {
+		t.Fatalf("oversized shutdown drain error = %v", err)
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -111,5 +123,6 @@ func testConfig(t *testing.T) Config {
 		UDPNATTimeout: time.Minute, UDPMaxSessions: 2048, UDPMaxSessionsPerUser: 128,
 		TCPMaxHandshakes: 1024, TCPMaxConnectionsPerUser: 800,
 		TCPTrafficFlushInterval: 30 * time.Second,
+		ShutdownDrainTimeout:    30 * time.Second,
 	}
 }

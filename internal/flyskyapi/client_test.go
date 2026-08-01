@@ -210,6 +210,64 @@ func TestClientMarksExpiredCursor(t *testing.T) {
 	}
 }
 
+func TestAPIErrorRetryClassificationAndRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 1, 2, 3, 4, 0, time.UTC)
+	tests := []struct {
+		name       string
+		statusCode int
+		retryAfter string
+		body       string
+		wantRetry  bool
+		wantDelay  time.Duration
+		wantParsed bool
+	}{
+		{
+			name: "server error without usable envelope", statusCode: http.StatusInternalServerError,
+			body: `not-json`, wantRetry: true,
+		},
+		{
+			name: "rate limited delta seconds", statusCode: http.StatusTooManyRequests,
+			retryAfter: "120", body: `{"ok":false,"error":{"code":"RATE_LIMITED","retryable":false}}`,
+			wantRetry: true, wantDelay: 2 * time.Minute, wantParsed: true,
+		},
+		{
+			name: "rate limited HTTP date", statusCode: http.StatusTooManyRequests,
+			retryAfter: now.Add(90 * time.Second).Format(http.TimeFormat), body: `{}`,
+			wantRetry: true, wantDelay: 90 * time.Second, wantParsed: true,
+		},
+		{
+			name: "permanent validation", statusCode: http.StatusUnprocessableEntity,
+			body: `{"ok":false,"error":{"code":"VALIDATION_FAILED","retryable":false}}`,
+		},
+		{
+			name: "server declared retryable", statusCode: http.StatusConflict,
+			body: `{"ok":false,"error":{"code":"TEMPORARY_CONFLICT","retryable":true}}`, wantRetry: true,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			response := &http.Response{StatusCode: test.statusCode, Header: make(http.Header)}
+			response.Header.Set("Retry-After", test.retryAfter)
+			var apiErr *APIError
+			if err := decodeAPIError(response, []byte(test.body)); !errors.As(err, &apiErr) {
+				t.Fatalf("decodeAPIError() = %T %v", err, err)
+			}
+			if apiErr.Retryable != test.wantRetry {
+				t.Fatalf("Retryable = %v, want %v", apiErr.Retryable, test.wantRetry)
+			}
+			delay, parsed := apiErr.RetryDelay(now)
+			if parsed != test.wantParsed || delay != test.wantDelay {
+				t.Fatalf("RetryDelay() = %v, %v; want %v, %v", delay, parsed, test.wantDelay, test.wantParsed)
+			}
+		})
+	}
+}
+
 func TestClientDoesNotFollowAuthenticationRedirect(t *testing.T) {
 	t.Parallel()
 
