@@ -19,17 +19,17 @@ func TestRuntimePolicyAndTraffic(t *testing.T) {
 		DisconnectIP:  "198.51.100.9",
 	}})
 	source := netip.MustParseAddrPort("198.51.100.10:12345")
-	if !runtime.Accept("udp", "7", source, conn.AddrFromIPPort(netip.MustParseAddrPort("203.0.113.1:443"))) {
+	if !runtime.Accept("udp", "7", source, conn.AddrFromIPPort(netip.MustParseAddrPort("203.0.113.1:1023"))) {
 		t.Fatal("allowed packet was rejected")
 	}
 	runtime.Observe("udp", "7", source)
-	if runtime.Accept("tcp", "7", source, conn.AddrFromIPPort(netip.MustParseAddrPort("192.0.2.1:443"))) {
+	if runtime.Accept("tcp", "7", source, conn.AddrFromIPPort(netip.MustParseAddrPort("192.0.2.1:1023"))) {
 		t.Fatal("forbidden IP was accepted")
 	}
 	if runtime.Accept("tcp", "7", source, conn.AddrFromIPPort(netip.MustParseAddrPort("203.0.113.1:25"))) {
 		t.Fatal("forbidden port was accepted")
 	}
-	if runtime.Accept("tcp", "7", netip.MustParseAddrPort("198.51.100.9:12345"), conn.AddrFromIPPort(netip.MustParseAddrPort("203.0.113.1:443"))) {
+	if runtime.Accept("tcp", "7", netip.MustParseAddrPort("198.51.100.9:12345"), conn.AddrFromIPPort(netip.MustParseAddrPort("203.0.113.1:1023"))) {
 		t.Fatal("disconnected source IP was accepted")
 	}
 

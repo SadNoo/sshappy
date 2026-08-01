@@ -288,7 +288,7 @@ func TestFinalTrafficReturnsPostCommitPersistenceFailure(t *testing.T) {
 	}
 }
 
-func TestReportTrafficDrainsPendingBeforeSnapshot(t *testing.T) {
+func TestReportTrafficPersistsNewTrafficAfterBacklogFlushFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
 	reporter, err := newTrafficReporter(path)
 	if err != nil {
@@ -302,11 +302,12 @@ func TestReportTrafficDrainsPendingBeforeSnapshot(t *testing.T) {
 		t.Fatal("first report unexpectedly succeeded")
 	}
 	state.AddTraffic(7, 0, 200)
-	if _, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, health); err == nil {
-		t.Fatal("second report unexpectedly succeeded")
+	_, secondErr := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reporter, health)
+	if !errors.Is(secondErr, database.err) {
+		t.Fatalf("second report error = %v, want original database error %v", secondErr, database.err)
 	}
-	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 1 || metrics.TrafficDownloadBytes != 200 {
-		t.Fatalf("new traffic was removed before the durable backlog drained: %+v", metrics)
+	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 0 {
+		t.Fatalf("new traffic remained only in memory after backlog flush failed: %+v", metrics)
 	}
 
 	reloaded, err := newTrafficReporter(path)
@@ -314,32 +315,75 @@ func TestReportTrafficDrainsPendingBeforeSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := reloaded.Metrics(time.Now())
-	if metrics.Batches != 1 || metrics.UploadBytes != 100 || metrics.DownloadBytes != 0 {
-		t.Fatalf("unexpected durable backlog: %+v", metrics)
+	if metrics.Batches != 2 || metrics.UploadBytes != 100 || metrics.DownloadBytes != 200 {
+		t.Fatalf("new traffic was not persisted as a separate durable batch: %+v", metrics)
 	}
+	if reloaded.pending[0].ID == reloaded.pending[1].ID ||
+		len(reloaded.pending[0].Deltas) != 1 ||
+		len(reloaded.pending[1].Deltas) != 1 ||
+		reloaded.pending[0].Deltas[0].Upload != 100 ||
+		reloaded.pending[0].Deltas[0].Download != 0 ||
+		reloaded.pending[1].Deltas[0].Upload != 0 ||
+		reloaded.pending[1].Deltas[0].Download != 200 {
+		t.Fatalf("unexpected durable batch boundaries: %+v", reloaded.pending)
+	}
+	wantIDs := []string{reloaded.pending[0].ID, reloaded.pending[1].ID}
 
 	database.err = nil
-	firstCall := true
-	database.onReport = func() {
-		if !firstCall {
-			return
-		}
-		firstCall = false
-		if pending := state.PendingMetrics(); pending.TrafficDownloadBytes != 200 {
-			t.Errorf("state was snapshotted before the old outbox batch flushed: %+v", pending)
-		}
-	}
 	if _, err := reportTraffic(database, Node{ID: 116, TrafficRate: 1}, state, reloaded, health); err != nil {
 		t.Fatal(err)
 	}
-	if len(database.batchIDs) != 2 {
-		t.Fatalf("reported batch IDs = %v, want recovered and newly captured batches", database.batchIDs)
+	if len(database.batchIDs) != 2 || database.batchIDs[0] != wantIDs[0] || database.batchIDs[1] != wantIDs[1] {
+		t.Fatalf("reported batch IDs = %v, want %v", database.batchIDs, wantIDs)
 	}
 	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 0 {
 		t.Fatalf("traffic remained in memory after recovery: %+v", metrics)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("outbox remained after recovery: %v", err)
+	}
+}
+
+func TestReportTrafficCaptureFailureAfterBacklogFailureIsFatal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic-outbox.json")
+	reporter, err := newTrafficReporter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Capture([]TrafficDelta{{UserID: 7, Upload: 100}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "block-replacement"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewState()
+	state.AddTraffic(7, 0, 200)
+	databaseErr := errors.New("database unavailable")
+	_, err = reportTraffic(
+		&fakeTrafficDatabase{err: databaseErr},
+		Node{ID: 116, TrafficRate: 1},
+		state,
+		reporter,
+		&databaseHealth{},
+	)
+	if !errors.Is(err, errTrafficOutboxPersistence) {
+		t.Fatalf("capture error = %v, want fatal outbox persistence classification", err)
+	}
+	if errors.Is(err, databaseErr) {
+		t.Fatalf("capture failure returned the ordinary database error: %v", err)
+	}
+	if metrics := state.PendingMetrics(); metrics.TrafficUsers != 1 || metrics.TrafficDownloadBytes != 200 {
+		t.Fatalf("capture failure lost new in-memory traffic: %+v", metrics)
+	}
+	if len(reporter.pending) != 1 || reporter.pending[0].Deltas[0].Upload != 100 {
+		t.Fatalf("existing durable backlog changed after capture failure: %+v", reporter.pending)
 	}
 }
 

@@ -35,7 +35,7 @@ func TestNodeAuthorizationErrorsAreClassified(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotAuthorized) {
 		t.Fatalf("invalid node type error was not authoritative: %v", err)
 	}
-	_, err = validateLoadedNode(Node{ID: 116, Sort: 14, Server: "example.com;443;sensitive-server-key"}, 0, 0)
+	_, err = validateLoadedNode(Node{ID: 116, Sort: 14, Server: "example.com;1023;sensitive-server-key"}, 0, 0)
 	if !errors.Is(err, ErrNodeNotAuthorized) || strings.Contains(err.Error(), "sensitive-server-key") {
 		t.Fatalf("invalid server key error was not safely classified: %v", err)
 	}

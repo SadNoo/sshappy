@@ -72,13 +72,13 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := writeCredentialFile(config.CredentialPath, users); err != nil {
-		return err
-	}
 
 	state := NewState()
 	runtime := NewRuntime(state)
-	runtime.ReplaceUsers(users)
+	users = replaceRuntimeUsers(runtime, users, logger)
+	if err := writeCredentialFile(config.CredentialPath, users); err != nil {
+		return err
+	}
 	manager, managedServer, err := newManager(config, node, runtime, logger)
 	if err != nil {
 		return err
@@ -216,6 +216,7 @@ runLoop:
 				continue
 			}
 			failures.RecordSuccess("user authorization refresh", time.Now())
+			loadedUsers = replaceRuntimeUsers(runtime, loadedUsers, logger)
 			if err := syncCredentials(managedServer, loadedUsers); err != nil {
 				age, remaining, expired := failures.RecordFailure("credential refresh", err, time.Now())
 				logger.Error("Failed to synchronize credentials",
@@ -230,7 +231,6 @@ runLoop:
 				continue
 			}
 			failures.RecordSuccess("credential refresh", time.Now())
-			runtime.ReplaceUsers(loadedUsers)
 			node = loadedNode
 			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
 		case <-trafficTicker.C:
@@ -341,20 +341,29 @@ runLoop:
 func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) (flushed bool, err error) {
 	// Drain durable backlog before taking traffic out of memory. This allows a
 	// recovered database to shrink/remove a large outbox before the next append.
+	// If the database is still unavailable, preserve traffic accumulated since
+	// the previous attempt as a separate durable batch before returning the
+	// database error. Local outbox failures remain immediately fatal.
+	var backlogFlushErr error
 	if len(reporter.pending) > 0 {
 		startedAt := time.Now()
-		flushErr := reporter.Flush(db, node)
-		health.Record("reportTraffic", startedAt, flushErr)
-		if flushErr != nil {
-			return false, flushErr
+		backlogFlushErr = reporter.Flush(db, node)
+		health.Record("reportTraffic", startedAt, backlogFlushErr)
+		if errors.Is(backlogFlushErr, errTrafficOutboxPersistence) {
+			return false, backlogFlushErr
 		}
-		flushed = true
+		if backlogFlushErr == nil {
+			flushed = true
+		}
 	}
 
 	traffic := state.SnapshotTraffic()
 	if err := reporter.Capture(traffic); err != nil {
 		state.MergeTraffic(traffic)
 		return flushed, fmt.Errorf("%w: %v", errTrafficOutboxPersistence, err)
+	}
+	if backlogFlushErr != nil {
+		return flushed, backlogFlushErr
 	}
 	if len(reporter.pending) == 0 {
 		return flushed, nil
@@ -495,6 +504,34 @@ func writeCredentialFile(path string, users []User) error {
 		return err
 	}
 	return writeFileAtomic(path, data, 0600)
+}
+
+// replaceRuntimeUsers publishes the fail-closed policy snapshot and removes
+// malformed users from the credential set. Policy diagnostics intentionally
+// contain only the numeric user ID, field and rule index; raw panel rows may
+// contain credentials and must never be logged.
+func replaceRuntimeUsers(runtime *Runtime, users []User, logger *zap.Logger) []User {
+	rejected := runtime.ReplaceUsers(users)
+	if len(rejected) == 0 {
+		return users
+	}
+	rejectedIDs := make(map[int]struct{}, len(rejected))
+	for _, policyErr := range rejected {
+		rejectedIDs[policyErr.UserID] = struct{}{}
+		logger.Error("Rejected user with invalid runtime policy",
+			zap.Int("userID", policyErr.UserID),
+			zap.String("field", policyErr.Field),
+			zap.Int("ruleIndex", policyErr.RuleIndex),
+			zap.Error(policyErr.Err),
+		)
+	}
+	valid := make([]User, 0, len(users)-len(rejectedIDs))
+	for _, user := range users {
+		if _, found := rejectedIDs[user.ID]; !found {
+			valid = append(valid, user)
+		}
+	}
+	return valid
 }
 
 func syncCredentials(server *cred.ManagedServer, users []User) error {

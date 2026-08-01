@@ -367,6 +367,23 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		logger.Debug("Rejected TCP connection by runtime policy", zap.String("username", req.Username))
 		return
 	}
+	var sessionEnd func()
+	if s.observer != nil {
+		var accepted bool
+		ctx, sessionEnd, accepted = beginRuntimeSession(ctx, s.observer, "tcp", req.Username, clientAddrPort, req.Addr)
+		if !accepted {
+			logger.Debug("Rejected TCP session registration by runtime policy", zap.String("username", req.Username))
+			if abortErr := req.Abort(conn.DialResult{Code: conn.DialResultCodeEACCES}); abortErr != nil {
+				logger.Debug("Failed to abort connection rejected during session registration", zap.Error(abortErr))
+			}
+			return
+		}
+		if sessionEnd != nil {
+			defer sessionEnd()
+			stopClientSessionClose := closeTCPConnectionOnSessionCancel(ctx, clientTCPConn)
+			defer stopClientSessionClose()
+		}
+	}
 	if !s.reserveUserConnection(req.Username, lnc.maxConnectionsPerUser, lnc.maxEstablishedConnections) {
 		logger.Debug("Rejected TCP connection by connection limit",
 			zap.String("username", req.Username),
@@ -420,6 +437,28 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		zap.String("targetAddress", targetAddress),
 		zap.String("client", clientInfo.Name),
 	)
+
+	// Preserve the original target for routing, then allow an optional runtime
+	// resolver to validate and pin the exact IP used by the outbound dial.
+	dialTarget := req.Addr
+	if s.observer != nil {
+		var accepted bool
+		dialTarget, accepted, err = resolveRuntimeTarget(ctx, s.observer, "tcp", req.Username, clientAddrPort, req.Addr)
+		if err != nil {
+			logger.Debug("Failed to resolve TCP target by runtime policy", zap.Error(err))
+			if abortErr := req.Abort(conn.DialResultFromError(err)); abortErr != nil {
+				logger.Debug("Failed to abort connection with unresolved target", zap.Error(abortErr))
+			}
+			return
+		}
+		if !accepted {
+			logger.Debug("Rejected resolved TCP target by runtime policy")
+			if abortErr := req.Abort(conn.DialResult{Code: conn.DialResultCodeEACCES}); abortErr != nil {
+				logger.Debug("Failed to abort connection rejected by resolved target policy", zap.Error(abortErr))
+			}
+			return
+		}
+	}
 
 	// Wait for initial payload if all of the following are true:
 	// 1. not disabled
@@ -477,7 +516,7 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	// Create remote connection.
 	dialStartedAt := time.Now()
 	s.targetDialAttempts.Add(1)
-	remoteConn, err := dialer.DialStream(ctx, req.Addr, req.Payload)
+	remoteConn, err := dialer.DialStream(ctx, dialTarget, req.Payload)
 	s.targetDialNanos.Add(uint64(time.Since(dialStartedAt)))
 	s.targetDialCompleted.Add(1)
 	if err != nil {
@@ -499,6 +538,10 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		return
 	}
 	defer s.unregisterConnection(remoteConn)
+	if sessionEnd != nil {
+		stopRemoteSessionClose := closeTCPConnectionOnSessionCancel(ctx, remoteConn)
+		defer stopRemoteSessionClose()
+	}
 
 	if clientConn == nil {
 		clientConn, err = req.PendingConn.Proceed()
@@ -536,6 +579,12 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 		zap.Int64("nl2r", nl2r),
 		zap.Int64("nr2l", nr2l),
 	)
+}
+
+func closeTCPConnectionOnSessionCancel(ctx context.Context, connection net.Conn) func() bool {
+	return context.AfterFunc(ctx, func() {
+		_ = connection.Close()
+	})
 }
 
 type meteredTCPConn struct {

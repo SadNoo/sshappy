@@ -20,6 +20,8 @@
 `auto` disables TLS only for loopback/localhost and otherwise requires an encrypted connection. `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
 `disabled` permits plaintext authentication and queries; use it only when the database cannot support TLS and the connection stays on a trusted private network.
 
+The database used by this deployment cannot negotiate TLS, so its 4.3.1 environment example explicitly sets `MYSQL_TLS_MODE=disabled`. Do not expose that database connection to the public Internet; restrict it to the node and database hosts on a trusted private network.
+
 If both a standard name and its legacy alias are present, keep their values identical. Legacy aliases are retained for compatibility and should be removed from new deployments.
 
 ## Listener and synchronization settings
@@ -68,7 +70,9 @@ If both a standard name and its legacy alias are present, keep their values iden
 
 The process account needs read/write access to the two state files and their parent directory. Do not expose either file through a web server, support bundle or source-control checkout.
 
-The 4.3 outbox deliberately uses the exact 4.2 JSON fields and wrapper version so the same durable state can be reused after a sequential rollback. Billing also keeps the 4.2 rule: the node ID and traffic rate are read from the current node when a batch is flushed, not when it is captured. A rate change while traffic is pending therefore applies the new rate to the recovered batch. Back up the state directory before upgrading, and do not move one node's outbox to a different node.
+The 4.3.1 outbox deliberately uses the exact 4.2 JSON fields and wrapper version so the same durable state can be reused after a sequential rollback. Billing also keeps the 4.2 rule: the node ID and traffic rate are read from the current node when a batch is flushed, not when it is captured. A rate change while traffic is pending therefore applies the new rate to the recovered batch. Back up the state directory before upgrading, and do not move one node's outbox to a different node.
+
+When an existing database backlog cannot be flushed, 4.3.1 persists newly captured traffic as another compatible outbox batch before returning the database error. A local outbox write failure remains immediately fatal; keep the state directory persistent and writable and never run two writers against one outbox.
 
 Set `TRAFFIC_BATCH_RETENTION_DAYS` above zero only for a single active reporter for that node and only when the retention period exceeds every possible outbox, backup and disaster-recovery replay window. Cleanup is not coordinated with another host's outbox.
 
@@ -81,3 +85,5 @@ host;port;base64-server-key
 ```
 
 The server and user keys must decode to 32 bytes for `2022-blake3-aes-256-gcm`. The adapter reads users, node limits and restrictions, and writes traffic, heartbeat, online-user, alive-IP and resource information. Run schema changes through a controlled migration and grant the runtime account only the permissions required by the deployed schema.
+
+Version 4.3.1 compiles `forbidden_ip`, `forbidden_port` and `disconnect_ip` rules before installing a refreshed user policy. Invalid IPs, CIDRs, ports or ranges reject only the affected user; the user is removed from the runtime policy and credential snapshot until corrected, while unrelated valid users remain available. For domain targets, both TCP and UDP validate the final resolved address selected for the outbound connection, so a domain cannot bypass an IP or CIDR restriction merely by being supplied in name form. Each UDP session pins the first resolved IP for at most 64 distinct domains; later packets recheck the pinned literal IP against the current policy without another DNS lookup, and additional new domains are rejected until a new session is created. User removal, a newly invalid policy, a security-policy change or a key/password change also cancels that user's registered TCP and UDP sessions after the successful refresh.
