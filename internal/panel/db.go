@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	mysqlmigration "github.com/database64128/shadowsocks-go/migrations/mysql"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -32,8 +33,9 @@ type Database struct {
 	// lockDB keeps advisory-lock sessions separate from cancellable traffic
 	// transactions. The MySQL driver cancels an in-flight query by closing its
 	// connection, which may otherwise delay RELEASE_LOCK behind that query.
-	lockDB *sql.DB
-	config Config
+	lockDB      *sql.DB
+	config      Config
+	schemaState databaseSchemaState
 }
 
 // ErrNodeNotAuthorized marks node state that is authoritative and must not be
@@ -65,7 +67,14 @@ func OpenDatabaseContext(ctx context.Context, config Config) (*Database, error) 
 		_ = db.Close()
 		return nil, err
 	}
-	if err := validateDatabaseSchemaContext(ctx, db, config.MySQLDB); err != nil {
+	schemaState, err := prepareDatabaseSchemaContext(
+		ctx,
+		db,
+		config.MySQLDB,
+		config.MySQLSchemaMode,
+		config.MySQLIOTimeoutSeconds,
+	)
+	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -81,7 +90,7 @@ func OpenDatabaseContext(ctx context.Context, config Config) (*Database, error) 
 	lockDB.SetMaxOpenConns(4)
 	lockDB.SetMaxIdleConns(1)
 	lockDB.SetConnMaxLifetime(3 * time.Minute)
-	return &Database{db: db, lockDB: lockDB, config: config}, nil
+	return &Database{db: db, lockDB: lockDB, config: config, schemaState: schemaState}, nil
 }
 
 func mysqlDriverConfig(config Config, tlsMode string) *mysql.Config {
@@ -107,10 +116,27 @@ const (
 	mysqlMigrationPath       = "migrations/mysql/0001_traffic_batch.sql"
 )
 
+type databaseSchemaState uint8
+
+const (
+	databaseSchemaCurrent databaseSchemaState = iota
+	databaseSchemaLegacyCompatible
+	databaseSchemaInitialized
+)
+
 // ErrDatabaseMigrationRequired marks a missing or incompatible database
-// schema. OpenDatabase only validates the schema; migrations must be applied
-// separately with an account that is allowed to execute DDL.
+// schema that cannot be accepted or safely initialized by the selected mode.
 var ErrDatabaseMigrationRequired = errors.New("database schema migration required")
+
+type mysqlSchemaQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type mysqlSchemaExecutor interface {
+	mysqlSchemaQueryer
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
 
 type mysqlColumnMetadata struct {
 	dataType   string
@@ -134,7 +160,259 @@ type mysqlTableMetadata struct {
 	indexes map[string][]mysqlIndexColumnMetadata
 }
 
-func validateDatabaseSchemaContext(ctx context.Context, db *sql.DB, schema string) error {
+type mysqlMigrationRecord struct {
+	version uint64
+	name    string
+}
+
+func prepareDatabaseSchemaContext(
+	ctx context.Context,
+	db *sql.DB,
+	schema, mode string,
+	lockTimeoutSeconds int,
+) (databaseSchemaState, error) {
+	if err := ctx.Err(); err != nil {
+		return databaseSchemaCurrent, err
+	}
+	switch strings.ToLower(mode) {
+	case "", "auto":
+	case "strict":
+		if err := validateDatabaseSchemaContext(ctx, db, schema); err != nil {
+			return databaseSchemaCurrent, err
+		}
+		return databaseSchemaCurrent, nil
+	default:
+		return databaseSchemaCurrent, fmt.Errorf("MYSQL_SCHEMA_MODE must be one of auto or strict")
+	}
+	if err := validateDatabaseSchemaContext(ctx, db, schema); err == nil {
+		return databaseSchemaCurrent, nil
+	} else if !errors.Is(err, ErrDatabaseMigrationRequired) {
+		return databaseSchemaCurrent, err
+	}
+
+	conn, release, err := acquireDatabaseSchemaLockContext(ctx, db, schema, lockTimeoutSeconds)
+	if err != nil {
+		return databaseSchemaCurrent, err
+	}
+	state, bootstrapErr := bootstrapDatabaseSchemaContext(ctx, conn, schema)
+	releaseErr := release()
+	if bootstrapErr != nil {
+		return databaseSchemaCurrent, errors.Join(bootstrapErr, releaseErr)
+	}
+	if releaseErr != nil {
+		return databaseSchemaCurrent, releaseErr
+	}
+	return state, nil
+}
+
+func acquireDatabaseSchemaLockContext(
+	ctx context.Context,
+	db *sql.DB,
+	schema string,
+	timeoutSeconds int,
+) (*sql.Conn, func() error, error) {
+	if timeoutSeconds < 1 {
+		timeoutSeconds = 30
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+1)*time.Second)
+	defer cancel()
+	conn, err := db.Conn(lockCtx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to reserve database schema lock connection: %w", err)
+	}
+	lockName := databaseSchemaLockName(schema)
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(lockCtx, "SELECT GET_LOCK(?, ?)", lockName, timeoutSeconds).Scan(&acquired); err != nil {
+		// The server may have granted the lock before the response was lost.
+		discardSQLConn(conn)
+		return nil, nil, fmt.Errorf("failed to acquire database schema lock: %w", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		_ = conn.Close()
+		return nil, nil, errors.New("timed out acquiring database schema lock")
+	}
+	release := func() error {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if releaseErr != nil || !released.Valid || released.Int64 != 1 {
+			discardSQLConn(conn)
+			if releaseErr != nil {
+				return fmt.Errorf("failed to release database schema lock: %w", releaseErr)
+			}
+			return errors.New("database schema lock was not owned at release")
+		}
+		return conn.Close()
+	}
+	return conn, release, nil
+}
+
+func databaseSchemaLockName(schema string) string {
+	sum := sha256.Sum256([]byte(schema))
+	return "sshappy:schema:" + hex.EncodeToString(sum[:16])
+}
+
+func bootstrapDatabaseSchemaContext(
+	ctx context.Context,
+	db mysqlSchemaExecutor,
+	schema string,
+) (databaseSchemaState, error) {
+	migrationTable, migrationFound, err := inspectMySQLTableContext(ctx, db, schema, "sshappy_schema_migrations")
+	if err != nil {
+		return databaseSchemaCurrent, fmt.Errorf("failed to inspect database migration table: %w", err)
+	}
+	if migrationFound {
+		if err := validateMigrationTableMetadata(migrationTable); err != nil {
+			return databaseSchemaCurrent, err
+		}
+	}
+	trafficTable, trafficFound, err := inspectMySQLTableContext(ctx, db, schema, "sshappy_traffic_batch")
+	if err != nil {
+		return databaseSchemaCurrent, fmt.Errorf("failed to inspect traffic batch table: %w", err)
+	}
+	if trafficFound {
+		if err := validateTrafficBatchTableMetadata(trafficTable); err != nil {
+			return databaseSchemaCurrent, err
+		}
+	}
+
+	var records []mysqlMigrationRecord
+	if migrationFound {
+		records, err = readDatabaseMigrationRecordsContext(ctx, db)
+		if err != nil {
+			return databaseSchemaCurrent, err
+		}
+		if len(records) > 0 {
+			if len(records) != 1 || records[0].version != mysqlSchemaVersion || records[0].name != mysqlSchemaMigrationName {
+				return databaseSchemaCurrent, databaseMigrationRequired("schema migration records are incompatible")
+			}
+			if !trafficFound {
+				return databaseSchemaCurrent, databaseMigrationRequired("traffic batch table is missing after migration version 1 was recorded")
+			}
+			return databaseSchemaCurrent, nil
+		}
+	}
+
+	// A compatible 4.3 traffic marker table is the complete functional v1
+	// schema. Accept it without DDL so an upgraded least-privilege account does
+	// not fail merely because 4.3 predates the migration-record table.
+	if !migrationFound && trafficFound {
+		return databaseSchemaLegacyCompatible, nil
+	}
+
+	statements, err := embeddedMySQLMigrationStatements()
+	if err != nil {
+		return databaseSchemaCurrent, err
+	}
+	if !migrationFound {
+		if _, err := db.ExecContext(ctx, statements[0]); err != nil {
+			return databaseSchemaCurrent, automaticSchemaInitializationError("create the migration table", err)
+		}
+	}
+	if !trafficFound {
+		if _, err := db.ExecContext(ctx, statements[1]); err != nil {
+			return databaseSchemaCurrent, automaticSchemaInitializationError("create the traffic batch table", err)
+		}
+	}
+
+	// CREATE TABLE IF NOT EXISTS never proves compatibility. Validate both
+	// objects before recording the migration, then run the full validator again.
+	migrationTable, migrationFound, err = inspectMySQLTableContext(ctx, db, schema, "sshappy_schema_migrations")
+	if err != nil {
+		return databaseSchemaCurrent, fmt.Errorf("failed to verify initialized migration table: %w", err)
+	}
+	if !migrationFound {
+		return databaseSchemaCurrent, databaseMigrationRequired("migration table is still missing after automatic initialization")
+	}
+	if err := validateMigrationTableMetadata(migrationTable); err != nil {
+		return databaseSchemaCurrent, err
+	}
+	trafficTable, trafficFound, err = inspectMySQLTableContext(ctx, db, schema, "sshappy_traffic_batch")
+	if err != nil {
+		return databaseSchemaCurrent, fmt.Errorf("failed to verify initialized traffic batch table: %w", err)
+	}
+	if !trafficFound {
+		return databaseSchemaCurrent, databaseMigrationRequired("traffic batch table is still missing after automatic initialization")
+	}
+	if err := validateTrafficBatchTableMetadata(trafficTable); err != nil {
+		return databaseSchemaCurrent, err
+	}
+	if _, err := db.ExecContext(ctx, statements[2]); err != nil {
+		return databaseSchemaCurrent, automaticSchemaInitializationError("record migration version 1", err)
+	}
+	if err := validateDatabaseSchemaContext(ctx, db, schema); err != nil {
+		return databaseSchemaCurrent, fmt.Errorf("automatic database schema initialization did not validate: %w", err)
+	}
+	return databaseSchemaInitialized, nil
+}
+
+func readDatabaseMigrationRecordsContext(ctx context.Context, db mysqlSchemaQueryer) ([]mysqlMigrationRecord, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT version, name
+		FROM sshappy_schema_migrations
+		ORDER BY version
+		LIMIT 2
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read database schema migrations: %w", err)
+	}
+	defer rows.Close()
+	var records []mysqlMigrationRecord
+	for rows.Next() {
+		var record mysqlMigrationRecord
+		if err := rows.Scan(&record.version, &record.name); err != nil {
+			return nil, fmt.Errorf("failed to scan database schema migration: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read database schema migrations: %w", err)
+	}
+	return records, nil
+}
+
+func embeddedMySQLMigrationStatements() ([]string, error) {
+	var executable strings.Builder
+	for _, line := range strings.Split(mysqlmigration.Version1(), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		executable.WriteString(line)
+		executable.WriteByte('\n')
+	}
+	parts := strings.Split(executable.String(), ";")
+	statements := make([]string, 0, 3)
+	for _, part := range parts {
+		if statement := strings.TrimSpace(part); statement != "" {
+			statements = append(statements, statement)
+		}
+	}
+	if len(statements) != 3 {
+		return nil, fmt.Errorf("embedded MySQL migration contains %d statements, want 3", len(statements))
+	}
+	for index, prefix := range []string{
+		"CREATE TABLE IF NOT EXISTS sshappy_schema_migrations",
+		"CREATE TABLE IF NOT EXISTS sshappy_traffic_batch",
+		"INSERT IGNORE INTO sshappy_schema_migrations",
+	} {
+		if !strings.HasPrefix(statements[index], prefix) {
+			return nil, fmt.Errorf("embedded MySQL migration statement %d has an unexpected form", index+1)
+		}
+	}
+	return statements, nil
+}
+
+func automaticSchemaInitializationError(action string, err error) error {
+	return fmt.Errorf(
+		"failed to %s during automatic database schema initialization: %w; grant the runtime account CREATE and INSERT for first startup, or apply %s with a migration account",
+		action,
+		err,
+		mysqlMigrationPath,
+	)
+}
+
+func validateDatabaseSchemaContext(ctx context.Context, db mysqlSchemaQueryer, schema string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -190,15 +468,15 @@ func validateDatabaseSchemaContext(ctx context.Context, db *sql.DB, schema strin
 	return validateTrafficBatchTableMetadata(trafficBatchTable)
 }
 
-func inspectMySQLTableContext(ctx context.Context, db *sql.DB, schema, table string) (mysqlTableMetadata, bool, error) {
+func inspectMySQLTableContext(ctx context.Context, db mysqlSchemaQueryer, schema, table string) (mysqlTableMetadata, bool, error) {
 	metadata := mysqlTableMetadata{
 		columns: make(map[string]mysqlColumnMetadata),
 		indexes: make(map[string][]mysqlIndexColumnMetadata),
 	}
 	if err := db.QueryRowContext(ctx, `
-		SELECT engine
+		SELECT COALESCE(engine, '')
 		FROM information_schema.tables
-		WHERE table_schema = ? AND table_name = ? AND table_type = 'BASE TABLE'
+		WHERE table_schema = ? AND table_name = ?
 	`, schema, table).Scan(&metadata.engine); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return metadata, false, nil

@@ -1,25 +1,25 @@
-# sshappy 4.4.0
+# sshappy 4.4.1
 
 `sshappy` is a Go implementation of a Shadowsocks 2022 node with an SSPanel-compatible runtime. The repository keeps the upstream `shadowsocks-go` server and domain-set converter, and adds `sstest`, which loads node/user policy from MySQL, enforces runtime restrictions, reports traffic and online state, and durably retries unreported traffic.
 
-Version 4.4.0 is developed on the `4.4` branch from the immutable 4.3.1 rollback baseline. Preserve the `4.3.1` branch, `v4.3.1` tag and `sadno/sstest:4.3.1` image; do not move the tag or rebuild/overwrite that image tag.
+Version 4.4.1 is a cold-start compatibility hotfix on the independent `4.4` branch, based on the immutable 4.4.0 release. Preserve `v4.4.0` and the existing `sadno/sstest:4.4.0`/`:4.4` images, as well as the 4.3.1 rollback baseline; do not move or overwrite them. The repository default branch remains unchanged until 4.4.1 completes user acceptance.
 
-## 4.4 changes
+## 4.4.1 and 4.4 changes
 
 - The traffic outbox is now a transactional SQLite WAL queue instead of a whole-file JSON rewrite. Each batch freezes the node ID and traffic rate at capture time and carries a canonical SHA-256 payload check.
 - A legacy 4.3.1 JSON outbox is never overwritten or silently converted. Startup preserves a non-SQLite file and fails with a reconciliation error.
 - A private process lock prevents two 4.4 writers from opening one outbox. Existing state with permissive modes, symlinks or hard links is rejected without changing it, and interrupted first-time initialization is recovered through an atomic marker.
-- MySQL schema setup is an explicit, versioned migration. The runtime validates the migration record, table engine, columns and indexes at startup and no longer performs DDL.
+- 4.4.1 fixes the 4.4.0 cold-start regression. Default `MYSQL_SCHEMA_MODE=auto` accepts an exact 4.3.1 traffic-marker table without requiring a new migration record or DDL permission. A fresh deployment safely initializes the two sshappy-owned auxiliary tables under a MySQL advisory lock. Existing incompatible or damaged tables are never altered. `strict` mode retains mandatory pre-migration and zero runtime DDL.
 - Runtime MySQL operations have explicit deadlines. Normal accounting cycles replay at most 64 durable batches before returning to other work, final shutdown captures new counters before replay, and billing arithmetic rejects integer overflow instead of wrapping.
 - Release archives and the container image include the exact MySQL migration used by this version.
 - The strict target-policy parsing, resolved-IP checks, active-session revocation and bounded UDP domain cache from 4.3.1 remain in place.
 
-Quota enforcement during accounting outages and node/user speed limiting are intentionally not implemented in 4.4. Their units, scope, multi-node coordination, burst behavior and update semantics require an explicit product contract before a safe implementation can be chosen. See [4.4 release notes](docs/4.4-release-notes.md).
+Quota enforcement during accounting outages and node/user speed limiting are intentionally not implemented in 4.4. Their units, scope, multi-node coordination, burst behavior and update semantics require an explicit product contract before a safe implementation can be chosen. See the [4.4.1 hotfix notes](docs/4.4.1-release-notes.md) and [4.4 release notes](docs/4.4-release-notes.md).
 
 ## Requirements
 
 - Go 1.26 or the exact version declared by `go.mod`.
-- A compatible SSPanel MySQL schema with [the 4.4 migration](docs/mysql-migration.md) applied before startup.
+- A compatible SSPanel MySQL schema. The two sshappy-owned accounting tables are handled according to `MYSQL_SCHEMA_MODE`; see [MySQL schema initialization](docs/mysql-migration.md).
 - An `ss_node` record whose `sort` is `14` and whose `server` value follows `host;port;base64-server-key`.
 - A private, writable and persistent data directory for the credential snapshot and SQLite outbox. Defaults use `/var/lib/sshappy`.
 
@@ -39,7 +39,7 @@ go build -trimpath ./cmd/shadowsocks-go-domain-set-converter
 
 ## Migrate and run
 
-Stop 4.3.1 and completely drain and back up its JSON outbox before starting 4.4. Never run both versions against the same state directory. Apply the migration with a separate DDL-capable account; the password is prompted rather than placed on the command line:
+Stop 4.3.1 and completely drain and back up its JSON outbox before starting 4.4.1. Never run both versions against the same state directory. The default `MYSQL_SCHEMA_MODE=auto` directly accepts the exact 4.3.1 traffic-marker schema without DDL. If both sshappy-owned tables are absent, the first startup account needs `CREATE` and `INSERT` once. Operators who require zero runtime DDL can apply the migration first and set `MYSQL_SCHEMA_MODE=strict`; the password is prompted rather than placed on the command line:
 
 ```sh
 mysql \
@@ -52,7 +52,7 @@ mysql \
   sspanel < migrations/mysql/0001_traffic_batch.sql
 ```
 
-The database used by this deployment cannot negotiate TLS, so the migration uses `--ssl-mode=DISABLED` and the runtime uses `MYSQL_TLS_MODE=disabled`. Both connections are plaintext: keep them on a trusted private network and prevent public access to MySQL.
+The database used by this deployment cannot negotiate TLS, so the migration uses `--ssl-mode=DISABLED` and the 4.4.1 Docker image sets `MYSQL_TLS_MODE=disabled` by default. Both connections are plaintext: keep them on a trusted private network and prevent public access to MySQL. Source-built binaries retain the safer `auto` fallback when this variable is unset.
 
 Do not commit real database passwords, node keys or user credentials. Supply them through the process environment or a secret manager:
 
@@ -63,6 +63,7 @@ MYSQL_DB=sspanel \
 MYSQL_USER=sshappy \
 MYSQL_PASS='replace-with-a-secret' \
 MYSQL_TLS_MODE=disabled \
+MYSQL_SCHEMA_MODE=auto \
 TRAFFIC_OUTBOX_PATH=/var/lib/sshappy/traffic-outbox.sqlite3 \
 ./sstest
 ```
@@ -82,10 +83,10 @@ go test -race -count=1 ./internal/panel ./service ./api/... ./cred ./dns ./direc
 go test -race -count=1 ./ss2022 -run '^(TestShadowStreamConnConcurrentReadsAndWrites|TestShadowStreamBulkCopyWrappedReaderDoesNotDeadlock|TestPSKLengthErrorRedactsPSK|TestCipherConfigsCloneKeyInputsAndSliceOutputs)$'
 ```
 
-The MySQL integration test requires a disposable database/schema and is intentionally opt-in. It applies the repository migration itself:
+The MySQL integration test requires a disposable database/schema and is intentionally opt-in. It verifies fresh automatic initialization, a no-DDL 4.3.1-compatible startup, strict mode, concurrent cold starts and idempotent traffic accounting:
 
 ```sh
-SSHAPPY_TEST_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/disposable_database?parseTime=true' \
+SSHAPPY_TEST_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/disposable_database?parseTime=true&tls=false' \
 go test -count=1 -v ./internal/panel -run '^TestMySQL'
 ```
 
@@ -95,7 +96,7 @@ Never point this integration test at production: it creates fixed table names.
 
 - `cmd/sstest`: SSPanel-managed node process.
 - `internal/panel`: MySQL adapter, policy, accounting, SQLite outbox and operational reporting.
-- `migrations/mysql`: versioned MySQL migrations applied before runtime startup.
+- `migrations/mysql`: versioned MySQL migration embedded in `sstest` and shipped with every release.
 - `service`: TCP/UDP relay lifecycle and limits.
 - `ss2022`: Shadowsocks 2022 crypto and protocol implementation.
 - `cred`: dynamic user credential manager.
@@ -110,12 +111,11 @@ The reviewed image is intentionally `linux/amd64`, uses Debian 12 distroless/sta
 ```sh
 docker buildx build \
   --platform linux/amd64 \
-  --build-arg VERSION=4.4.0 \
+  --build-arg VERSION=4.4.1 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load -f Dockerfile.sstest \
-  -t sadno/sstest:4.4.0 \
-  -t sadno/sstest:4.4 .
+  -t sadno/sstest:4.4.1 .
 ```
 
 The default root user permits panel-managed relay ports below 1024; `sstest` does not impose a low-port restriction. Deployment examples use TCP and UDP port 1023.

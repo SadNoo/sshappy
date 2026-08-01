@@ -1,7 +1,7 @@
--- Apply this migration with a dedicated migration account before starting 4.4.
--- It is safe for a fresh database and for a 4.3 database that already has the
--- current sshappy_traffic_batch table. 4.4 validates the existing table's
--- engine, required columns, primary key, and node_created_at index at startup.
+-- 4.4.1 embeds this exact migration for automatic first-start initialization.
+-- Operators may instead apply it with a dedicated migration account and set
+-- MYSQL_SCHEMA_MODE=strict. It is safe for a fresh sshappy-owned schema and for
+-- a 4.3 database that already has the current sshappy_traffic_batch table.
 
 CREATE TABLE IF NOT EXISTS sshappy_schema_migrations (
     version BIGINT UNSIGNED NOT NULL,

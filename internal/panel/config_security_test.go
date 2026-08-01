@@ -43,6 +43,31 @@ func TestDefaultMySQLTLSModeIsAuto(t *testing.T) {
 	}
 }
 
+func TestEmptyMySQLTLSModeIsAuto(t *testing.T) {
+	got, err := mysqlTLSMode(Config{MySQLHost: "db.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "true" {
+		t.Fatalf("empty MySQL TLS mode = %q, want true", got)
+	}
+}
+
+func TestDefaultMySQLSchemaModeIsAuto(t *testing.T) {
+	t.Setenv("MYSQL_SCHEMA_MODE", "")
+	if got := LoadConfig().MySQLSchemaMode; got != "auto" {
+		t.Fatalf("default MySQL schema mode = %q, want auto", got)
+	}
+}
+
+func TestInvalidMySQLSchemaModeIsRejected(t *testing.T) {
+	t.Setenv("NODE_ID", "1")
+	t.Setenv("MYSQL_SCHEMA_MODE", "repair-everything")
+	if err := LoadConfig().Validate(); err == nil {
+		t.Fatal("invalid MySQL schema mode was silently accepted")
+	}
+}
+
 func TestInvalidIntegerEnvironmentIsRejected(t *testing.T) {
 	t.Setenv("NODE_ID", "1")
 	t.Setenv("SYNC_INTERVAL_SECONDS", "sixty")

@@ -37,6 +37,18 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) (runErr error) 
 	if err != nil {
 		return err
 	}
+	switch db.schemaState {
+	case databaseSchemaLegacyCompatible:
+		logger.Warn("Accepted compatible 4.3 traffic schema without a migration record",
+			zap.String("schemaMode", "auto"),
+			zap.String("strictMode", "MYSQL_SCHEMA_MODE=strict"),
+		)
+	case databaseSchemaInitialized:
+		logger.Info("Initialized sshappy database schema",
+			zap.Int("schemaVersion", mysqlSchemaVersion),
+			zap.String("migration", mysqlSchemaMigrationName),
+		)
+	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
 			runErr = errors.Join(runErr, closeErr)

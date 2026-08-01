@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+func TestEmbeddedMySQLMigrationHasExpectedStatements(t *testing.T) {
+	statements, err := embeddedMySQLMigrationStatements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS sshappy_schema_migrations",
+		"CREATE TABLE IF NOT EXISTS sshappy_traffic_batch",
+		"INSERT IGNORE INTO sshappy_schema_migrations",
+	} {
+		if !strings.Contains(statements[index], fragment) {
+			t.Fatalf("migration statement %d does not contain %q", index+1, fragment)
+		}
+	}
+}
+
+func TestPrepareDatabaseSchemaRejectsUnknownModeBeforeDatabaseIO(t *testing.T) {
+	_, err := prepareDatabaseSchemaContext(t.Context(), nil, "test", "strcit", 1)
+	if err == nil || !strings.Contains(err.Error(), "MYSQL_SCHEMA_MODE") {
+		t.Fatalf("unknown schema mode should fail before database I/O, got %v", err)
+	}
+}
+
 func TestValidateMigrationTableMetadata(t *testing.T) {
 	valid := validMigrationTableMetadata()
 	if err := validateMigrationTableMetadata(valid); err != nil {

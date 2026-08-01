@@ -27,7 +27,7 @@ Every runtime MySQL call uses the configured connect/I/O deadline. A normal traf
 
 ## Database safety and migration
 
-Version 4.4 performs no runtime DDL. Apply `migrations/mysql/0001_traffic_batch.sql` before startup with a dedicated migration account. Startup validates schema version 1, the migration name, InnoDB engines, required columns, primary keys and the `node_created_at` index. `CREATE TABLE IF NOT EXISTS` does not repair an incompatible pre-existing table; if validation rejects one, preserve it and perform a reviewed compatibility migration rather than altering production ad hoc.
+Version 4.4.1 defaults to `MYSQL_SCHEMA_MODE=auto`. It accepts an exact 4.3.1 `sshappy_traffic_batch` table as implicit version 1 without DDL, and initializes both sshappy-owned tables only when both are absent. Initialization is serialized by a schema-specific MySQL advisory lock and followed by exact engine, column, primary-key and index validation. An incompatible existing object, wrong migration record or declared-but-missing table is never altered. Set `MYSQL_SCHEMA_MODE=strict` after applying `migrations/mysql/0001_traffic_batch.sql` with a dedicated account when runtime DDL must be prohibited.
 
 The database used by this deployment cannot negotiate TLS. The migration client must use `--ssl-mode=DISABLED` and the runtime must use `MYSQL_TLS_MODE=disabled`. These transmit credentials and queries in plaintext; keep the database on a trusted private network and deny public ingress. Do not put a DSN or password in command-line arguments, logs, issue reports or committed files. Detailed commands and verification are in [MySQL migration](mysql-migration.md).
 
@@ -43,7 +43,7 @@ Before replacing or downgrading a node, require the outbox pending-batch count t
 
 `AUTH_STALE_GRACE_SECONDS` bounds how long the last successful authorization snapshot may remain active after a transient node/user/credential refresh or traffic-accounting error. A successful refresh clears only that refresh failure, and a successful traffic flush clears the accounting failure. An authoritative node deletion, bandwidth-limit breach, invalid node type, invalid server/key configuration, or local durability failure stops service immediately.
 
-## Upgrade from 4.3.1 to 4.4.0
+## Upgrade from 4.3.1 or 4.4.0 to 4.4.1
 
 The 4.3.1 JSON queue and 4.4 SQLite queue are not interchangeable. There is deliberately no automatic converter.
 
@@ -51,15 +51,15 @@ The 4.3.1 JSON queue and 4.4 SQLite queue are not interchangeable. There is deli
 2. While 4.3.1 is still the only writer, restore database connectivity and wait until its JSON outbox reports zero pending batches. Do not continue while any traffic remains queued.
 3. Stop 4.3.1 gracefully. Confirm that its process/container has exited and no second writer uses the state directory.
 4. Back up the complete state directory, the drained JSON outbox if it still exists, the configuration and the MySQL schema. Keep permissions restrictive.
-5. Apply `migrations/mysql/0001_traffic_batch.sql` with `mysql --ssl-mode=DISABLED`, then verify migration version 1.
+5. Choose schema mode. Default `auto` accepts the exact 4.3.1 traffic table without DDL; for `strict`, apply `migrations/mysql/0001_traffic_batch.sql` with `mysql --ssl-mode=DISABLED` and verify migration version 1.
 6. Change `TRAFFIC_OUTBOX_PATH` from the legacy JSON name to `/var/lib/sshappy/traffic-outbox.sqlite3`. Preserve the JSON backup; never rename or copy it over the new path.
-7. Deploy `sadno/sstest:4.4.0` (or its recorded digest) to one canary node. Ensure `MYSQL_TLS_MODE=disabled` is explicit.
+7. Deploy `sadno/sstest:4.4.1` (or its recorded digest) to one canary node. Ensure `MYSQL_TLS_MODE=disabled` and the chosen `MYSQL_SCHEMA_MODE` are explicit.
 8. On TCP and UDP port 1023, verify authentication, forbidden-target enforcement, resolved-IP checks, session revocation, accounting replay, online state and graceful restart.
 9. Expand gradually while watching MySQL validation, outbox age/size, traffic totals and database failures.
 
 If the configured SQLite path contains the old JSON file, 4.4 fails startup without overwriting it. Correct the path only after confirming the old queue was drained and backed up.
 
-## Roll back from 4.4.0 to 4.3.1
+## Roll back from 4.4.1 to 4.3.1
 
 1. Keep 4.4 running as the sole writer until its SQLite outbox reports zero pending batches. If the database is unavailable or the queue cannot drain, stop the rollback: preserve the SQLite files and reconcile them before changing versions.
 2. Stop 4.4 gracefully and confirm it has exited. Back up the SQLite main file and any remaining sidecars together with the state directory.

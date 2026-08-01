@@ -100,7 +100,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test traffic accounting against MySQL
+      - name: Test cold-start schema compatibility and traffic accounting
         env:
-          SSHAPPY_TEST_MYSQL_DSN: root:test-password@tcp(127.0.0.1:3306)/sshappy_test?parseTime=true
+          SSHAPPY_TEST_MYSQL_DSN: 'root:test-password@tcp(127.0.0.1:3306)/sshappy_test?parseTime=true&tls=false'
         run: go test -count=1 -v ./internal/panel -run '^TestMySQL'

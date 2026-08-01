@@ -12,15 +12,15 @@
 | `MYSQL_DB` | `sspanel` | Database/schema name. Legacy alias: `MYSQLDBNAME`. |
 | `MYSQL_USER` | `root` | Database user. Legacy alias: `MYSQLUSR`. |
 | `MYSQL_PASS` | empty | Database password. Legacy alias: `MYSQLPASSWD`. |
-| `MYSQL_TLS_MODE` | `auto` | `auto`, `disabled`, `preferred`, `required`, or `verify`. |
+| `MYSQL_TLS_MODE` | `auto` (`disabled` in the Docker image) | `disabled`, `auto`, `preferred`, `required`, or `verify`. |
 | `MYSQL_TLS_CA` | empty | PEM CA file; required when TLS mode is `verify`. |
+| `MYSQL_SCHEMA_MODE` | `auto` | `auto` accepts an exact 4.3.1 marker schema and initializes missing sshappy-owned tables; `strict` requires the migration to be applied before startup and performs no DDL. |
 | `MYSQL_CONNECT_TIMEOUT_SECONDS` | `10` | Positive connection timeout. |
 | `MYSQL_IO_TIMEOUT_SECONDS` | `30` | Positive read/write timeout. |
 
-`auto` disables TLS only for loopback/localhost and otherwise requires an encrypted connection. `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
-`disabled` permits plaintext authentication and queries; use it only when the database cannot support TLS and the connection stays on a trusted private network.
+The 4.4.1 Docker image sets `disabled` by default for this service and therefore permits plaintext authentication and queries; use it only where the database connection stays on a trusted private network. A source-built binary defaults to `auto`, which disables TLS only for loopback/localhost and otherwise requires encryption. `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
 
-The database used by this deployment cannot negotiate TLS, so its 4.4 environment example explicitly sets `MYSQL_TLS_MODE=disabled`. Do not expose that database connection to the public Internet; restrict it to the node and database hosts on a trusted private network. The separate migration command must likewise use `mysql --ssl-mode=DISABLED`; see [MySQL migration](mysql-migration.md).
+The database used by this deployment cannot negotiate TLS, so the 4.4.1 Docker image defaults to `MYSQL_TLS_MODE=disabled`. Setting it explicitly is still recommended in reviewed deployment manifests. Do not expose that database connection to the public Internet; restrict it to the node and database hosts on a trusted private network. Any optional migration command must likewise use `mysql --ssl-mode=DISABLED`; see [MySQL schema initialization](mysql-migration.md).
 
 If both a standard name and its legacy alias are present, keep their values identical. Legacy aliases are retained for compatibility and should be removed from new deployments.
 
@@ -88,6 +88,6 @@ The server and user keys must decode to 32 bytes for `2022-blake3-aes-256-gcm`. 
 
 Version 4.4 retains the 4.3.1 behavior that compiles `forbidden_ip`, `forbidden_port` and `disconnect_ip` rules before installing a refreshed user policy. Invalid IPs, CIDRs, ports or ranges reject only the affected user; the user is removed from the runtime policy and credential snapshot until corrected, while unrelated valid users remain available. For domain targets, both TCP and UDP validate the final resolved address selected for the outbound connection, so a domain cannot bypass an IP or CIDR restriction merely by being supplied in name form. Each UDP session pins the first resolved IP for at most 64 distinct domains; later packets recheck the pinned literal IP against the current policy without another DNS lookup, and additional new domains are rejected until a new session is created. User removal, a newly invalid policy, a security-policy change or a key/password change also cancels that user's registered TCP and UDP sessions after the successful refresh.
 
-The runtime account does not perform DDL in 4.4. Apply `migrations/mysql/0001_traffic_batch.sql` before startup with a separate migration account. Startup rejects a missing migration record or incompatible table engine, column or index and reports the required migration path. The migration is additive and leaves the 4.3.1 traffic marker table compatible for rollback.
+Version 4.4.1 defaults to `MYSQL_SCHEMA_MODE=auto`. An exact 4.3.1 `sshappy_traffic_batch` table is accepted without a migration record and without runtime DDL, which makes an in-place upgrade work with a least-privilege account. If both sshappy-owned auxiliary tables are absent, auto mode initializes them once from the embedded migration; that first startup requires `CREATE` and `INSERT`. Existing incompatible tables, wrong versions and declared-but-missing objects remain fatal and are never repaired in place. Set `MYSQL_SCHEMA_MODE=strict` after applying `migrations/mysql/0001_traffic_batch.sql` to require the complete migration record and prohibit runtime DDL.
 
 The `Node.SpeedLimit` and `User.NodeSpeedLimit` fields are still loaded but not enforced. Likewise, pending outbox traffic is not a distributed quota reservation. Speed units, burst/drop behavior, hierarchy, quota scope, reset rules and multi-node coordination remain deliberately undefined; 4.4 does not invent those product semantics.

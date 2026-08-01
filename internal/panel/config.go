@@ -16,6 +16,7 @@ type Config struct {
 	MySQLPassword              string
 	MySQLTLSMode               string
 	MySQLTLSCA                 string
+	MySQLSchemaMode            string
 	MySQLConnectTimeoutSeconds int
 	MySQLIOTimeoutSeconds      int
 	NodeID                     int
@@ -58,6 +59,7 @@ func LoadConfig() Config {
 		MySQLPassword:              getenv("MYSQLPASSWD", getenv("MYSQL_PASS", "")),
 		MySQLTLSMode:               getenv("MYSQL_TLS_MODE", getenv("MYSQL_TLS", "auto")),
 		MySQLTLSCA:                 getenv("MYSQL_TLS_CA", ""),
+		MySQLSchemaMode:            getenv("MYSQL_SCHEMA_MODE", "auto"),
 		MySQLConnectTimeoutSeconds: loader.int("MYSQL_CONNECT_TIMEOUT_SECONDS", 10),
 		MySQLIOTimeoutSeconds:      loader.int("MYSQL_IO_TIMEOUT_SECONDS", 30),
 		NodeID:                     loader.intAny([]string{"node_id", "NODE_ID"}, 0),
@@ -143,8 +145,19 @@ func (c Config) Validate() error {
 		return fmt.Errorf("MYSQL_TLS_MODE must be one of auto, disabled, preferred, required, or verify")
 	case strings.EqualFold(c.MySQLTLSMode, "verify") && c.MySQLTLSCA == "":
 		return fmt.Errorf("MYSQL_TLS_CA must be set when MYSQL_TLS_MODE=verify")
+	case !validMySQLSchemaMode(c.MySQLSchemaMode):
+		return fmt.Errorf("MYSQL_SCHEMA_MODE must be one of auto or strict")
 	}
 	return nil
+}
+
+func validMySQLSchemaMode(mode string) bool {
+	switch strings.ToLower(mode) {
+	case "", "auto", "strict":
+		return true
+	default:
+		return false
+	}
 }
 
 func validMySQLTLSMode(mode string) bool {

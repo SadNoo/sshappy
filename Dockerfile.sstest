@@ -2,7 +2,7 @@
 
 ARG GO_IMAGE=golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
 ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:latest@sha256:a9fcaedd4c9b59e12dd65d954f0b5044f19b0647a8a3712e77205df9e7b102cd
-ARG VERSION=4.4.0-dev
+ARG VERSION=4.4.1-dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=1970-01-01T00:00:00Z
 
@@ -58,7 +58,8 @@ LABEL org.opencontainers.image.title="sshappy" \
       org.opencontainers.image.source="https://github.com/SadNoo/sshappy" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
 
-ENV HOME=/var/lib/sshappy
+ENV HOME=/var/lib/sshappy \
+    MYSQL_TLS_MODE=disabled
 
 # Root is intentional for the default image: the relay port is panel-managed
 # and may be below 1024. Deployments using only high ports can opt into the
