@@ -68,7 +68,7 @@
 | `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |
 | `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
 | `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
-| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 逗号分隔的禁止出口 IP/CIDR；单个 IPv4 会规范为 `/32`。节点经 NAT 暴露、其公网地址不在本机网卡上时必须显式填写该公网 IP，防止用户经代理回连节点自身 |
+| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 必填的逗号分隔禁止出口 IP/CIDR；至少包含节点实际公网地址，单个 IPv4 会规范为 `/32`。缺失或格式错误时节点拒绝启动，防止用户经代理回连节点自身 |
 | `FLYSKY_CHANGE_POLL_SECONDS` | 增量同步周期 |
 | `FLYSKY_HEARTBEAT_SECONDS` | 状态心跳周期 |
 | `FLYSKY_USAGE_REPORT_SECONDS` | 流量落盘与上报周期，默认 30 秒 |
@@ -87,7 +87,7 @@
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
-先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 设置为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。可同时填写多个 IP/CIDR并以英文逗号分隔。格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
+先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 的占位符替换为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。这是所有部署的必填项；可同时填写多个 IP/CIDR并以英文逗号分隔。缺失或格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
 
 ~~~bash
 install -d -m 0700 /var/lib/flysky/ssbad /etc/flysky/ssbad/secrets

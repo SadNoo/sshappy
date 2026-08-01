@@ -72,6 +72,14 @@ func TestLoadConfigRejectsInvalidProtectedEgressPrefixes(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRequiresProtectedEgressPrefix(t *testing.T) {
+	t.Setenv("FLYSKY_CONTROL_PLANE_URL", "https://panel.example")
+	t.Setenv("FLYSKY_PROTECTED_EGRESS_PREFIXES", "")
+	if err := LoadConfig().Validate(); err == nil || !strings.Contains(err.Error(), "must include the node public address") {
+		t.Fatalf("missing protected prefix error = %v", err)
+	}
+}
+
 func TestConfigRejectsInvalidProtectedEgressPrefixValue(t *testing.T) {
 	config := testConfig(t)
 	config.ProtectedEgressPrefixes = []netip.Prefix{{}}
@@ -84,7 +92,10 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
 	return Config{
-		ControlPlaneURL:       "https://panel.example",
+		ControlPlaneURL: "https://panel.example",
+		ProtectedEgressPrefixes: []netip.Prefix{
+			netip.MustParsePrefix("203.0.113.10/32"),
+		},
 		EnrollmentTokenPath:   filepath.Join(dir, "enrollment"),
 		MachineCredentialPath: filepath.Join(dir, "machine.json"),
 		SnapshotPath:          filepath.Join(dir, "snapshot.json"),
