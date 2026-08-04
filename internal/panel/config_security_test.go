@@ -35,11 +35,11 @@ func TestMySQLTLSMode(t *testing.T) {
 	}
 }
 
-func TestDefaultMySQLTLSModeIsAuto(t *testing.T) {
+func TestDefaultMySQLTLSModeIsDisabled(t *testing.T) {
 	t.Setenv("MYSQL_TLS_MODE", "")
 	t.Setenv("MYSQL_TLS", "")
-	if got := LoadConfig().MySQLTLSMode; got != "auto" {
-		t.Fatalf("default MySQL TLS mode = %q, want auto", got)
+	if got := LoadConfig().MySQLTLSMode; got != "disabled" {
+		t.Fatalf("default MySQL TLS mode = %q, want disabled", got)
 	}
 }
 

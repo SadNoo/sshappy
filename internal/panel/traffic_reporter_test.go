@@ -3,6 +3,7 @@ package panel
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,15 @@ type fakeTrafficDatabase struct {
 	batchIDs []string
 	nodes    []Node
 	onReport func()
+}
+
+func TestOnlyOutboxPersistenceFailureStopsAccounting(t *testing.T) {
+	if fatalTrafficReportError(errors.New("database unavailable")) {
+		t.Fatal("ordinary database failure would stop the relay")
+	}
+	if !fatalTrafficReportError(fmt.Errorf("capture failed: %w", errTrafficOutboxPersistence)) {
+		t.Fatal("outbox persistence failure would not stop the relay")
+	}
 }
 
 func (d *fakeTrafficDatabase) ReportTraffic(node Node, batchID string, _ []TrafficDelta) error {

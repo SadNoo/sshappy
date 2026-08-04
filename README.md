@@ -1,10 +1,18 @@
-# sshappy 4.3.1
+# sshappy 4.5
 
 `sshappy` is a Go implementation of a Shadowsocks 2022 node with an SSPanel-compatible runtime. This repository keeps the upstream `shadowsocks-go` server and domain-set converter, and adds `sstest`, which loads node/user policy from MySQL, enforces runtime limits, reports traffic and online state, and persists unreported traffic locally for retry.
 
-Version 4.3.1 is developed on the `4.3.1` branch from the immutable `v4.3.0` baseline. The `4.3` branch, the `v4.3.0` Git tag, and the `sadno/sstest:4.3` and `sadno/sstest:4.3.0` images are frozen rollback references and must not be moved, rebuilt or overwritten. The traffic-outbox JSON remains byte-shape compatible with 4.2 for both its single- and multi-batch forms; as in 4.2, a recovered batch uses the node ID and traffic rate current when it is flushed.
+Version 4.5 is based directly on immutable `v4.3.1` and intentionally does not inherit the `v4.4.0` or `v4.4.1` release lines. The `v4.3.1` tag and `sadno/sstest:4.3.1` image remain the first rollback references. The traffic-outbox JSON remains byte-shape compatible with 4.3.1 and 4.2 for both its single- and multi-batch forms.
 
-## 4.3.1 hardening
+## 4.5 database resilience
+
+- Traffic-accounting database failures no longer stop the relay while the durable local outbox remains writable. Database recovery replays the same idempotent batches.
+- Authorization refresh remains fail-closed, but its default stale-snapshot grace is one hour for nodes connected over unreliable networks.
+- MySQL advisory-lock waits are capped below the socket I/O timeout, fast stale-connection failures receive one fresh-connection retry, and transaction errors identify the failed accounting stage.
+- The default MySQL TLS mode is `disabled`, so deployments using the expected plaintext database do not need an extra environment variable. Keep that connection on a trusted private or encrypted network.
+- Idle pooled MySQL connections expire after 30 seconds to reduce reuse of stale WAN/NAT connections.
+
+## Inherited 4.3.1 hardening
 
 - User target restrictions are compiled strictly. An invalid `forbidden_ip`, `forbidden_port` or `disconnect_ip` rule rejects only its owning user instead of being silently ignored or interrupting unrelated users.
 - TCP and UDP domain targets are checked again against `forbidden_ip` after resolution, using the final IP selected for the outbound connection. UDP sessions pin up to 64 resolved domains locally, preventing per-packet DNS amplification and DNS rebinding within a session.
@@ -44,14 +52,13 @@ MYSQL_HOST=127.0.0.1 \
 MYSQL_DB=sspanel \
 MYSQL_USER=sshappy \
 MYSQL_PASS='replace-with-a-secret' \
-MYSQL_TLS_MODE=disabled \
 ./sstest
 ```
 
-The database used by this deployment cannot negotiate TLS, so its examples explicitly set `MYSQL_TLS_MODE=disabled`. This sends database credentials and queries in plaintext; use it only on a trusted private network with firewall rules that prevent public access. The application default remains `auto` for other deployments.
+MySQL TLS is disabled by default for this deployment. This sends database credentials and queries in plaintext; use it only on a trusted private network, an encrypted tunnel such as WireGuard, and firewall rules that prevent public access. Deployments with database TLS can still opt into `MYSQL_TLS_MODE=verify` with a trusted CA.
 
 See [configuration](docs/configuration.md) for all environment variables and [operations](docs/operations.md) for data durability, shutdown and rollback guidance.
-Known items that require a product contract, schema migration or further deployment work are tracked in [4.3.1 remaining work](docs/4.3.1-remaining-work.md).
+See the [4.5 release notes](docs/4.5-release-notes.md) and the inherited [4.3.1 remaining work](docs/4.3.1-remaining-work.md).
 
 Automatic traffic-marker cleanup is disabled by default. Do not enable it without first reading the single-instance and recovery-window requirements in the operations guide.
 
@@ -93,11 +100,11 @@ The reviewed container build is intentionally limited to `linux/amd64`. It uses 
 ```sh
 docker buildx build \
   --platform linux/amd64 \
-  --build-arg VERSION=4.3.1 \
+  --build-arg VERSION=4.5 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load -f Dockerfile.sstest \
-  -t sadno/sstest:4.3.1 .
+  -t sadno/sstest:4.5 .
 ```
 
 See [Docker deployment](docs/docker.md) for persistent state, privileged relay ports, optional non-root execution, TCP/UDP publication, MySQL and shutdown requirements.

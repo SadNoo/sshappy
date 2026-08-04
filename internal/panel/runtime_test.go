@@ -83,11 +83,11 @@ func TestDefaultOperationalSettings(t *testing.T) {
 		config.TCPMaxEstablishedTotal != 0 ||
 		config.TCPTrafficFlushSeconds != 30 ||
 		config.TrafficBatchRetentionDays != 0 ||
-		config.AuthorizationStaleSeconds != 300 ||
+		config.AuthorizationStaleSeconds != 3600 ||
 		config.ResourceReportSeconds != 60 ||
 		config.OutboxMinFreeBytes != 256<<20 ||
 		config.MySQLConnectTimeoutSeconds != 10 ||
-		config.MySQLIOTimeoutSeconds != 30 {
+		config.MySQLIOTimeoutSeconds != 15 {
 		t.Fatalf("unexpected operational defaults: %+v", config)
 	}
 }
@@ -140,12 +140,12 @@ func TestFailClosedWindowRecoversOnlySuccessfulOperation(t *testing.T) {
 	window := newFailClosedWindow(40*time.Millisecond, func() { canceled <- struct{}{} })
 	defer window.Close()
 	window.RecordFailure("node authorization refresh", errors.New("node read failed"), time.Now())
-	window.RecordFailure("traffic accounting", errors.New("traffic write failed"), time.Now())
+	window.RecordFailure("user authorization refresh", errors.New("user read failed"), time.Now())
 	window.RecordSuccess("node authorization refresh", time.Now())
 	select {
 	case <-canceled:
 	case <-time.After(time.Second):
-		t.Fatal("remaining accounting failure did not expire")
+		t.Fatal("remaining authorization failure did not expire")
 	}
 	if err := window.Err(time.Now()); err == nil {
 		t.Fatal("missing accounting expiration error")
@@ -156,8 +156,8 @@ func TestFailClosedWindowSuccessCancelsDeadline(t *testing.T) {
 	canceled := make(chan struct{}, 1)
 	window := newFailClosedWindow(20*time.Millisecond, func() { canceled <- struct{}{} })
 	defer window.Close()
-	window.RecordFailure("traffic accounting", errors.New("traffic write failed"), time.Now())
-	window.RecordSuccess("traffic accounting", time.Now())
+	window.RecordFailure("credential refresh", errors.New("credential write failed"), time.Now())
+	window.RecordSuccess("credential refresh", time.Now())
 	select {
 	case <-canceled:
 		t.Fatal("successful traffic flush did not recover the fail-closed window")
@@ -169,7 +169,7 @@ func TestFailClosedWindowZeroGraceExpiresImmediately(t *testing.T) {
 	canceled := make(chan struct{}, 1)
 	window := newFailClosedWindow(0, func() { canceled <- struct{}{} })
 	defer window.Close()
-	_, remaining, expired := window.RecordFailure("traffic accounting", errors.New("write failed"), time.Now())
+	_, remaining, expired := window.RecordFailure("node authorization refresh", errors.New("read failed"), time.Now())
 	if remaining != 0 || !expired {
 		t.Fatalf("zero-grace failure remaining=%v expired=%v", remaining, expired)
 	}

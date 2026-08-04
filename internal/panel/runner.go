@@ -235,15 +235,10 @@ runLoop:
 			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
 		case <-trafficTicker.C:
 			startedAt := time.Now()
-			flushed, err := reportTraffic(db, node, state, trafficReporter, dbHealth)
-			if flushed {
-				// A successful durable flush starts a fresh failure window even if a
-				// later flush in this reporting cycle fails again.
-				failures.RecordSuccess("traffic accounting", time.Now())
-			}
+			_, err := reportTraffic(db, node, state, trafficReporter, dbHealth)
 			if err != nil {
 				outbox := trafficReporter.Metrics(time.Now())
-				if errors.Is(err, errTrafficOutboxPersistence) {
+				if fatalTrafficReportError(err) {
 					logger.Error("Traffic outbox persistence failed; stopping immediately",
 						zap.Duration("duration", time.Since(startedAt)),
 						zap.Int("outboxBatches", outbox.Batches),
@@ -253,20 +248,13 @@ runLoop:
 					stopErr = err
 					break runLoop
 				}
-				age, remaining, expired := failures.RecordFailure("traffic accounting", err, time.Now())
-				logger.Error("Failed to report traffic",
+				logger.Error("Failed to report traffic; durable outbox retained",
 					zap.Duration("duration", time.Since(startedAt)),
-					zap.Duration("staleAge", age),
-					zap.Duration("staleGraceRemaining", remaining),
 					zap.Int("outboxBatches", outbox.Batches),
 					zap.Int64("outboxFileBytes", outbox.FileBytes),
 					zap.Duration("outboxOldestAge", outbox.OldestAge),
 					zap.Error(err),
 				)
-				if expired {
-					stopErr = failures.Err(time.Now())
-					break runLoop
-				}
 			} else {
 				logger.Info("Traffic reported",
 					zap.Duration("duration", time.Since(startedAt)),
@@ -336,6 +324,10 @@ runLoop:
 		return errors.New("upstream service manager stopped with an error")
 	}
 	return nil
+}
+
+func fatalTrafficReportError(err error) bool {
+	return errors.Is(err, errTrafficOutboxPersistence)
 }
 
 func reportTraffic(db trafficDatabase, node Node, state *State, reporter *trafficReporter, health *databaseHealth) (flushed bool, err error) {

@@ -24,8 +24,11 @@ import (
 var processStartedAt = time.Now()
 
 const (
-	trafficSQLBatchSize = 50
-	aliveIPSQLBatchSize = 500
+	trafficSQLBatchSize       = 50
+	aliveIPSQLBatchSize       = 500
+	trafficBatchLockMaxWait   = 5 * time.Second
+	trafficBadConnRetryCount  = 1
+	trafficBadConnRetryWindow = 2 * time.Second
 )
 
 type Database struct {
@@ -50,6 +53,7 @@ func OpenDatabase(config Config) (*Database, error) {
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
+	db.SetConnMaxIdleTime(30 * time.Second)
 	db.SetConnMaxLifetime(3 * time.Minute)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
@@ -254,10 +258,26 @@ func (d *Database) LoadUsers(node Node) ([]User, error) {
 	return users, rows.Err()
 }
 
-func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) (err error) {
+func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDelta) error {
 	if len(traffic) == 0 {
 		return nil
 	}
+	var err error
+	for attempt := 0; attempt <= trafficBadConnRetryCount; attempt++ {
+		startedAt := time.Now()
+		err = d.reportTrafficOnce(node, batchID, traffic)
+		if err == nil || !shouldRetryTrafficReport(err, time.Since(startedAt)) {
+			return err
+		}
+	}
+	return err
+}
+
+func shouldRetryTrafficReport(err error, elapsed time.Duration) bool {
+	return errors.Is(err, driver.ErrBadConn) && elapsed <= trafficBadConnRetryWindow
+}
+
+func (d *Database) reportTrafficOnce(node Node, batchID string, traffic []TrafficDelta) (err error) {
 	conn, release, err := d.acquireTrafficBatchLock(node.ID, batchID)
 	if err != nil {
 		return err
@@ -308,11 +328,12 @@ func (d *Database) ReportTraffic(node Node, batchID string, traffic []TrafficDel
 }
 
 func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Conn, func() error, error) {
-	timeoutSeconds := d.config.MySQLIOTimeoutSeconds
-	if timeoutSeconds < 1 {
-		timeoutSeconds = 30
+	ioTimeout := time.Duration(d.config.MySQLIOTimeoutSeconds) * time.Second
+	if ioTimeout <= 0 {
+		ioTimeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds+1)*time.Second)
+	lockWait := trafficBatchLockWait(ioTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
 	defer cancel()
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
@@ -320,15 +341,15 @@ func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Con
 	}
 	lockName := trafficBatchLockName(nodeID, batchID)
 	var acquired sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, timeoutSeconds).Scan(&acquired); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, int(lockWait/time.Second)).Scan(&acquired); err != nil {
 		// The server may have granted the lock before the response was lost.
 		// Discard the physical connection instead of returning it to the pool.
 		discardSQLConn(conn)
-		return nil, nil, fmt.Errorf("failed to acquire traffic batch lock: %w", err)
+		return nil, nil, fmt.Errorf("failed to acquire traffic batch lock after %s: %w", lockWait, err)
 	}
 	if !acquired.Valid || acquired.Int64 != 1 {
 		_ = conn.Close()
-		return nil, nil, fmt.Errorf("timed out acquiring traffic batch lock")
+		return nil, nil, fmt.Errorf("timed out acquiring traffic batch lock after %s", lockWait)
 	}
 	release := func() error {
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -350,6 +371,10 @@ func (d *Database) acquireTrafficBatchLock(nodeID int, batchID string) (*sql.Con
 	return conn, release, nil
 }
 
+func trafficBatchLockWait(ioTimeout time.Duration) time.Duration {
+	return min(trafficBatchLockMaxWait, max(ioTimeout-time.Second, 0))
+}
+
 func discardSQLConn(conn *sql.Conn) {
 	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 	_ = conn.Close()
@@ -363,7 +388,7 @@ func trafficBatchLockName(nodeID int, batchID string) string {
 func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID string) (bool, error) {
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("begin batch marker check: %w", err)
 	}
 	result, err := tx.Exec(
 		"INSERT IGNORE INTO sshappy_traffic_batch (batch_id, node_id, created_at) VALUES (?, ?, ?)",
@@ -373,15 +398,15 @@ func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID str
 	)
 	if err != nil {
 		_ = tx.Rollback()
-		return false, err
+		return false, fmt.Errorf("write batch marker check: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
 		_ = tx.Rollback()
-		return false, err
+		return false, fmt.Errorf("read batch marker result: %w", err)
 	}
 	if err := tx.Rollback(); err != nil {
-		return false, err
+		return false, fmt.Errorf("rollback batch marker check: %w", err)
 	}
 	return inserted == 0, nil
 }
@@ -389,7 +414,7 @@ func (d *Database) trafficBatchCommitted(conn *sql.Conn, nodeID int, batchID str
 func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string, batch []billedTrafficDelta, now int64) error {
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin traffic chunk transaction: %w", err)
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(
@@ -399,22 +424,22 @@ func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string,
 		now,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("write traffic chunk marker: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("read traffic chunk marker result: %w", err)
 	}
 	if inserted == 0 {
 		return nil
 	}
 	query, args := userTrafficUpdateStatement(batch, now)
 	if _, err := tx.Exec(query, args...); err != nil {
-		return err
+		return fmt.Errorf("update user traffic counters: %w", err)
 	}
 	query, args = trafficLogInsertStatement(batch, node, now)
 	if _, err := tx.Exec(query, args...); err != nil {
-		return err
+		return fmt.Errorf("insert user traffic logs: %w", err)
 	}
 	var total int64
 	for _, delta := range batch {
@@ -425,15 +450,18 @@ func (d *Database) reportTrafficChunk(conn *sql.Conn, node Node, chunkID string,
 		SET node_heartbeat = ?, node_bandwidth = node_bandwidth + ?
 		WHERE id = ?
 	`, now, total, node.ID); err != nil {
-		return err
+		return fmt.Errorf("update node traffic counter: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit traffic chunk transaction: %w", err)
+	}
+	return nil
 }
 
 func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID string, chunkIDs []string, now int64) error {
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin traffic batch finalization: %w", err)
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(
@@ -442,7 +470,7 @@ func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID stri
 		nodeID,
 		now,
 	); err != nil {
-		return err
+		return fmt.Errorf("write final traffic batch marker: %w", err)
 	}
 	if len(chunkIDs) > 0 {
 		var query strings.Builder
@@ -455,10 +483,13 @@ func (d *Database) finalizeTrafficBatch(conn *sql.Conn, nodeID int, batchID stri
 			args = append(args, chunkID)
 		}
 		if _, err := tx.Exec(query.String(), args...); err != nil {
-			return err
+			return fmt.Errorf("remove traffic chunk markers: %w", err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit traffic batch finalization: %w", err)
+	}
+	return nil
 }
 
 func trafficChunkID(batchID string, nodeID, index int) string {

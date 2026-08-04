@@ -1,28 +1,28 @@
-# Docker image for Debian 11+ hosts
+# sshappy 4.5 Docker image for Debian 11+ hosts
 
-The 4.3.1 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime is Debian 12 distroless/static, which can run on supported Docker Engine installations on Debian 11 and newer hosts. An OCI image cannot enforce the host distribution or version, so a real Debian 11 host remains part of deployment acceptance testing.
+The 4.5 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime is Debian 12 distroless/static, which can run on supported Docker Engine installations on Debian 11 and newer hosts.
 
 The image does not contain a shell, package manager, database credentials, node keys, user credentials or a MySQL CA. It retains the Debian CA bundle and timezone data needed by a static Go service.
 
 ## Build
 
-Run this from the 4.3.1 repository root:
+Run this from the 4.5 repository root:
 
 ```sh
 docker buildx build \
   --platform linux/amd64 \
   --pull \
-  --build-arg VERSION=4.3.1 \
+  --build-arg VERSION=4.5 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load \
   -f Dockerfile.sstest \
-  -t sadno/sstest:4.3.1 .
+  -t sadno/sstest:4.5 .
 ```
 
 The base images are pinned by digest. Updating either digest is a reviewed dependency change, not an automatic tag refresh.
 
-The `4.3` branch, `v4.3.0` Git tag and `sadno/sstest:4.3` / `sadno/sstest:4.3.0` images are the immutable rollback baseline. Both baseline image tags resolve to OCI index digest `sha256:65cdd4492e0a16fc5614d82a79bf498a317e4b4df89ea7f80cc0c51f83431ba5`; pin that digest for rollback. Do not rebuild or repush those tags. Publish this patch only as `sadno/sstest:4.3.1`, and record its registry digest before deployment.
+Version 4.5 is based directly on `v4.3.1`; it does not inherit either `v4.4.x` tag. Preserve `sadno/sstest:4.3.1` as the first rollback image and record the 4.5 registry digest before deployment.
 
 ## Runtime state, user and secrets
 
@@ -40,7 +40,7 @@ For a bind mount used with the optional non-root account, create the host direct
 
 If `MYSQL_TLS_MODE=verify` uses a private CA, mount that file read-only and set `MYSQL_TLS_CA` to its container path. Do not copy the CA or password into the image.
 
-The database used by this deployment cannot negotiate TLS, so set `MYSQL_TLS_MODE=disabled`. This is required for a remote plaintext database because the default `auto` mode requires encryption for non-loopback hosts. Plaintext exposes database credentials and queries to the network; keep the connection on a trusted private network and block public access to MySQL.
+MySQL TLS is disabled by default and does not need an environment argument. Plaintext exposes database credentials and queries to the network; keep the connection on a trusted private network or encrypted tunnel and block public access to MySQL.
 
 ## Run on a privileged relay port
 
@@ -53,11 +53,10 @@ docker run -d \
   --restart unless-stopped \
   --stop-timeout 120 \
   --env-file /secure/path/sshappy.env \
-  --env MYSQL_TLS_MODE=disabled \
   --mount type=volume,src=sshappy-node,dst=/var/lib/sshappy \
   -p 1023:1023/tcp \
   -p 1023:1023/udp \
-  sadno/sstest:4.3.1
+  sadno/sstest:4.5
 ```
 
 The default root user already supports ports below 1024; the image does not require `--privileged`, `NET_ADMIN` or `NET_RAW`. A deployment may optionally reduce capabilities while retaining a privileged port with `--cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true`. If it uses only ports 1024 or higher, it may instead add `--user 65532:65532`.
@@ -69,7 +68,7 @@ The application handles `SIGTERM` and persists/retries final accounting during s
 ## Verification
 
 ```sh
-docker image inspect sadno/sstest:4.3.1 \
+docker image inspect sadno/sstest:4.5 \
   --format 'platform={{.Os}}/{{.Architecture}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}}'
 ```
 

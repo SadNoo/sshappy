@@ -12,15 +12,12 @@
 | `MYSQL_DB` | `sspanel` | Database/schema name. Legacy alias: `MYSQLDBNAME`. |
 | `MYSQL_USER` | `root` | Database user. Legacy alias: `MYSQLUSR`. |
 | `MYSQL_PASS` | empty | Database password. Legacy alias: `MYSQLPASSWD`. |
-| `MYSQL_TLS_MODE` | `auto` | `auto`, `disabled`, `preferred`, `required`, or `verify`. |
+| `MYSQL_TLS_MODE` | `disabled` | Optional override: `auto`, `disabled`, `preferred`, `required`, or `verify`. |
 | `MYSQL_TLS_CA` | empty | PEM CA file; required when TLS mode is `verify`. |
 | `MYSQL_CONNECT_TIMEOUT_SECONDS` | `10` | Positive connection timeout. |
-| `MYSQL_IO_TIMEOUT_SECONDS` | `30` | Positive read/write timeout. |
+| `MYSQL_IO_TIMEOUT_SECONDS` | `15` | Positive read/write timeout. |
 
-`auto` disables TLS only for loopback/localhost and otherwise requires an encrypted connection. `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
-`disabled` permits plaintext authentication and queries; use it only when the database cannot support TLS and the connection stays on a trusted private network.
-
-The database used by this deployment cannot negotiate TLS, so its 4.3.1 environment example explicitly sets `MYSQL_TLS_MODE=disabled`. Do not expose that database connection to the public Internet; restrict it to the node and database hosts on a trusted private network.
+`disabled` permits plaintext authentication and queries and is the deployment default, so it does not need to be included in the Docker command. Do not expose the database connection to the public Internet. `auto` disables TLS only for loopback/localhost and otherwise requires encryption; `verify` additionally validates the server certificate against `MYSQL_TLS_CA` and the configured host name.
 
 If both a standard name and its legacy alias are present, keep their values identical. Legacy aliases are retained for compatibility and should be removed from new deployments.
 
@@ -32,7 +29,7 @@ If both a standard name and its legacy alias are present, keep their values iden
 | `ENABLE_TCP` | `true` | Enable TCP relay. |
 | `ENABLE_UDP` | `true` | Enable UDP relay. At least one relay must be enabled. |
 | `SYNC_INTERVAL_SECONDS` | `60` | Node and user policy refresh interval. |
-| `AUTH_STALE_GRACE_SECONDS` | `300` | Hard deadline after the first node/user/credential refresh or traffic-accounting failure. The relay is canceled at the deadline even while the runner is busy. Zero fails closed on the first failure. |
+| `AUTH_STALE_GRACE_SECONDS` | `3600` | Hard deadline after the first node/user/credential refresh failure. Traffic-accounting failures do not consume this window while the durable outbox remains writable. Zero fails closed on the first authorization failure. |
 | `TRAFFIC_REPORT_SECONDS` | `60` | Traffic capture/report interval. |
 | `NODE_REPORT_SECONDS` | `60` | Heartbeat and online-count interval. |
 | `ALIVE_IP_REPORT_SECONDS` | `60` | Alive-IP report interval. |
@@ -70,9 +67,9 @@ If both a standard name and its legacy alias are present, keep their values iden
 
 The process account needs read/write access to the two state files and their parent directory. Do not expose either file through a web server, support bundle or source-control checkout.
 
-The 4.3.1 outbox deliberately uses the exact 4.2 JSON fields and wrapper version so the same durable state can be reused after a sequential rollback. Billing also keeps the 4.2 rule: the node ID and traffic rate are read from the current node when a batch is flushed, not when it is captured. A rate change while traffic is pending therefore applies the new rate to the recovered batch. Back up the state directory before upgrading, and do not move one node's outbox to a different node.
+The 4.5 outbox deliberately uses the exact 4.3.1/4.2 JSON fields and wrapper version so the same durable state can be reused after a sequential rollback. Billing keeps the 4.2 rule: the node ID and traffic rate are read from the current node when a batch is flushed, not when it is captured. A rate change while traffic is pending therefore applies the new rate to the recovered batch. Back up the state directory before upgrading, and do not move one node's outbox to a different node.
 
-When an existing database backlog cannot be flushed, 4.3.1 persists newly captured traffic as another compatible outbox batch before returning the database error. A local outbox write failure remains immediately fatal; keep the state directory persistent and writable and never run two writers against one outbox.
+When an existing database backlog cannot be flushed, 4.5 persists newly captured traffic as another compatible outbox batch and keeps the relay running. A local outbox write or removal failure remains immediately fatal; keep the state directory persistent and writable and never run two writers against one outbox. During an accounting outage, committed panel quotas do not include pending local traffic until replay succeeds.
 
 Set `TRAFFIC_BATCH_RETENTION_DAYS` above zero only for a single active reporter for that node and only when the retention period exceeds every possible outbox, backup and disaster-recovery replay window. Cleanup is not coordinated with another host's outbox.
 

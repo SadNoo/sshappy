@@ -1,11 +1,42 @@
 package panel
 
 import (
+	"database/sql/driver"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestTrafficBatchLockWaitStaysBelowIOTimeout(t *testing.T) {
+	for _, test := range []struct {
+		ioTimeout time.Duration
+		want      time.Duration
+	}{
+		{ioTimeout: 30 * time.Second, want: 5 * time.Second},
+		{ioTimeout: 5 * time.Second, want: 4 * time.Second},
+		{ioTimeout: time.Second, want: 0},
+	} {
+		if got := trafficBatchLockWait(test.ioTimeout); got != test.want {
+			t.Fatalf("trafficBatchLockWait(%s) = %s, want %s", test.ioTimeout, got, test.want)
+		}
+	}
+}
+
+func TestTrafficBadConnectionClassificationSurvivesWrapping(t *testing.T) {
+	err := fmt.Errorf("traffic chunk failed: %w", driver.ErrBadConn)
+	if !shouldRetryTrafficReport(err, time.Second) {
+		t.Fatalf("quick wrapped bad connection is not retryable: %v", err)
+	}
+	if shouldRetryTrafficReport(err, 3*time.Second) {
+		t.Fatalf("slow I/O failure would be retried immediately: %v", err)
+	}
+	if shouldRetryTrafficReport(errors.New("database unavailable"), 0) {
+		t.Fatal("ordinary database failure was classified as a stale connection")
+	}
+}
 
 func TestTrafficBatchStatements(t *testing.T) {
 	batch := []billedTrafficDelta{
