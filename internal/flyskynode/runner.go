@@ -411,7 +411,7 @@ func capabilityReport(config Config) flyskyapi.CapabilityReport {
 		},
 		Features: []string{
 			"snapshot_v1", "cursor_changes_v1", "status_report_v1", "credential_rotation_v1",
-			"usage_batch_v1", "alive_ip_aggregate_v1", "node_dns_v1",
+			"usage_batch_v1", "alive_ip_aggregate_v1", "node_dns_v1", "fake_ip_domain_v1",
 		},
 	}
 }
