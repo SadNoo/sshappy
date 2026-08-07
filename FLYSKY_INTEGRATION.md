@@ -54,6 +54,24 @@
 - IPv4、IPv6 和双栈监听统一使用标准地址拼接。默认 `LISTEN_HOST=0.0.0.0`，保证不受宿主机 `net.ipv6.bindv6only` 设置影响；明确验证双栈内核行为后才可改为 `::`。
 - 检测到新的注册令牌文件时优先执行重新注册并原子替换旧机器凭据，避免旧凭据继续请求新节点而返回 `NODE_FORBIDDEN`；管理端安装命令仍必须为每个节点使用独立状态目录。
 
+### 3.1 节点 DNS 候选
+
+`sadno/flyskynode:3.1` 当前只作为待真机验收候选，不替换 Panel 默认的
+`sadno/flyskynode:3.0`。候选增加 `node_dns_v1` 能力，并在启动时读取容器自己的
+`/etc/resolv.conf`：
+
+- 只把隧道内固定目标 `198.18.0.53:53` 映射到其中经过校验、去重且最多四个的 IPv4
+  nameserver；UDP 和 TCP 都适用。
+- UDP 只有在同一代理会话实际发送过该虚拟目标后，才把精确上游的回包源地址恢复为
+  `198.18.0.53:53`；普通公开 DNS 流量不会仅因源地址相同而被改写。
+- 直接访问 RFC1918、CGNAT、回环、metadata、控制面、节点网卡或管理员保护网段仍被
+  consumer-node egress ACL 拒绝；该功能不会在公网监听 DNS，也不会把节点变成递归服务器。
+- 容器没有可用 IPv4 nameserver 时拒绝启动。节点 DNS 最后一跳遵循节点系统配置，可能是
+  普通 UDP/TCP 53；查询进入节点前仍由当前用户的 SS2022 会话加密。
+
+3.1 只有在配套 iOS 候选、DNS 泄漏、节点切换、UDP/TCP DNS、网络切换和常用站点真机
+Gate 全部通过后，才允许提交、推送或切换 Panel 默认镜像。
+
 ### Flysky 联调配置
 
 | 变量 | 用途 |
@@ -84,7 +102,7 @@
 - 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
 - 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
 - Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
-- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前发布名称为 `sadno/flyskynode:2.0`。
+- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前稳定发布名称为 `sadno/flyskynode:3.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
@@ -101,7 +119,7 @@ docker compose -f deploy/compose.yaml pull
 docker compose -f deploy/compose.yaml up -d
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。发布标签为 `sadno/flyskynode:2.0`；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。稳定标签为 `sadno/flyskynode:3.0`；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
 管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
 
@@ -112,7 +130,7 @@ printf '\n'
 umask 077
 printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
 unset FLYSKY_ENROLLMENT_TOKEN
-docker pull sadno/flyskynode:2.0
+docker pull sadno/flyskynode:3.0
 ~~~
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。

@@ -1,11 +1,14 @@
 package flyskynode
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +36,8 @@ type outboundACL struct {
 	resolver             ipResolver
 	controlPlaneHostname string
 	protectedPrefixes    []netip.Prefix
+	nodeDNSUpstreams     []netip.Addr
+	nodeDNSUpstreamSet   map[netip.Addr]struct{}
 	now                  func() time.Time
 
 	dnsMu       sync.Mutex
@@ -60,6 +65,8 @@ const (
 	outboundDNSLookupTimeout = 5 * time.Second
 	outboundDNSCacheMax      = 256
 	outboundDNSInflightMax   = 256
+	maximumNodeDNSUpstreams  = 4
+	systemResolverConfigPath = "/etc/resolv.conf"
 )
 
 var (
@@ -80,16 +87,22 @@ var (
 		netip.MustParsePrefix("224.0.0.0/4"),
 		netip.MustParsePrefix("240.0.0.0/4"),
 	}
-	wellKnownNAT64Prefix = netip.MustParsePrefix("64:ff9b::/96")
-	localUseNAT64Prefix  = netip.MustParsePrefix("64:ff9b:1::/48")
+	wellKnownNAT64Prefix  = netip.MustParsePrefix("64:ff9b::/96")
+	localUseNAT64Prefix   = netip.MustParsePrefix("64:ff9b:1::/48")
+	nodeDNSVirtualAddress = netip.MustParseAddr("198.18.0.53")
 )
 
 func newOutboundACL(controlPlaneURL string, protectedPrefixes []netip.Prefix) (*outboundACL, error) {
-	return newOutboundACLWithDependencies(
+	dnsUpstreams, err := readSystemDNSUpstreams(systemResolverConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	return newOutboundACLWithDNSDependencies(
 		controlPlaneURL,
 		protectedPrefixes,
 		net.DefaultResolver,
 		net.InterfaceAddrs,
+		dnsUpstreams,
 	)
 }
 
@@ -98,6 +111,18 @@ func newOutboundACLWithDependencies(
 	protectedPrefixes []netip.Prefix,
 	resolver ipResolver,
 	interfaceAddrs func() ([]net.Addr, error),
+) (*outboundACL, error) {
+	return newOutboundACLWithDNSDependencies(
+		controlPlaneURL, protectedPrefixes, resolver, interfaceAddrs, nil,
+	)
+}
+
+func newOutboundACLWithDNSDependencies(
+	controlPlaneURL string,
+	protectedPrefixes []netip.Prefix,
+	resolver ipResolver,
+	interfaceAddrs func() ([]net.Addr, error),
+	dnsUpstreams []netip.Addr,
 ) (*outboundACL, error) {
 	if resolver == nil {
 		return nil, errors.New("outbound ACL resolver is unavailable")
@@ -115,9 +140,25 @@ func newOutboundACLWithDependencies(
 		resolver:             resolver,
 		controlPlaneHostname: controlHost,
 		protectedPrefixes:    make([]netip.Prefix, 0, len(protectedPrefixes)+8),
+		nodeDNSUpstreams:     make([]netip.Addr, 0, len(dnsUpstreams)),
+		nodeDNSUpstreamSet:   make(map[netip.Addr]struct{}, len(dnsUpstreams)),
 		now:                  time.Now,
 		dnsCache:             make(map[string]outboundDNSCacheEntry),
 		dnsInflight:          make(map[string]*outboundDNSLookup),
+	}
+	for _, upstream := range dnsUpstreams {
+		upstream = upstream.Unmap()
+		if !validNodeDNSUpstream(upstream) {
+			return nil, errors.New("invalid node DNS upstream")
+		}
+		if _, exists := acl.nodeDNSUpstreamSet[upstream]; exists {
+			continue
+		}
+		if len(acl.nodeDNSUpstreams) >= maximumNodeDNSUpstreams {
+			break
+		}
+		acl.nodeDNSUpstreamSet[upstream] = struct{}{}
+		acl.nodeDNSUpstreams = append(acl.nodeDNSUpstreams, upstream)
 	}
 	for _, prefix := range protectedPrefixes {
 		if err := acl.addProtectedPrefix(prefix); err != nil {
@@ -156,6 +197,16 @@ func (a *outboundACL) ResolveAndAuthorize(ctx context.Context, target conn.Addr)
 
 	if target.IsIP() {
 		ip := target.IP()
+		if ip.Unmap() == nodeDNSVirtualAddress && target.Port() == 53 {
+			if len(a.nodeDNSUpstreams) == 0 {
+				return nil, router.ErrRejected
+			}
+			resolved := make([]conn.Addr, 0, len(a.nodeDNSUpstreams))
+			for _, upstream := range a.nodeDNSUpstreams {
+				resolved = append(resolved, conn.AddrFromIPAndPort(upstream, 53))
+			}
+			return resolved, nil
+		}
 		if !a.allowIP(ip) {
 			return nil, router.ErrRejected
 		}
@@ -191,6 +242,94 @@ func (a *outboundACL) ResolveAndAuthorize(ctx context.Context, target conn.Addr)
 		return nil, router.ErrRejected
 	}
 	return candidates, nil
+}
+
+// ResponseSourceRewrite opts into restoring the tunnel-only DNS virtual
+// address only when this packet was originally addressed to that exact
+// virtual endpoint and was authorized to an exact system resolver.
+func (a *outboundACL) ResponseSourceRewrite(originalTarget, authorizedTarget conn.Addr) (netip.AddrPort, bool) {
+	if !originalTarget.IsIP() || originalTarget.IP().Unmap() != nodeDNSVirtualAddress || originalTarget.Port() != 53 ||
+		!authorizedTarget.IsIP() || authorizedTarget.Port() != 53 {
+		return netip.AddrPort{}, false
+	}
+	if _, ok := a.nodeDNSUpstreamSet[authorizedTarget.IP().Unmap()]; !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(nodeDNSVirtualAddress, 53), true
+}
+
+func readSystemDNSUpstreams(path string) ([]netip.Addr, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("open node system resolver configuration")
+	}
+	defer file.Close()
+	upstreams, err := parseSystemDNSUpstreams(file)
+	if err != nil {
+		return nil, err
+	}
+	if len(upstreams) == 0 {
+		return nil, errors.New("node system resolver configuration has no usable IPv4 nameserver")
+	}
+	return upstreams, nil
+}
+
+func parseSystemDNSUpstreams(reader io.Reader) ([]netip.Addr, error) {
+	if reader == nil {
+		return nil, errors.New("node system resolver configuration is unavailable")
+	}
+	scanner := bufio.NewScanner(reader)
+	upstreams := make([]netip.Addr, 0, 2)
+	seen := make(map[netip.Addr]struct{}, 2)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		upstream, err := netip.ParseAddr(fields[1])
+		if err != nil {
+			continue
+		}
+		upstream = upstream.Unmap()
+		if !validNodeDNSUpstream(upstream) {
+			continue
+		}
+		if _, exists := seen[upstream]; exists {
+			continue
+		}
+		seen[upstream] = struct{}{}
+		upstreams = append(upstreams, upstream)
+		if len(upstreams) == maximumNodeDNSUpstreams {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, errors.New("read node system resolver configuration")
+	}
+	return upstreams, nil
+}
+
+func validNodeDNSUpstream(ip netip.Addr) bool {
+	if !ip.IsValid() || !ip.Is4() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip == nodeDNSVirtualAddress {
+		return false
+	}
+	// Loopback, RFC1918 and CGNAT resolvers are allowed only through the exact
+	// virtual DNS mapping. Direct proxy access to these addresses remains
+	// blocked by allowIP.
+	if ip.IsLoopback() || ip.IsPrivate() ||
+		netip.MustParsePrefix("100.64.0.0/10").Contains(ip) ||
+		netip.MustParsePrefix("198.18.0.0/15").Contains(ip) {
+		return true
+	}
+	if !ip.IsGlobalUnicast() {
+		return false
+	}
+	for _, prefix := range blockedIPv4Prefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // lookupIPv4 provides a small, shared positive and negative DNS cache. It

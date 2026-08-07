@@ -274,6 +274,20 @@ func TestValidateCapabilities(t *testing.T) {
 	}
 }
 
+func TestCapabilityReportAdvertisesNodeDNSAndInjectedVersion(t *testing.T) {
+	previous := buildVersion
+	buildVersion = "v3.1"
+	t.Cleanup(func() { buildVersion = previous })
+
+	report := capabilityReport(testConfig(t))
+	if report.Version != "3.1" {
+		t.Fatalf("capability version = %q, want 3.1", report.Version)
+	}
+	if !containsString(report.Features, "node_dns_v1") {
+		t.Fatalf("capability features = %v, missing node_dns_v1", report.Features)
+	}
+}
+
 func TestUsageLimitsFromCapabilities(t *testing.T) {
 	t.Parallel()
 	capabilities := flyskyapi.Capabilities{Limits: flyskyapi.CapabilitiesLimits{

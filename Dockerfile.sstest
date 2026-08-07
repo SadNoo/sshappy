@@ -6,7 +6,10 @@ RUN go mod download
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -ldflags="-s -w" -o /out/sstest ./cmd/sstest
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath \
+    -ldflags="-s -w -X github.com/database64128/shadowsocks-go/internal/flyskynode.buildVersion=$VERSION" \
+    -o /out/sstest ./cmd/sstest
 
 FROM scratch
 ARG VERSION=dev

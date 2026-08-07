@@ -411,7 +411,7 @@ func capabilityReport(config Config) flyskyapi.CapabilityReport {
 		},
 		Features: []string{
 			"snapshot_v1", "cursor_changes_v1", "status_report_v1", "credential_rotation_v1",
-			"usage_batch_v1", "alive_ip_aggregate_v1",
+			"usage_batch_v1", "alive_ip_aggregate_v1", "node_dns_v1",
 		},
 	}
 }
@@ -480,7 +480,12 @@ func reportStatus(
 	return next
 }
 
+var buildVersion string
+
 func runtimeVersion() string {
+	if version := strings.TrimSpace(buildVersion); version != "" {
+		return strings.TrimPrefix(version, "v")
+	}
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return strings.TrimPrefix(info.Main.Version, "v")
 	}

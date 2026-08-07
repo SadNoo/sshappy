@@ -20,6 +20,21 @@ type testOutboundPolicy struct {
 	targets  []conn.Addr
 }
 
+type rewritingOutboundPolicy struct {
+	*testOutboundPolicy
+	original netip.AddrPort
+	from     netip.AddrPort
+	to       netip.AddrPort
+}
+
+func (p *rewritingOutboundPolicy) ResponseSourceRewrite(originalTarget, authorizedTarget conn.Addr) (netip.AddrPort, bool) {
+	if originalTarget.IsIP() && originalTarget.IPPort() == p.original &&
+		authorizedTarget.IsIP() && authorizedTarget.IPPort() == p.from {
+		return p.to, true
+	}
+	return netip.AddrPort{}, false
+}
+
 func (p *testOutboundPolicy) ResolveAndAuthorize(_ context.Context, target conn.Addr) ([]conn.Addr, error) {
 	p.calls++
 	p.targets = append(p.targets, target)
@@ -227,6 +242,47 @@ func TestPolicyUDPClientDoesNotPackRejectedTarget(t *testing.T) {
 	}
 	if innerPacker.target.IsValid() {
 		t.Fatalf("inner packer was called for rejected target %v", innerPacker.target)
+	}
+}
+
+func TestPolicyUDPClientRewritesAuthorizedResponseSource(t *testing.T) {
+	innerPacker := &recordingClientPacker{}
+	inner := &recordingUDPClient{packer: innerPacker}
+	upstream := netip.MustParseAddrPort("100.100.101.101:53")
+	virtual := netip.MustParseAddrPort("198.18.0.53:53")
+	policy := &rewritingOutboundPolicy{
+		testOutboundPolicy: &testOutboundPolicy{resolved: []netip.Addr{upstream.Addr()}},
+		original:           virtual,
+		from:               upstream,
+		to:                 virtual,
+	}
+	client := wrapUDPClient(inner, policy)
+	_, session, err := client.NewSession(t.Context())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// The same public resolver must not be rewritten merely because it appears
+	// in policy configuration. This session has not sent the virtual target yet.
+	source, _, _, err := session.Unpacker.UnpackInPlace(nil, upstream, 0, 0)
+	if err != nil {
+		t.Fatalf("UnpackInPlace: %v", err)
+	}
+	if source != upstream {
+		t.Fatalf("unsolicited source = %v, want unchanged %v", source, upstream)
+	}
+
+	if _, _, _, err := session.Packer.PackInPlace(
+		t.Context(), make([]byte, 32), conn.AddrFromIPAndPort(virtual.Addr(), virtual.Port()), 0, 32,
+	); err != nil {
+		t.Fatalf("PackInPlace: %v", err)
+	}
+	source, _, _, err = session.Unpacker.UnpackInPlace(nil, upstream, 0, 0)
+	if err != nil {
+		t.Fatalf("UnpackInPlace after translated send: %v", err)
+	}
+	if source != virtual {
+		t.Fatalf("rewritten source = %v, want %v", source, virtual)
 	}
 }
 

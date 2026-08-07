@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/database64128/shadowsocks-go/conn"
@@ -26,6 +27,14 @@ var ErrOutboundPolicyResolution = errors.New("outbound target policy resolution 
 // candidate; each returned address must have been checked independently.
 type OutboundTargetPolicy interface {
 	ResolveAndAuthorize(context.Context, conn.Addr) ([]conn.Addr, error)
+}
+
+// OutboundResponseSourceRewriter is an optional companion to
+// OutboundTargetPolicy for narrowly-scoped destination translations. The
+// Flysky node uses it to restore the tunnel-only DNS virtual address after an
+// authorized system resolver replies. Ordinary policies do not implement it.
+type OutboundResponseSourceRewriter interface {
+	ResponseSourceRewrite(originalTarget, authorizedTarget conn.Addr) (netip.AddrPort, bool)
 }
 
 type policyStreamClient struct {
@@ -124,7 +133,14 @@ func (c *policyUDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSes
 	if err != nil {
 		return info, session, err
 	}
-	session.Packer = &policyClientPacker{inner: session.Packer, policy: c.policy}
+	packer := &policyClientPacker{inner: session.Packer, policy: c.policy}
+	if rewriter, ok := c.policy.(OutboundResponseSourceRewriter); ok {
+		rewrites := &policyResponseSourceRewrites{sources: make(map[netip.AddrPort]netip.AddrPort)}
+		packer.rewriter = rewriter
+		packer.rewrites = rewrites
+		session.Unpacker = &policyClientUnpacker{inner: session.Unpacker, rewrites: rewrites}
+	}
+	session.Packer = packer
 	return info, session, nil
 }
 
@@ -134,8 +150,64 @@ func (c *policyUDPClient) NewSession(ctx context.Context) (zerocopy.UDPClientSes
 // first candidate throughout one positive-cache generation: rotating the
 // remote IP per packet would change the 5-tuple and break QUIC/UDP sessions.
 type policyClientPacker struct {
-	inner  zerocopy.ClientPacker
-	policy OutboundTargetPolicy
+	inner    zerocopy.ClientPacker
+	policy   OutboundTargetPolicy
+	rewriter OutboundResponseSourceRewriter
+	rewrites *policyResponseSourceRewrites
+}
+
+type policyClientUnpacker struct {
+	inner    zerocopy.ClientUnpacker
+	rewrites *policyResponseSourceRewrites
+}
+
+// policyResponseSourceRewrites is session-scoped. A response source is only
+// rewritten after this exact UDP session sent an authorized packet through a
+// translated virtual destination. Merely receiving a packet from the same
+// public resolver is not enough to activate a rewrite.
+type policyResponseSourceRewrites struct {
+	mu      sync.RWMutex
+	sources map[netip.AddrPort]netip.AddrPort
+}
+
+func (r *policyResponseSourceRewrites) record(actual, rewritten netip.AddrPort) {
+	if !actual.IsValid() || !rewritten.IsValid() {
+		return
+	}
+	r.mu.Lock()
+	r.sources[actual] = rewritten
+	r.mu.Unlock()
+}
+
+func (r *policyResponseSourceRewrites) rewrite(source netip.AddrPort) netip.AddrPort {
+	r.mu.RLock()
+	rewritten, ok := r.sources[source]
+	r.mu.RUnlock()
+	if ok {
+		return rewritten
+	}
+	return source
+}
+
+func (u *policyClientUnpacker) ClientUnpackerInfo() zerocopy.ClientUnpackerInfo {
+	return u.inner.ClientUnpackerInfo()
+}
+
+func (u *policyClientUnpacker) UnpackInPlace(
+	b []byte,
+	packetSourceAddrPort netip.AddrPort,
+	packetStart, packetLen int,
+) (netip.AddrPort, int, int, error) {
+	source, payloadStart, payloadLen, err := u.inner.UnpackInPlace(
+		b,
+		packetSourceAddrPort,
+		packetStart,
+		packetLen,
+	)
+	if err != nil {
+		return netip.AddrPort{}, 0, 0, err
+	}
+	return u.rewrites.rewrite(source), payloadStart, payloadLen, nil
 }
 
 func (p *policyClientPacker) ClientPackerInfo() zerocopy.ClientPackerInfo {
@@ -148,15 +220,25 @@ func (p *policyClientPacker) PackInPlace(
 	target conn.Addr,
 	payloadStart, payloadLen int,
 ) (destAddrPort netip.AddrPort, packetStart, packetLen int, err error) {
-	resolved, err := p.resolveAndAuthorize(ctx, target)
+	canonicalTarget := canonicalOutboundTarget(target)
+	resolved, err := p.resolveAndAuthorize(ctx, canonicalTarget)
 	if err != nil {
 		return netip.AddrPort{}, 0, 0, err
 	}
-	return p.inner.PackInPlace(ctx, b, resolved, payloadStart, payloadLen)
+	destAddrPort, packetStart, packetLen, err = p.inner.PackInPlace(ctx, b, resolved, payloadStart, payloadLen)
+	if err != nil {
+		return netip.AddrPort{}, 0, 0, err
+	}
+	if p.rewriter != nil && p.rewrites != nil {
+		if rewritten, ok := p.rewriter.ResponseSourceRewrite(canonicalTarget, resolved); ok {
+			p.rewrites.record(destAddrPort, rewritten)
+		}
+	}
+	return destAddrPort, packetStart, packetLen, nil
 }
 
 func (p *policyClientPacker) resolveAndAuthorize(ctx context.Context, target conn.Addr) (conn.Addr, error) {
-	candidates, err := p.policy.ResolveAndAuthorize(ctx, canonicalOutboundTarget(target))
+	candidates, err := p.policy.ResolveAndAuthorize(ctx, target)
 	if err != nil {
 		return conn.Addr{}, err
 	}
