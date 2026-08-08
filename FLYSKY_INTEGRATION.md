@@ -148,6 +148,6 @@ docker pull sadno/flyskynode:3.0
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
 
-当前管理后台安装命令尚不会自动探测并填入 NAT 公网地址，这是部署自动化的已知残余；在该自动化补齐前，运维必须保留上述 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 设置。若节点公网地址变化，也必须先更新该值并重启容器。
+当前管理后台安装命令会使用发布记录中的节点域名或 IPv4，在目标主机上解析出当前 IPv4，并自动填入 `FLYSKY_PROTECTED_EGRESS_PREFIXES=<IPv4>/32`；解析失败时命令立即停止，不会启动缺少出口保护的容器。若节点公网地址变化，必须重新生成并执行安装命令或手动更新该值后重启容器。
 
 下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。
