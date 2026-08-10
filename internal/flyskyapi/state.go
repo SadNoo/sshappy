@@ -12,27 +12,40 @@ import (
 	"time"
 )
 
-const maxStateBytes = 64 << 10
+const (
+	maxSmallStateBytes    = 64 << 10
+	maxSyncStateBytes     = 8 << 20
+	maxSnapshotStateBytes = 16 << 20
+)
 
 type SyncState struct {
-	NodeID             string    `json:"node_id"`
-	SchemaVersion      int       `json:"schema_version"`
-	ConfigVersion      string    `json:"config_version"`
-	Cursor             string    `json:"cursor"`
-	SnapshotValidUntil time.Time `json:"snapshot_valid_until"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	NodeID                   string           `json:"node_id"`
+	SchemaVersion            int              `json:"schema_version"`
+	AppliedServingGeneration string           `json:"applied_serving_generation,omitempty"`
+	ConfigVersion            string           `json:"config_version,omitempty"`
+	Cursor                   string           `json:"cursor,omitempty"`
+	SnapshotValidUntil       time.Time        `json:"snapshot_valid_until,omitempty"`
+	UpdatedAt                time.Time        `json:"updated_at"`
+	ResourceVersions         map[string]int64 `json:"resource_versions"`
+}
+
+type StopServingState struct {
+	NodeID            string    `json:"node_id"`
+	ServingGeneration string    `json:"serving_generation"`
+	Phase             string    `json:"phase"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 func SaveMachineCredential(path string, credential MachineCredential) error {
 	if err := validateMachineCredential(credential); err != nil {
 		return err
 	}
-	return writeState(path, credential)
+	return writeState(path, credential, maxSmallStateBytes)
 }
 
 func LoadMachineCredential(path string) (MachineCredential, error) {
 	var credential MachineCredential
-	if err := readState(path, &credential); err != nil {
+	if err := readState(path, &credential, maxSmallStateBytes); err != nil {
 		return MachineCredential{}, err
 	}
 	if err := validateMachineCredential(credential); err != nil {
@@ -45,12 +58,12 @@ func SaveSyncState(path string, state SyncState) error {
 	if err := validateSyncState(state); err != nil {
 		return err
 	}
-	return writeState(path, state)
+	return writeState(path, state, maxSyncStateBytes)
 }
 
 func LoadSyncState(path string) (SyncState, error) {
 	var state SyncState
-	if err := readState(path, &state); err != nil {
+	if err := readState(path, &state, maxSyncStateBytes); err != nil {
 		return SyncState{}, err
 	}
 	if err := validateSyncState(state); err != nil {
@@ -59,16 +72,34 @@ func LoadSyncState(path string) (SyncState, error) {
 	return state, nil
 }
 
+func SaveStopServingState(path string, state StopServingState) error {
+	if err := validateStopServingState(state); err != nil {
+		return err
+	}
+	return writeState(path, state, maxSmallStateBytes)
+}
+
+func LoadStopServingState(path string) (StopServingState, error) {
+	var state StopServingState
+	if err := readState(path, &state, maxSmallStateBytes); err != nil {
+		return StopServingState{}, err
+	}
+	if err := validateStopServingState(state); err != nil {
+		return StopServingState{}, err
+	}
+	return state, nil
+}
+
 func SaveSnapshot(path string, snapshot Snapshot) error {
 	if err := validateSnapshotState(snapshot); err != nil {
 		return err
 	}
-	return writeState(path, snapshot)
+	return writeState(path, snapshot, maxSnapshotStateBytes)
 }
 
 func LoadSnapshot(path string) (Snapshot, error) {
 	var snapshot Snapshot
-	if err := readState(path, &snapshot); err != nil {
+	if err := readState(path, &snapshot, maxSnapshotStateBytes); err != nil {
 		return Snapshot{}, err
 	}
 	if err := validateSnapshotState(snapshot); err != nil {
@@ -85,25 +116,81 @@ func validateMachineCredential(credential MachineCredential) error {
 	return nil
 }
 
+func validateStopServingState(state StopServingState) error {
+	if !validUUIDString(state.NodeID) || !validUUIDString(state.ServingGeneration) ||
+		(state.Phase != "requested" && state.Phase != "stopped") || state.UpdatedAt.IsZero() {
+		return errors.New("invalid Flysky stop-serving state")
+	}
+	return nil
+}
+
 func validateSyncState(state SyncState) error {
-	if strings.TrimSpace(state.NodeID) == "" || state.SchemaVersion < 1 ||
-		strings.TrimSpace(state.ConfigVersion) == "" || strings.TrimSpace(state.Cursor) == "" ||
-		state.SnapshotValidUntil.IsZero() || state.UpdatedAt.IsZero() {
+	if strings.TrimSpace(state.NodeID) == "" || state.SchemaVersion < 1 || state.SchemaVersion > 3 || state.UpdatedAt.IsZero() {
 		return errors.New("invalid Flysky synchronization state")
+	}
+	if state.SchemaVersion < 3 {
+		if strings.TrimSpace(state.AppliedServingGeneration) != "" || strings.TrimSpace(state.ConfigVersion) == "" ||
+			strings.TrimSpace(state.Cursor) == "" || state.SnapshotValidUntil.IsZero() {
+			return errors.New("invalid legacy Flysky synchronization state")
+		}
+	} else {
+		generationSet := strings.TrimSpace(state.AppliedServingGeneration) != ""
+		appliedTupleSet := strings.TrimSpace(state.ConfigVersion) != "" || strings.TrimSpace(state.Cursor) != "" ||
+			!state.SnapshotValidUntil.IsZero()
+		if generationSet != appliedTupleSet || generationSet &&
+			(strings.TrimSpace(state.ConfigVersion) == "" || strings.TrimSpace(state.Cursor) == "" || state.SnapshotValidUntil.IsZero()) {
+			return errors.New("invalid Flysky applied synchronization acknowledgement")
+		}
+		if generationSet && !validUUIDString(state.AppliedServingGeneration) {
+			return errors.New("invalid Flysky applied serving generation")
+		}
+	}
+	if state.SchemaVersion == 1 && len(state.ResourceVersions) != 0 {
+		return errors.New("Flysky synchronization state v1 cannot contain resource versions")
+	}
+	if len(state.ResourceVersions) > MaxResourceVersionFences {
+		return errors.New("Flysky synchronization state contains too many resource versions")
+	}
+	for resourceID, version := range state.ResourceVersions {
+		if strings.TrimSpace(resourceID) == "" || version < 1 {
+			return errors.New("invalid Flysky synchronization resource version")
+		}
 	}
 	return nil
 }
 
 func validateSnapshotState(snapshot Snapshot) error {
-	if snapshot.SchemaVersion < 1 || strings.TrimSpace(snapshot.ConfigVersion) == "" ||
+	if snapshot.SchemaVersion < 1 || !validUUIDString(snapshot.ServingGeneration) || strings.TrimSpace(snapshot.ConfigVersion) == "" ||
 		strings.TrimSpace(snapshot.Cursor) == "" || snapshot.GeneratedAt.IsZero() || snapshot.ValidUntil.IsZero() ||
 		strings.TrimSpace(snapshot.Node.NodeID) == "" || strings.TrimSpace(snapshot.Node.ServerKey) == "" {
 		return errors.New("invalid Flysky snapshot state")
 	}
+	if snapshot.StopServingGeneration != "" &&
+		(!validUUIDString(snapshot.StopServingGeneration) || snapshot.StopServingGeneration != snapshot.ServingGeneration) {
+		return errors.New("invalid Flysky snapshot stop-serving generation")
+	}
+	if len(snapshot.Users) > MaxSnapshotUsers || len(snapshot.ResourceVersions) > MaxResourceVersionFences {
+		return errors.New("Flysky snapshot state contains too many resources")
+	}
 	return nil
 }
 
-func writeState(path string, value any) error {
+func validUUIDString(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for index, char := range value {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			continue
+		}
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f' || char >= 'A' && char <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeState(path string, value any, maxBytes int) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("Flysky state path is required")
 	}
@@ -112,6 +199,9 @@ func writeState(path string, value any) error {
 		return fmt.Errorf("encode Flysky state: %w", err)
 	}
 	data = append(data, '\n')
+	if len(data) > maxBytes {
+		return errors.New("Flysky state is too large")
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create Flysky state directory: %w", err)
@@ -155,7 +245,7 @@ func writeState(path string, value any) error {
 	return nil
 }
 
-func readState(path string, target any) error {
+func readState(path string, target any, maxBytes int64) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("inspect Flysky state: %w", err)
@@ -171,11 +261,11 @@ func readState(path string, target any) error {
 		return fmt.Errorf("open Flysky state: %w", err)
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxStateBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return fmt.Errorf("read Flysky state: %w", err)
 	}
-	if len(data) > maxStateBytes {
+	if int64(len(data)) > maxBytes {
 		return errors.New("Flysky state is too large")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))

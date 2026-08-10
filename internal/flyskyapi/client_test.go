@@ -19,6 +19,7 @@ func TestClientNodeAPIFlow(t *testing.T) {
 	accessToken := "fnode_" + strings.Repeat("a", 43)
 	enrollmentToken := "fenr_" + strings.Repeat("b", 43)
 	nodeID := "10000000-0000-4000-8000-000000000001"
+	servingGeneration := "90000000-0000-4000-8000-000000000009"
 	cursor := "cursor+/with symbols="
 	report := testCapabilityReport()
 	generatedAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
@@ -71,14 +72,21 @@ func TestClientNodeAPIFlow(t *testing.T) {
 			})
 		case "/api/node/v1/status":
 			assertBearer(t, request, accessToken)
+			var status StatusRequest
+			if err := json.NewDecoder(request.Body).Decode(&status); err != nil ||
+				status.AppliedServingGeneration != servingGeneration || status.AppliedCursor != cursor {
+				t.Fatalf("status report = %+v, err=%v", status, err)
+			}
 			writeTestSuccess(t, response, map[string]any{
 				"state": "online", "state_version": 2, "last_seen_at": generatedAt,
 				"next_heartbeat_seconds": 60,
 			})
 		case "/api/node/v1/snapshot":
 			assertBearer(t, request, accessToken)
+			assertResourceVersionFence(t, request)
 			writeTestSuccess(t, response, map[string]any{
-				"schema_version": 1, "config_version": "12", "cursor": "cursor-12",
+				"schema_version": 1, "serving_generation": servingGeneration,
+				"config_version": "12", "cursor": "cursor-12",
 				"generated_at": generatedAt, "valid_until": generatedAt.Add(time.Hour),
 				"node": map[string]any{
 					"node_id": nodeID, "protocol": "ss2022", "method": "2022-blake3-aes-256-gcm",
@@ -89,13 +97,16 @@ func TestClientNodeAPIFlow(t *testing.T) {
 					"user_key": "dXNlci1rZXk=", "valid_until": generatedAt.Add(time.Hour),
 					"quota_remaining_bytes": 1024, "policy_version": 5,
 				}},
+				"resource_versions": map[string]any{"20000000-0000-4000-8000-000000000002": 5},
 			})
 		case "/api/node/v1/changes":
 			assertBearer(t, request, accessToken)
+			assertResourceVersionFence(t, request)
 			if got := request.URL.Query().Get("since"); got != cursor {
 				t.Errorf("since query = %q, want %q", got, cursor)
 			}
 			writeTestSuccess(t, response, map[string]any{
+				"serving_generation": servingGeneration,
 				"changes": []any{map[string]any{
 					"sequence": 13, "operation": "revoke_user", "resource_id": nodeID,
 					"resource_version": 6, "payload": map[string]any{"user_id": nodeID},
@@ -142,18 +153,20 @@ func TestClientNodeAPIFlow(t *testing.T) {
 		t.Fatalf("RotateCredential(): %v", err)
 	}
 	state, err := client.ReportStatus(ctx, accessToken, StatusRequest{
-		CapabilityReport: report,
-		Health:           HealthReport{Status: "healthy", ActiveConnections: 2, Load1: 0.25, MemoryUsedBytes: 4096},
+		CapabilityReport:         report,
+		AppliedServingGeneration: servingGeneration,
+		AppliedCursor:            cursor,
+		Health:                   HealthReport{Status: "healthy", ActiveConnections: 2, Load1: 0.25, MemoryUsedBytes: 4096},
 	})
 	if err != nil || state.State != "online" || state.NextHeartbeatSeconds != 60 {
 		t.Fatalf("ReportStatus() = %+v, %v", state, err)
 	}
 	snapshot, err := client.Snapshot(ctx, accessToken)
-	if err != nil || snapshot.ConfigVersion != "12" || len(snapshot.Users) != 1 {
+	if err != nil || snapshot.ServingGeneration != servingGeneration || snapshot.ConfigVersion != "12" || len(snapshot.Users) != 1 {
 		t.Fatalf("Snapshot() = %+v, %v", snapshot, err)
 	}
 	changes, err := client.Changes(ctx, accessToken, cursor)
-	if err != nil || changes.NextCursor != "cursor-13" || len(changes.Changes) != 1 {
+	if err != nil || changes.ServingGeneration != servingGeneration || changes.NextCursor != "cursor-13" || len(changes.Changes) != 1 {
 		t.Fatalf("Changes() = %+v, %v", changes, err)
 	}
 	usageReceipt, err := client.SubmitUsage(ctx, accessToken, UsageReport{
@@ -191,6 +204,26 @@ func TestClientErrorsDoNotExposeTokens(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), accessToken) {
 		t.Fatal("API error exposed the access token")
+	}
+}
+
+func TestReportStatusRequiresAppliedGenerationCursorPair(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, "https://panel.example.test")
+	for _, report := range []StatusRequest{
+		{AppliedServingGeneration: "90000000-0000-4000-8000-000000000009"},
+		{AppliedCursor: "cursor-9"},
+		{AppliedServingGeneration: "not-a-uuid", AppliedCursor: "cursor-9"},
+		{StoppedServingGeneration: "not-a-uuid"},
+		{
+			AppliedServingGeneration: "90000000-0000-4000-8000-000000000009", AppliedCursor: "cursor-9",
+			StoppedServingGeneration: "80000000-0000-4000-8000-000000000008",
+		},
+	} {
+		if _, err := client.ReportStatus(context.Background(), "token", report); err == nil {
+			t.Fatalf("invalid applied acknowledgement was accepted: %+v", report)
+		}
 	}
 }
 
@@ -328,6 +361,93 @@ func TestClientLimitsAndValidatesResponses(t *testing.T) {
 	}
 }
 
+func TestClientUsesEndpointSpecificResponseLimitsAndFenceScope(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/api/node/v1/snapshot":
+			assertResourceVersionFence(t, request)
+			writeTestSuccess(t, response, map[string]any{})
+		case "/api/node/v1/changes":
+			assertResourceVersionFence(t, request)
+			writeTestSuccess(t, response, map[string]any{"changes": []any{}, "next_cursor": "cursor-2"})
+		case "/api/node/v1/capabilities":
+			if got := request.Header.Get(resourceVersionFenceHeader); got != "" {
+				t.Errorf("capabilities unexpectedly carried %s=%q", resourceVersionFenceHeader, got)
+			}
+			writeTestSuccess(t, response, map[string]any{})
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	client.maxBodyBytes = 1
+	client.maxSnapshotBodyBytes = 1024
+	client.maxChangesBodyBytes = 1024
+	if _, err := client.Snapshot(context.Background(), "token"); err != nil {
+		t.Fatalf("Snapshot() did not use snapshot response limit: %v", err)
+	}
+	if _, err := client.Changes(context.Background(), "token", "cursor-1"); err != nil {
+		t.Fatalf("Changes() did not use changes response limit: %v", err)
+	}
+	if _, err := client.Capabilities(context.Background()); !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("Capabilities() error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestReadLimitedRejectsExactlyOneByteOverLimit(t *testing.T) {
+	t.Parallel()
+
+	const limit = int64(128)
+	if data, err := readLimited(strings.NewReader(strings.Repeat("x", int(limit))), limit); err != nil || int64(len(data)) != limit {
+		t.Fatalf("exact-limit response = %d bytes, %v", len(data), err)
+	}
+	if _, err := readLimited(strings.NewReader(strings.Repeat("x", int(limit+1))), limit); !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("limit+1 response error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestDefaultResponseLimitsAreBoundedByEndpoint(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(Config{BaseURL: "http://127.0.0.1", AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.maxBodyBytes != defaultMaxBodyBytes ||
+		client.maxSnapshotBodyBytes != defaultMaxSnapshotBodyBytes ||
+		client.maxChangesBodyBytes != defaultMaxChangesBodyBytes {
+		t.Fatalf("response limits = small:%d snapshot:%d changes:%d", client.maxBodyBytes, client.maxSnapshotBodyBytes, client.maxChangesBodyBytes)
+	}
+	clamped, err := NewClient(Config{
+		BaseURL: "http://127.0.0.1", AllowInsecureHTTP: true, MaxBodyBytes: 64 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clamped.maxBodyBytes != defaultMaxBodyBytes ||
+		clamped.maxSnapshotBodyBytes != defaultMaxSnapshotBodyBytes ||
+		clamped.maxChangesBodyBytes != defaultMaxChangesBodyBytes {
+		t.Fatalf("oversized override escaped response caps: small:%d snapshot:%d changes:%d", clamped.maxBodyBytes, clamped.maxSnapshotBodyBytes, clamped.maxChangesBodyBytes)
+	}
+}
+
+func TestNilClientFailsWithoutPanicking(t *testing.T) {
+	t.Parallel()
+
+	var client *Client
+	if _, err := client.Snapshot(context.Background(), "token"); err == nil {
+		t.Fatal("nil Snapshot client was accepted")
+	}
+	if _, err := client.Changes(context.Background(), "token", "cursor-1"); err == nil {
+		t.Fatal("nil Changes client was accepted")
+	}
+}
+
 func TestClientRequiresHTTPSOutsideLoopback(t *testing.T) {
 	t.Parallel()
 
@@ -378,6 +498,13 @@ func assertBearer(t *testing.T, request *http.Request, token string) {
 	t.Helper()
 	if got := request.Header.Get("Authorization"); got != "Bearer "+token {
 		t.Errorf("Authorization header = %q", got)
+	}
+}
+
+func assertResourceVersionFence(t *testing.T, request *http.Request) {
+	t.Helper()
+	if got := request.Header.Get(resourceVersionFenceHeader); got != resourceVersionFenceHeaderValue {
+		t.Errorf("%s header = %q, want %q", resourceVersionFenceHeader, got, resourceVersionFenceHeaderValue)
 	}
 }
 

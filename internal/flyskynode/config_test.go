@@ -20,6 +20,12 @@ func TestConfigValidation(t *testing.T) {
 	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "distinct") {
 		t.Fatalf("overlapping state path error = %v", err)
 	}
+
+	config = testConfig(t)
+	config.SnapshotPath = config.SyncStatePath + ".stop-serving"
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("derived stop-serving path collision error = %v", err)
+	}
 }
 
 func TestLoadConfigRejectsInvalidBoolean(t *testing.T) {

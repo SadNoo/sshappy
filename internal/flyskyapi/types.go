@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+const (
+	MaxSnapshotUsers         = 50000
+	MaxResourceVersionFences = 150000
+	MaxIncrementalChanges    = 1000
+)
+
 type ProtocolCapability struct {
 	Methods             []string `json:"methods"`
 	TCP                 bool     `json:"tcp"`
@@ -54,24 +60,31 @@ type HealthReport struct {
 
 type StatusRequest struct {
 	CapabilityReport
-	Health HealthReport `json:"health"`
+	Health                   HealthReport `json:"health"`
+	AppliedServingGeneration string       `json:"applied_serving_generation,omitempty"`
+	AppliedCursor            string       `json:"applied_cursor,omitempty"`
+	StoppedServingGeneration string       `json:"stopped_serving_generation,omitempty"`
 }
 
 type RuntimeState struct {
-	State                string    `json:"state"`
-	StateVersion         int64     `json:"state_version"`
-	LastSeenAt           time.Time `json:"last_seen_at"`
-	NextHeartbeatSeconds int       `json:"next_heartbeat_seconds"`
+	State                  string    `json:"state"`
+	StateVersion           int64     `json:"state_version"`
+	LastSeenAt             time.Time `json:"last_seen_at"`
+	NextHeartbeatSeconds   int       `json:"next_heartbeat_seconds"`
+	StoppedServingAccepted bool      `json:"stopped_serving_accepted,omitempty"`
 }
 
 type Snapshot struct {
-	SchemaVersion int            `json:"schema_version"`
-	ConfigVersion string         `json:"config_version"`
-	Cursor        string         `json:"cursor"`
-	GeneratedAt   time.Time      `json:"generated_at"`
-	ValidUntil    time.Time      `json:"valid_until"`
-	Node          SnapshotNode   `json:"node"`
-	Users         []SnapshotUser `json:"users"`
+	SchemaVersion         int              `json:"schema_version"`
+	ServingGeneration     string           `json:"serving_generation"`
+	StopServingGeneration string           `json:"stop_serving_generation,omitempty"`
+	ConfigVersion         string           `json:"config_version"`
+	Cursor                string           `json:"cursor"`
+	GeneratedAt           time.Time        `json:"generated_at"`
+	ValidUntil            time.Time        `json:"valid_until"`
+	Node                  SnapshotNode     `json:"node"`
+	Users                 []SnapshotUser   `json:"users"`
+	ResourceVersions      map[string]int64 `json:"resource_versions"`
 }
 
 type SnapshotNode struct {
@@ -102,8 +115,9 @@ type Change struct {
 }
 
 type Changes struct {
-	Changes    []Change `json:"changes"`
-	NextCursor string   `json:"next_cursor"`
+	ServingGeneration string   `json:"serving_generation"`
+	Changes           []Change `json:"changes"`
+	NextCursor        string   `json:"next_cursor"`
 }
 
 type UsageItem struct {

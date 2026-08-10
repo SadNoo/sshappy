@@ -143,7 +143,7 @@ func (config Config) Validate() error {
 
 	paths := []string{
 		config.EnrollmentTokenPath, config.MachineCredentialPath, config.SnapshotPath,
-		config.SyncStatePath, config.ReportOutboxPath, config.CredentialPath,
+		config.SyncStatePath, config.SyncStatePath + ".stop-serving", config.ReportOutboxPath, config.CredentialPath,
 	}
 	seen := make(map[string]struct{}, len(paths))
 	for _, value := range paths {

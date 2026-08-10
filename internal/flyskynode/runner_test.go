@@ -5,9 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +26,127 @@ type enrollmentClientStub struct {
 	credential flyskyapi.MachineCredential
 	calls      int
 	token      string
+}
+
+type startupSnapshotSourceStub struct {
+	fetchErr    error
+	cachedCalls int
+}
+
+func (source *startupSnapshotSourceStub) FetchAndInstallSnapshot(
+	context.Context,
+	string,
+	string,
+) (AppliedSnapshot, error) {
+	return AppliedSnapshot{}, source.fetchErr
+}
+
+func (source *startupSnapshotSourceStub) LoadCachedSnapshot(string) (AppliedSnapshot, error) {
+	source.cachedCalls++
+	return AppliedSnapshot{}, errors.New("cached snapshot must not be loaded")
+}
+
+func TestUnsafeStartupSnapshotFailureNeverFallsBackToCache(t *testing.T) {
+	t.Parallel()
+
+	for _, fatalErr := range []error{
+		ErrSynchronizationUnsafe,
+		ErrRestartRequired,
+		&StopServingRequestError{ServingGeneration: "90000000-0000-4000-8000-000000000009"},
+	} {
+		source := &startupSnapshotSourceStub{fetchErr: fatalErr}
+		_, err := loadStartupSnapshot(context.Background(), source, "token", "node-id", zap.NewNop())
+		if !errors.Is(err, fatalErr) {
+			t.Fatalf("loadStartupSnapshot() error = %v, want %v", err, fatalErr)
+		}
+		if source.cachedCalls != 0 {
+			t.Fatalf("fatal startup error %v loaded cache %d times", fatalErr, source.cachedCalls)
+		}
+	}
+}
+
+func TestRunHandlesStartupStopSnapshotBeforeManagerStarts(t *testing.T) {
+	now := time.Now().UTC()
+	snapshot := validSnapshot(now)
+	snapshot.StopServingGeneration = snapshot.ServingGeneration
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	snapshot.Node.ListenPort = occupied.Addr().(*net.TCPAddr).Port
+	var snapshotCalls, statusCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/api/node/v1/capabilities":
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"ok": true,
+				"data": map[string]any{
+					"api_version": "v1", "schema_versions": []int{1},
+					"features": []string{
+						"snapshot_v1", "cursor_changes_v1", "status_report_v1", "usage_batch_v1",
+						"alive_ip_aggregate_v1", "resource_version_fence_v1",
+						"serving_generation_ack_v1", "stop_serving_ack_v1",
+					},
+					"protocols": map[string]any{"ss2022": map[string]any{
+						"methods": []string{method}, "tcp": true, "udp": true, "single_port_multi_user": true,
+					}},
+					"limits": map[string]any{"usage_report_max_bytes": 4 << 20, "usage_report_max_items": 10000},
+				},
+			})
+		case "/api/node/v1/snapshot":
+			snapshotCalls.Add(1)
+			_ = json.NewEncoder(response).Encode(map[string]any{"ok": true, "data": snapshot})
+		case "/api/node/v1/status":
+			statusCalls.Add(1)
+			var report flyskyapi.StatusRequest
+			if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+				t.Errorf("decode stopped status: %v", err)
+			}
+			if report.StoppedServingGeneration != snapshot.ServingGeneration || report.AppliedServingGeneration != "" {
+				t.Errorf("startup stopped report = %+v", report)
+			}
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"ok": true,
+				"data": map[string]any{
+					"state": "disabled", "state_version": 2, "last_seen_at": now,
+					"next_heartbeat_seconds": 30, "stopped_serving_accepted": true,
+				},
+			})
+		default:
+			t.Errorf("unexpected startup request path %s", request.URL.Path)
+			response.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	config := testConfig(t)
+	config.ControlPlaneURL = server.URL
+	config.AllowInsecureHTTP = true
+	config.EnableUDP = false
+	if err := flyskyapi.SaveMachineCredential(config.MachineCredentialPath, flyskyapi.MachineCredential{
+		NodeID: snapshot.Node.NodeID, AccessToken: "machine-token", TokenType: "Bearer", ExpiresAt: now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := Run(ctx, config, zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotCalls.Load() != 1 || statusCalls.Load() != 1 {
+		t.Fatalf("startup stop calls: snapshot=%d status=%d", snapshotCalls.Load(), statusCalls.Load())
+	}
+	stopState, err := flyskyapi.LoadStopServingState(config.SyncStatePath + ".stop-serving")
+	if err != nil || stopState.Phase != "stopped" || stopState.ServingGeneration != snapshot.ServingGeneration {
+		t.Fatalf("startup stop barrier = %+v, %v", stopState, err)
+	}
+	for _, path := range []string{config.CredentialPath, config.SnapshotPath, config.SyncStatePath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("startup stop left runtime state %s: %v", path, err)
+		}
+	}
 }
 
 func (client *enrollmentClientStub) Enroll(
@@ -222,6 +347,135 @@ func TestCaptureAliveIPReportPropagatesPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestReportStatusCarriesDurablyAppliedGenerationAndCursor(t *testing.T) {
+	servingGeneration := "90000000-0000-4000-8000-000000000009"
+	cursor := "cursor-42"
+	var received flyskyapi.StatusRequest
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Errorf("decode status request: %v", err)
+			response.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"state": "online", "state_version": 1, "last_seen_at": time.Now().UTC(),
+				"next_heartbeat_seconds": 60,
+			},
+		})
+	}))
+	defer server.Close()
+	client, err := flyskyapi.NewClient(flyskyapi.Config{BaseURL: server.URL, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(t)
+	applied := AppliedSnapshot{Wire: flyskyapi.Snapshot{
+		ServingGeneration: servingGeneration, Cursor: cursor, ValidUntil: time.Now().Add(time.Hour),
+	}}
+	if next := reportStatus(context.Background(), client, config, "machine-token", applied, zap.NewNop()); next != time.Minute {
+		t.Fatalf("next heartbeat = %s, want 1m", next)
+	}
+	if received.AppliedServingGeneration != servingGeneration || received.AppliedCursor != cursor {
+		t.Fatalf("heartbeat applied acknowledgement = %+v", received)
+	}
+}
+
+func TestStoppedServingAcknowledgementExitsOnExplicitAccepted200(t *testing.T) {
+	generation := "90000000-0000-4000-8000-000000000009"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		var report flyskyapi.StatusRequest
+		if err := json.NewDecoder(request.Body).Decode(&report); err != nil {
+			t.Errorf("decode stopped heartbeat: %v", err)
+		}
+		if report.StoppedServingGeneration != generation || report.AppliedServingGeneration != "" || report.AppliedCursor != "" {
+			t.Errorf("stopped heartbeat = %+v", report)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"state": "disabled", "state_version": 2, "last_seen_at": time.Now().UTC(),
+				"next_heartbeat_seconds": 30, "stopped_serving_accepted": true,
+			},
+		})
+	}))
+	defer server.Close()
+	client, err := flyskyapi.NewClient(flyskyapi.Config{BaseURL: server.URL, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(t)
+	config.HeartbeatInterval = time.Millisecond
+	if err := awaitStoppedServingAcknowledgement(context.Background(), client, config, "machine-token", generation, zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("accepted stopped ACK calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestStoppedServingAcknowledgementRecognizesLost200Terminal401(t *testing.T) {
+	generation := "90000000-0000-4000-8000-000000000009"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"ok":    false,
+			"error": map[string]any{"code": "NODE_STOP_SERVING_FINALIZED", "retryable": false},
+			"meta":  map[string]any{"request_id": "request-finalized"},
+		})
+	}))
+	defer server.Close()
+	client, err := flyskyapi.NewClient(flyskyapi.Config{BaseURL: server.URL, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(t)
+	config.HeartbeatInterval = time.Millisecond
+	if err := awaitStoppedServingAcknowledgement(context.Background(), client, config, "revoked-token", generation, zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("terminal 401 calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestStoppedServingAcknowledgementDoesNotTreatMismatch403AsSuccess(t *testing.T) {
+	generation := "90000000-0000-4000-8000-000000000009"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"ok":    false,
+			"error": map[string]any{"code": "STOP_SERVING_GENERATION_MISMATCH", "retryable": false},
+		})
+	}))
+	defer server.Close()
+	client, err := flyskyapi.NewClient(flyskyapi.Config{BaseURL: server.URL, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig(t)
+	config.HeartbeatInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	if err := awaitStoppedServingAcknowledgement(ctx, client, config, "machine-token", generation, zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("mismatch 403 was treated as terminal after %d call(s)", calls.Load())
+	}
+}
+
 func TestLogReportFlushFailureIncludesReconciliationCounts(t *testing.T) {
 	t.Parallel()
 	core, observed := observer.New(zapcore.WarnLevel)
@@ -260,6 +514,7 @@ func TestValidateCapabilities(t *testing.T) {
 		Limits: flyskyapi.CapabilitiesLimits{UsageReportMaxItems: 10000, UsageReportMaxBytes: 4 << 20},
 		Features: []string{
 			"snapshot_v1", "cursor_changes_v1", "status_report_v1", "usage_batch_v1", "alive_ip_aggregate_v1",
+			"resource_version_fence_v1", "serving_generation_ack_v1", "stop_serving_ack_v1",
 		},
 		Protocols: map[string]flyskyapi.ProtocolCapability{
 			"ss2022": {Methods: []string{method}, TCP: true, UDP: true, SinglePortMultiUser: true},
@@ -276,18 +531,24 @@ func TestValidateCapabilities(t *testing.T) {
 
 func TestCapabilityReportAdvertisesNodeDNSAndInjectedVersion(t *testing.T) {
 	previous := buildVersion
-	buildVersion = "v3.2"
+	buildVersion = "v3.3"
 	t.Cleanup(func() { buildVersion = previous })
 
 	report := capabilityReport(testConfig(t))
-	if report.Version != "3.2" {
-		t.Fatalf("capability version = %q, want 3.2", report.Version)
+	if report.Version != "3.3" {
+		t.Fatalf("capability version = %q, want 3.3", report.Version)
 	}
 	if !containsString(report.Features, "node_dns_v1") {
 		t.Fatalf("capability features = %v, missing node_dns_v1", report.Features)
 	}
 	if !containsString(report.Features, "fake_ip_domain_v1") {
 		t.Fatalf("capability features = %v, missing fake_ip_domain_v1", report.Features)
+	}
+	if !containsString(report.Features, "resource_version_fence_v1") {
+		t.Fatalf("capability features = %v, missing resource_version_fence_v1", report.Features)
+	}
+	if !containsString(report.Features, "serving_generation_ack_v1") || !containsString(report.Features, "stop_serving_ack_v1") {
+		t.Fatalf("capability features = %v, missing generation/stop ACK features", report.Features)
 	}
 }
 
@@ -325,8 +586,9 @@ func TestManagedServerAtomicallyReloadsUUIDCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &fakeControlPlane{snapshot: initial, changes: flyskyapi.Changes{
+		ServingGeneration: initial.ServingGeneration,
 		Changes: []flyskyapi.Change{
-			{Sequence: 11, Operation: "upsert_user", ResourceID: user2, ResourceVersion: 2, Payload: upsertPayload},
+			{Sequence: 11, Operation: "upsert_user", ResourceID: user2, ResourceVersion: 3, Payload: upsertPayload},
 			{Sequence: 12, Operation: "revoke_user", ResourceID: initial.Users[0].UserID, ResourceVersion: 3, Payload: revokePayload},
 		},
 		NextCursor: "cursor-12",

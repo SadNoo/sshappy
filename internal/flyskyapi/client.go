@@ -19,9 +19,13 @@ import (
 )
 
 const (
-	defaultTimeout       = 30 * time.Second
-	defaultMaxBodyBytes  = 8 << 20
-	defaultClientVersion = "development"
+	defaultTimeout                  = 30 * time.Second
+	defaultMaxBodyBytes             = 1 << 20
+	defaultMaxSnapshotBodyBytes     = 16 << 20
+	defaultMaxChangesBodyBytes      = 2 << 20
+	defaultClientVersion            = "development"
+	resourceVersionFenceHeader      = "X-Flysky-Resource-Version-Fence"
+	resourceVersionFenceHeaderValue = "1"
 )
 
 var (
@@ -39,10 +43,12 @@ type Config struct {
 }
 
 type Client struct {
-	baseURL      *url.URL
-	httpClient   *http.Client
-	maxBodyBytes int64
-	userAgent    string
+	baseURL              *url.URL
+	httpClient           *http.Client
+	maxBodyBytes         int64
+	maxSnapshotBodyBytes int64
+	maxChangesBodyBytes  int64
+	userAgent            string
 }
 
 type APIError struct {
@@ -113,19 +119,25 @@ func NewClient(config Config) (*Client, error) {
 		return http.ErrUseLastResponse
 	}
 
-	maxBodyBytes := config.MaxBodyBytes
-	if maxBodyBytes <= 0 {
-		maxBodyBytes = defaultMaxBodyBytes
+	maxBodyBytes := int64(defaultMaxBodyBytes)
+	maxSnapshotBodyBytes := int64(defaultMaxSnapshotBodyBytes)
+	maxChangesBodyBytes := int64(defaultMaxChangesBodyBytes)
+	if config.MaxBodyBytes > 0 {
+		maxBodyBytes = min(config.MaxBodyBytes, maxBodyBytes)
+		maxSnapshotBodyBytes = min(config.MaxBodyBytes, maxSnapshotBodyBytes)
+		maxChangesBodyBytes = min(config.MaxBodyBytes, maxChangesBodyBytes)
 	}
 	clientVersion := strings.TrimSpace(config.ClientVersion)
 	if clientVersion == "" {
 		clientVersion = defaultClientVersion
 	}
 	return &Client{
-		baseURL:      baseURL,
-		httpClient:   &clientCopy,
-		maxBodyBytes: maxBodyBytes,
-		userAgent:    "ssbad-flysky/" + clientVersion,
+		baseURL:              baseURL,
+		httpClient:           &clientCopy,
+		maxBodyBytes:         maxBodyBytes,
+		maxSnapshotBodyBytes: maxSnapshotBodyBytes,
+		maxChangesBodyBytes:  maxChangesBodyBytes,
+		userAgent:            "ssbad-flysky/" + clientVersion,
 	}, nil
 }
 
@@ -148,11 +160,30 @@ func (c *Client) RotateCredential(ctx context.Context, accessToken string) (Mach
 }
 
 func (c *Client) ReportStatus(ctx context.Context, accessToken string, report StatusRequest) (RuntimeState, error) {
+	generationSet := strings.TrimSpace(report.AppliedServingGeneration) != ""
+	cursorSet := strings.TrimSpace(report.AppliedCursor) != ""
+	if generationSet != cursorSet {
+		return RuntimeState{}, errors.New("Flysky applied serving generation and cursor must be reported together")
+	}
+	if generationSet && !validUUIDString(report.AppliedServingGeneration) {
+		return RuntimeState{}, errors.New("Flysky applied serving generation must be a UUID")
+	}
+	stoppedGenerationSet := strings.TrimSpace(report.StoppedServingGeneration) != ""
+	if stoppedGenerationSet && !validUUIDString(report.StoppedServingGeneration) {
+		return RuntimeState{}, errors.New("Flysky stopped serving generation must be a UUID")
+	}
+	if stoppedGenerationSet && generationSet {
+		return RuntimeState{}, errors.New("Flysky heartbeat cannot acknowledge applied and stopped generations together")
+	}
 	return doJSON[RuntimeState](ctx, c, http.MethodPost, "/api/node/v1/status", accessToken, report)
 }
 
 func (c *Client) Snapshot(ctx context.Context, accessToken string) (Snapshot, error) {
-	return doJSON[Snapshot](ctx, c, http.MethodGet, "/api/node/v1/snapshot", accessToken, nil)
+	maxBodyBytes := int64(defaultMaxSnapshotBodyBytes)
+	if c != nil {
+		maxBodyBytes = c.maxSnapshotBodyBytes
+	}
+	return doFencedJSON[Snapshot](ctx, c, http.MethodGet, "/api/node/v1/snapshot", accessToken, nil, maxBodyBytes)
 }
 
 func (c *Client) Changes(ctx context.Context, accessToken, cursor string) (Changes, error) {
@@ -160,7 +191,11 @@ func (c *Client) Changes(ctx context.Context, accessToken, cursor string) (Chang
 		return Changes{}, errors.New("Flysky change cursor is required")
 	}
 	endpoint := "/api/node/v1/changes?" + url.Values{"since": []string{cursor}}.Encode()
-	changes, err := doJSON[Changes](ctx, c, http.MethodGet, endpoint, accessToken, nil)
+	maxBodyBytes := int64(defaultMaxChangesBodyBytes)
+	if c != nil {
+		maxBodyBytes = c.maxChangesBodyBytes
+	}
+	changes, err := doFencedJSON[Changes](ctx, c, http.MethodGet, endpoint, accessToken, nil, maxBodyBytes)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusGone && apiErr.Code == "CURSOR_EXPIRED" {
 		return Changes{}, errors.Join(ErrCursorExpired, apiErr)
@@ -177,6 +212,25 @@ func (c *Client) SubmitAliveIPs(ctx context.Context, accessToken string, report 
 }
 
 func doJSON[T any](ctx context.Context, client *Client, method, endpoint, accessToken string, requestBody any) (T, error) {
+	maxBodyBytes := int64(defaultMaxBodyBytes)
+	if client != nil {
+		maxBodyBytes = client.maxBodyBytes
+	}
+	return doJSONWithFence[T](ctx, client, method, endpoint, accessToken, requestBody, false, maxBodyBytes)
+}
+
+func doFencedJSON[T any](ctx context.Context, client *Client, method, endpoint, accessToken string, requestBody any, maxBodyBytes int64) (T, error) {
+	return doJSONWithFence[T](ctx, client, method, endpoint, accessToken, requestBody, true, maxBodyBytes)
+}
+
+func doJSONWithFence[T any](
+	ctx context.Context,
+	client *Client,
+	method, endpoint, accessToken string,
+	requestBody any,
+	resourceVersionFence bool,
+	maxBodyBytes int64,
+) (T, error) {
 	var zero T
 	if client == nil {
 		return zero, errors.New("Flysky API client is nil")
@@ -211,13 +265,22 @@ func doJSON[T any](ctx context.Context, client *Client, method, endpoint, access
 	if accessToken != "" {
 		request.Header.Set("Authorization", "Bearer "+accessToken)
 	}
+	if resourceVersionFence {
+		request.Header.Set(resourceVersionFenceHeader, resourceVersionFenceHeaderValue)
+	}
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
 		return zero, fmt.Errorf("perform Flysky API request: %w", err)
 	}
 	defer response.Body.Close()
-	data, err := readLimited(response.Body, client.maxBodyBytes)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		maxBodyBytes = client.maxBodyBytes
+	}
+	if response.ContentLength > maxBodyBytes {
+		return zero, ErrResponseTooLarge
+	}
+	data, err := readLimited(response.Body, maxBodyBytes)
 	if err != nil {
 		return zero, err
 	}

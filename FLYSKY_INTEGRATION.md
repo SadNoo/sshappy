@@ -36,7 +36,7 @@
 
 - Node API capabilities、一次性注册、机器凭据轮换与状态心跳；
 - SS2022 全量快照与游标增量变更；
-- HTTPS 默认强制、认证请求禁止重定向、响应大小上限和脱敏 API 错误；
+- HTTPS 默认强制、认证请求禁止重定向、按端点区分的有界响应和脱敏 API 错误；
 - 机器凭据与同步游标的 `0600` 原子本地持久化。
 - `usage-reports` 与 `alive-ips` 上报，以及严格校验服务端回执。
 
@@ -45,7 +45,7 @@
 - Flysky 正式入口只接受 `SSBAD_MODE=flysky`（未设置时也进入 Flysky）；二进制不链接旧 MySQL Panel 适配；
 - UUID 用户标识、订阅有效期、剩余额度和快照 TTL 的默认拒绝授权；
 - 全量 snapshot 启动、`upsert_user`/`revoke_user` 热更新和 `410` 全量恢复；
-- 先原子更新凭据与快照，最后推进本地 cursor；重复拉取可幂等重放；
+- 先持久化每用户授权版本高水位，再更新凭据、运行时与快照，最后才推进已应用 cursor；任一提交失败立即清空运行时并要求进程重启；
 - 节点端口或 server key 变化返回明确的 restart required，不进行危险的半热更新；
 - HTTPS 容器补充系统 CA，注册令牌只从受限文件读取并在成功换取机器凭据后尝试删除。
 - UUID 流量批次与在线 IP 汇总共用 `0600` 原子 Outbox；断网时保留原 report_id 和 sequence，只有收到匹配的 `202 accepted` 才删除。
@@ -85,6 +85,30 @@ SS2022 前恢复域名；节点收到域名后通过共享、有界的出口解�
 旧网络代际映射和无法验证的地址均失败关闭。3.2 必须与 iOS Build 3 配套完成真机
 Gate 后才允许成为默认安装版本。
 
+### 3.3 授权版本栅栏候选
+
+`sadno/flyskynode:3.3` 在 3.2 数据面基础上增加 `resource_version_fence_v1`、
+`serving_generation_ack_v1` 与 `stop_serving_ack_v1`。Snapshot
+和 Changes 请求显式携带版本栅栏 Header；节点持久保存每用户最高授权版本（包括已撤销用户
+的 tombstone），相等或更旧的 upsert/revoke 只推进 cursor，不得恢复旧密钥。提交顺序以栅栏
+先落盘，任何凭据、运行时或快照提交失败均失败关闭；启动阶段的此类失败禁止回退旧缓存。
+Snapshot 与 Changes 还必须携带同一个不可混淆的 `serving_generation`；节点只在快照或增量
+完成校验、凭据激活、运行时替换、快照原子落盘后，才把已应用 generation/cursor 写入同步
+状态并随 heartbeat 回报。抓取响应丢失、中途崩溃或最终状态写失败均不会产生新 ACK。
+
+退役采用两阶段 stop-serving：Changes 的 `stop_serving` 或 full Snapshot 的
+`stop_serving_generation` 会先建立独立持久 barrier，禁止启动/回退旧缓存；节点确认监听器与
+会话停止后清空 runtime、凭据、快照和同步状态，才持续回报 exact-generation stopped ACK。
+Panel 显式接受 ACK（或以专用 finalized 终态确认先前 200 响应丢失）后节点退出；generation
+不匹配或普通 401/403 不会被误判为成功。barrier 使用 `FLYSKY_SYNC_STATE_PATH` 的
+`.stop-serving` 同目录私有状态文件，并在 re-enroll/reactivate 完整安装新 generation 后清除。
+
+默认响应上限按端点隔离：普通 Node API 为 1 MiB、Changes 为 2 MiB、Snapshot 为
+16 MiB；本地同步状态为 8 MiB、快照为 16 MiB。30,000 用户夹具的快照约 8.9 MiB、
+授权版本状态约 1.34 MiB，并额外限制单快照 50,000 用户、150,000 个授权版本栅栏和
+单批 1,000 条增量，适合 512 MiB 节点并保留编码余量。3.3 当前是待提交、待构建、
+待发布的候选标签，不得假装已经存在于 Registry；发布时必须显式注入 `VERSION=3.3`。
+
 ### Flysky 联调配置
 
 | 变量 | 用途 |
@@ -96,7 +120,7 @@ Gate 后才允许成为默认安装版本。
 | `UDP_OUTER_FRAGMENTATION` | 对超出物理路径 MTU 的 SS2022 UDP 外层包允许由发送端分片；默认 `true`，保证大 UDP 回包不会静默丢失 |
 | `FLYSKY_MACHINE_CREDENTIAL_PATH` | 机器凭据状态文件 |
 | `FLYSKY_SNAPSHOT_PATH` | 最后有效快照缓存 |
-| `FLYSKY_SYNC_STATE_PATH` | cursor 与 config version 状态 |
+| `FLYSKY_SYNC_STATE_PATH` | 授权栅栏与已原子应用的 serving generation/cursor 状态；同目录派生 `.stop-serving` 退役 barrier |
 | `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
 | `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
 | `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 必填的逗号分隔禁止出口 IP/CIDR；必须包含节点实际公网地址，以及任何专用 Panel origin 地址，单个 IPv4 会规范为 `/32`。缺失或格式错误时节点拒绝启动，防止用户经代理回连节点自身；不要加入 Cloudflare 共享 Anycast 网段 |
@@ -115,7 +139,7 @@ Gate 后才允许成为默认安装版本。
 - 静态二进制由 systemd 启动，SS2022 单端口 TCP/UDP 双栈监听正常；
 - 官方 mihomo v1.19.28 完成 TCP、UDP DNS、计费与在线 IP 聚合验证；
 - Panel 离线期间节点继续使用最后有效快照转发，`0600` Outbox 持久化报告，控制面恢复后自动补报并清空；
-- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；当前稳定发布名称为 `sadno/flyskynode:3.0`。
+- Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；该次历史验收基线为 `sadno/flyskynode:3.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
@@ -132,7 +156,7 @@ docker compose -f deploy/compose.yaml pull
 docker compose -f deploy/compose.yaml up -d
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。稳定标签为 `sadno/flyskynode:3.0`；镜像重新构建后必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。当前部署模板指向待发布的不可覆盖候选 `sadno/flyskynode:3.3`；镜像只有在提交 SHA 固定后才允许构建和发布，届时必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
 
 管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
 
@@ -143,7 +167,7 @@ printf '\n'
 umask 077
 printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
 unset FLYSKY_ENROLLMENT_TOKEN
-docker pull sadno/flyskynode:3.0
+docker pull sadno/flyskynode:3.3
 ~~~
 
 完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
