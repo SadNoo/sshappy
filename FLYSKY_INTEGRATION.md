@@ -107,11 +107,12 @@ Panel 显式接受 ACK（或以专用 finalized 终态确认先前 200 响应丢
 
 公开 `sadno/flyskynode:3.3` 后续暴露 closed UDP socket 永久错误 `WARN + continue` 的紧循环；
 未采样 logger 与部署层缺少 Docker 日志轮转使该缺陷放大为磁盘耗尽事故。3.3 已 quarantine，
-不得再拉取、安装、恢复或作为 Compose fallback。`3.3.1-canary.1` 是仅用于单节点人工 canary 的
-前向修复候选：永久/关闭/超时 socket 错误退出，只有明确 temporary 错误才以 10 ms 至 1 s
-指数退避；runtime logger 按 level/message 每分钟最多保留 10 条；Docker `json-file` 固定
-`max-size=10m`、`max-file=3`。候选必须从 clean 精确提交构建并私有离线传输，不能覆盖或推送
-公开 3.3 标签。
+不得再拉取、安装、恢复或作为 Compose fallback。`3.3.1-canary.1` 是已在单个 Closure 节点
+通过首轮人工验证的日志放大修复候选；`3.3.1-canary.2` 在同一修复上增加固定非 root
+`65532:65532` 运行边界，仍然只允许同一 Closure 节点验证。永久/关闭/超时 socket 错误退出，
+只有明确 temporary 错误才以 10 ms 至 1 s 指数退避；runtime logger 按 level/message 每分钟
+最多保留 10 条；Docker `json-file` 固定 `max-size=10m`、`max-file=3`。候选必须从 clean 精确
+提交构建并私有离线传输，不能覆盖或推送公开 3.3 标签。
 
 ### Flysky 联调配置
 
@@ -151,31 +152,40 @@ Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 
 控制面使用 Cloudflare 代理时，节点只自动拒绝 `FLYSKY_CONTROL_PLANE_URL` 中的精确主机名。Cloudflare 的公网 A/Anycast 地址由大量无关站点共享，因此不能把整段共享地址加入禁止出口网段，否则会误伤正常代理目标。若需要防止用户绕过主机名直连 Panel，请为 Panel origin 保留专用公网地址并加入 `FLYSKY_PROTECTED_EGRESS_PREFIXES`；没有专用 origin 时，这项共享 Anycast 风险必须作为部署取舍明确记录，不能用全局封禁 Cloudflare 地址替代。
 
+下面的命令块只适用于**全新 Node UUID 的首次注册**，不得原样用于保留旧 machine state 的
+Closure 原地迁移：
+
 ~~~bash
 set -euo pipefail
 
-NODE_UUID='<new-node-uuid>'
+NODE_UUID='<explicitly-approved-node-uuid>'
 STATE_DIR="/var/lib/flysky/nodes/${NODE_UUID}/state"
 SECRET_DIR="/etc/flysky/nodes/${NODE_UUID}/secrets"
 ENV_FILE="/etc/flysky/nodes/${NODE_UUID}/flysky-node.env"
 CANDIDATE_REVISION='<full-40-character-git-revision>'
-CANDIDATE_TAG="3.3.1-canary.1-g${CANDIDATE_REVISION:0:12}"
-CANDIDATE_VERSION="3.3.1-canary.1+g${CANDIDATE_REVISION:0:12}"
+CANDIDATE_TAG="3.3.1-canary.2-g${CANDIDATE_REVISION:0:12}"
+CANDIDATE_VERSION="3.3.1-canary.2+g${CANDIDATE_REVISION:0:12}"
 IMAGE="localhost/flysky-node-canary:${CANDIDATE_TAG}"
-EXPECTED_IMAGE_ID='sha256:<config-digest-from-reviewed-build-manifest>'
+EXPECTED_ENGINE_IMAGE_ID='sha256:<docker-image-inspect-id-from-reviewed-offline-load>'
 ARTIFACT_DIR='/path/to/reviewed-canary-artifacts'
-PROJECT_NAME="flysky-closure-canary-${NODE_UUID}"
+PROJECT_NAME="flysky-closure-nonroot-canary2-${NODE_UUID}"
+RUNTIME_UID=65532
+RUNTIME_GID=65532
 
-install -d -m 0700 "$STATE_DIR" "$SECRET_DIR" "$(dirname "$ENV_FILE")"
+install -d -o "$RUNTIME_UID" -g "$RUNTIME_GID" -m 0700 "$STATE_DIR" "$SECRET_DIR"
+install -d -m 0700 "$(dirname "$ENV_FILE")"
 install -m 0600 /path/to/reviewed-flysky-node.env "$ENV_FILE"
 ! grep -Eq 'panel\.example\.com|REPLACE_WITH_NODE_PUBLIC_IP' "$ENV_FILE"
+! docker info --format '{{json .SecurityOptions}}' | grep -Eq 'name=(userns|rootless)'
+test "$(sysctl -n net.ipv4.ip_unprivileged_port_start)" -le 2343
 (cd "$ARTIFACT_DIR" && sha256sum -c SHA256SUMS)
-docker load -i "$ARTIFACT_DIR/flyskynode-3.3.1-canary.1-linux-amd64.docker.tar"
-test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$EXPECTED_IMAGE_ID"
+docker load -i "$ARTIFACT_DIR/flyskynode-3.3.1-canary.2-linux-amd64.docker.tar"
+test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$EXPECTED_ENGINE_IMAGE_ID"
 test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
 test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "$CANDIDATE_VERSION"
 test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$CANDIDATE_REVISION"
 test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$IMAGE")" = 'https://github.com/SadNoo/sshappy'
+test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = "$RUNTIME_UID:$RUNTIME_GID"
 
 SSBAD_IMAGE="$IMAGE" \
 SSBAD_PROJECT_NAME="$PROJECT_NAME" \
@@ -191,20 +201,23 @@ CID="$(SSBAD_IMAGE="$IMAGE" SSBAD_PROJECT_NAME="$PROJECT_NAME" \
   SSBAD_STATE_DIR="$STATE_DIR" SSBAD_SECRET_DIR="$SECRET_DIR" SSBAD_ENV_FILE="$ENV_FILE" \
   docker compose -p "$PROJECT_NAME" -f deploy/compose.yaml ps --all --quiet ssbad)"
 test -n "$CID"
-test "$(docker inspect --format '{{.Image}}' "$CID")" = "$EXPECTED_IMAGE_ID"
+test "$(docker inspect --format '{{.Image}}' "$CID")" = "$EXPECTED_ENGINE_IMAGE_ID"
 test "$(docker inspect --format '{{.HostConfig.LogConfig.Type}}' "$CID")" = 'json-file'
 test "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-size"}}' "$CID")" = '10m'
 test "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-file"}}' "$CID")" = '3'
 test "$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$CID")" = 'no'
 test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$CID")" = 'true'
 test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$CID")" = 'host'
-install -m 0600 /path/to/enrollment-token "$SECRET_DIR/enrollment-token"
+test "$(docker inspect --format '{{.Config.User}}' "$CID")" = "$RUNTIME_UID:$RUNTIME_GID"
+install -o "$RUNTIME_UID" -g "$RUNTIME_GID" -m 0600 /path/to/enrollment-token "$SECRET_DIR/enrollment-token"
 docker start "$CID"
 ~~~
 
 注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。删除后重建的节点必须使用新 Node UUID 专属 project、state、secret 与 env 路径；严禁复用旧节点的 Compose project、`machine.json`、`snapshot.json`、`sync.json`、`reports.json` 或 `users.json`。部署模板没有镜像 fallback：必须显式传入已批准、已在本机 `docker load` 的不可变候选和唯一 project name，且默认 `pull_policy=never`、`restart=no`。未设置 `SSBAD_IMAGE` 或 `SSBAD_PROJECT_NAME` 时 Compose 必须失败关闭。先只 `create`，核对容器实际镜像 ID、日志轮转、restart、只读根和 host network 后才 `start`；不得使用 `--remove-orphans`。公开 3.3 已 quarantine；修复候选只有在 clean 提交 SHA 固定、离线 tar 与 SHA-256/OCI provenance 核验后，才允许进入一台已明确指定的 canary。
 
-已部署 Panel 2.17 的历史安装命令会嵌入短期注册令牌，但该命令仍指向已 quarantine 的 3.3，禁止使用；本地修复源码已经把该入口设为 fail-closed。单 canary 的离线步骤必须把注册令牌单独写入新 Node UUID 专属 `0600` 外置文件，不能放入命令参数、Docker 环境变量或共享旧状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`。
+已有节点由 root canary 迁移到 non-root canary 时，可以复用同一 active Panel Node UUID 与其**当前 live state**，但不得执行上面的 enrollment-token 安装步骤。迁移必须从精确旧 container ID 的 `.Mounts` 按 `/var/lib/flysky` 与 `/run/secrets/flysky` 各唯一一次反查宿主 source，逐项与批准路径相等比较，并在停止旧容器前断言 secret source 内不存在 `enrollment-token`。新 Compose project 必须使用新的 nonroot-canary 名称，绝不能与保留的旧 project/container 重名。新容器只能先 `create`；旧容器仅在所有 inspect Gate 通过后停止，且不得删除。回滚必须用精确旧 container ID 重新启动，不能让 Compose 重新创建旧容器。
+
+已部署 Panel 2.17 的历史安装命令会嵌入短期注册令牌，但该命令仍指向已 quarantine 的 3.3，禁止使用；本地修复源码已经把该入口设为 fail-closed。单 canary 的离线步骤必须把注册令牌单独写入新 Node UUID 专属 `0600` 外置文件，不能放入命令参数、Docker 环境变量或共享旧状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、固定非 root `65532:65532`、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`。state 与 secret 目录必须保持 `0700`，其中由运行时读取、替换或删除的文件必须保持 `0600` 并归该 UID/GID 所有；已有节点切换前必须先制作 root-only 状态副本，再只调整 live bind 的数值所有权。回滚必须先停止非 root canary，把**当前最新** live state 的所有权恢复为 `root:root` 并保持 `0700/0600`，再启动原样保留的旧 root 容器；不得用新 Compose 重建旧镜像，也不得默认覆盖成旧备份内容，只有确认当前 state 已损坏时才能受控恢复备份。
 
 3.3 quarantine 期间不得执行管理后台仍可能显示的旧安装命令。单 canary 使用经过审核的离线安装步骤，令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。只允许安装项目所有者明确指定的 `Flysky 3.2 Closure`，安装后必须停止 rollout，等待项目所有者真实客户端反馈；没有项目所有者明确“可以全量”授权时，不得触碰第二台节点。
 

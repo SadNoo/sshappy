@@ -24,6 +24,24 @@ func TestComposeCapsDockerJSONLogs(t *testing.T) {
 	}
 }
 
+func TestNodeRuntimeUsesFixedUnprivilegedIdentity(t *testing.T) {
+	composeContent, err := os.ReadFile("compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(composeContent), "    user: \"65532:65532\"\n") {
+		t.Fatal("Node compose template must pin the reviewed unprivileged runtime UID/GID")
+	}
+
+	dockerfileContent, err := os.ReadFile("../Dockerfile.sstest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(dockerfileContent), "USER 65532:65532\n") {
+		t.Fatal("Node image must default to the reviewed unprivileged runtime UID/GID")
+	}
+}
+
 func TestComposeRequiresExplicitOfflineCandidate(t *testing.T) {
 	content, err := os.ReadFile("compose.yaml")
 	if err != nil {

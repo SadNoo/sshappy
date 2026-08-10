@@ -22,4 +22,5 @@ LABEL org.opencontainers.image.title="Flysky Node" \
 COPY --from=build /out/sstest /usr/local/bin/sstest
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY LICENSE /
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/sstest"]

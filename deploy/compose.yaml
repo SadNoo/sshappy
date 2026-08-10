@@ -3,6 +3,7 @@ name: ${SSBAD_PROJECT_NAME:?set a unique project name for the explicitly approve
 services:
   ssbad:
     image: ${SSBAD_IMAGE:?set an explicitly approved immutable offline candidate image; Node 3.3 is quarantined}
+    user: "65532:65532"
     pull_policy: ${SSBAD_PULL_POLICY:-never}
     platform: linux/amd64
     network_mode: host
