@@ -5,9 +5,7 @@ package service
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/netip"
-	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -33,6 +31,7 @@ type natUplinkMmsg struct {
 
 // natDownlinkMmsg is used for passing information about relay downlink to the relay goroutine.
 type natDownlinkMmsg struct {
+	ctx                context.Context
 	clientName         string
 	clientAddrPort     netip.AddrPort
 	clientPktinfop     *[]byte
@@ -77,12 +76,12 @@ func (s *UDPNATRelay) startMmsg(ctx context.Context, index int, lnc *udpRelaySer
 }
 
 func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) {
-	n := lnc.serverRecvBatchSize
-	qpvec := make([]*natQueuedPacket, n)
-	namevec := make([]unix.RawSockaddrInet6, n)
-	iovec := make([]unix.Iovec, n)
-	cmsgvec := make([][]byte, n)
-	msgvec := make([]conn.Mmsghdr, n)
+	batchSize := lnc.serverRecvBatchSize
+	qpvec := make([]*natQueuedPacket, batchSize)
+	namevec := make([]unix.RawSockaddrInet6, batchSize)
+	iovec := make([]unix.Iovec, batchSize)
+	cmsgvec := make([][]byte, batchSize)
+	msgvec := make([]conn.Mmsghdr, batchSize)
 
 	for i := range msgvec {
 		cmsgBuf := make([]byte, conn.SocketControlMessageBufferSize)
@@ -95,7 +94,6 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 	}
 
 	var (
-		err                  error
 		recvmmsgCount        uint64
 		packetsReceived      uint64
 		payloadBytesReceived uint64
@@ -103,7 +101,7 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 	)
 
 	for {
-		for i := range iovec[:n] {
+		for i := range batchSize {
 			queuedPacket := s.getQueuedPacket()
 			qpvec[i] = queuedPacket
 			iovec[i].Base = &queuedPacket.buf[s.packetBufFrontHeadroom]
@@ -111,17 +109,19 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 			msgvec[i].Msghdr.SetControllen(conn.SocketControlMessageBufferSize)
 		}
 
-		n, err = serverConn.ReadMsgs(msgvec, 0)
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
-			}
-
+		n, readErr := readMmsgBatch(ctx, serverConn, msgvec, func(err error) {
 			lnc.logger.Warn("Failed to batch read packets from serverConn", zap.Error(err))
-
-			n = 1
-			s.putQueuedPacket(qpvec[0])
-			continue
+		})
+		if readErr != nil {
+			for i := range batchSize {
+				s.putQueuedPacket(qpvec[i])
+				qpvec[i] = nil
+			}
+			break
+		}
+		for i := n; i < batchSize; i++ {
+			s.putQueuedPacket(qpvec[i])
+			qpvec[i] = nil
 		}
 
 		recvmmsgCount++
@@ -339,6 +339,7 @@ func (s *UDPNATRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRe
 					})
 
 					s.relayNatConnToServerConnSendmmsg(natDownlinkMmsg{
+						ctx:                ctx,
 						clientName:         clientInfo.Name,
 						clientAddrPort:     clientAddrPort,
 						clientPktinfop:     clientPktinfop,
@@ -573,18 +574,15 @@ func (s *UDPNATRelay) relayNatConnToServerConnSendmmsg(downlink natDownlinkMmsg)
 	}
 
 	for {
-		nr, err := downlink.natConn.ReadMsgs(rmsgvec, 0)
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
-			}
-
+		nr, err := readMmsgBatch(downlink.ctx, downlink.natConn, rmsgvec, func(err error) {
 			downlink.logger.Warn("Failed to batch read packets from natConn",
 				zap.Stringer("clientAddress", downlink.clientAddrPort),
 				zap.String("client", downlink.clientName),
 				zap.Error(err),
 			)
-			continue
+		})
+		if err != nil {
+			break
 		}
 
 		var ns int

@@ -1,10 +1,7 @@
 # Flysky ssbad 集成说明
 
-本目录是 SadNoo/sshappy 的独立 Git worktree：
-
-- 分支：integration/flysky-2.0
-- 基线：origin/4.2
-- 起点：39a795fd7b2b1e81143e222b2918d9526be89740
+本目录是 SadNoo/sshappy 的独立 Git worktree。每个候选必须从 clean、精确的 Git commit
+构建；分支名不是发布身份，运行镜像必须记录完整 revision、OCI config digest 与归档 SHA-256。
 
 ## 责任
 
@@ -85,7 +82,7 @@ SS2022 前恢复域名；节点收到域名后通过共享、有界的出口解�
 旧网络代际映射和无法验证的地址均失败关闭。3.2 必须与 iOS Build 3 配套完成真机
 Gate 后才允许成为默认安装版本。
 
-### 3.3 授权版本栅栏候选
+### 3.3 授权版本栅栏与 3.3.1 日志修复候选
 
 `sadno/flyskynode:3.3` 在 3.2 数据面基础上增加 `resource_version_fence_v1`、
 `serving_generation_ack_v1` 与 `stop_serving_ack_v1`。Snapshot
@@ -106,8 +103,15 @@ Panel 显式接受 ACK（或以专用 finalized 终态确认先前 200 响应丢
 默认响应上限按端点隔离：普通 Node API 为 1 MiB、Changes 为 2 MiB、Snapshot 为
 16 MiB；本地同步状态为 8 MiB、快照为 16 MiB。30,000 用户夹具的快照约 8.9 MiB、
 授权版本状态约 1.34 MiB，并额外限制单快照 50,000 用户、150,000 个授权版本栅栏和
-单批 1,000 条增量，适合 512 MiB 节点并保留编码余量。3.3 当前是待提交、待构建、
-待发布的候选标签，不得假装已经存在于 Registry；发布时必须显式注入 `VERSION=3.3`。
+单批 1,000 条增量，适合 512 MiB 节点并保留编码余量。
+
+公开 `sadno/flyskynode:3.3` 后续暴露 closed UDP socket 永久错误 `WARN + continue` 的紧循环；
+未采样 logger 与部署层缺少 Docker 日志轮转使该缺陷放大为磁盘耗尽事故。3.3 已 quarantine，
+不得再拉取、安装、恢复或作为 Compose fallback。`3.3.1-canary.1` 是仅用于单节点人工 canary 的
+前向修复候选：永久/关闭/超时 socket 错误退出，只有明确 temporary 错误才以 10 ms 至 1 s
+指数退避；runtime logger 按 level/message 每分钟最多保留 10 条；Docker `json-file` 固定
+`max-size=10m`、`max-file=3`。候选必须从 clean 精确提交构建并私有离线传输，不能覆盖或推送
+公开 3.3 标签。
 
 ### Flysky 联调配置
 
@@ -148,30 +152,62 @@ Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
 控制面使用 Cloudflare 代理时，节点只自动拒绝 `FLYSKY_CONTROL_PLANE_URL` 中的精确主机名。Cloudflare 的公网 A/Anycast 地址由大量无关站点共享，因此不能把整段共享地址加入禁止出口网段，否则会误伤正常代理目标。若需要防止用户绕过主机名直连 Panel，请为 Panel origin 保留专用公网地址并加入 `FLYSKY_PROTECTED_EGRESS_PREFIXES`；没有专用 origin 时，这项共享 Anycast 风险必须作为部署取舍明确记录，不能用全局封禁 Cloudflare 地址替代。
 
 ~~~bash
-install -d -m 0700 /var/lib/flysky/ssbad /etc/flysky/ssbad/secrets
-cp deploy/flysky-node.env.example deploy/flysky-node.env
-chmod 0600 deploy/flysky-node.env
-install -m 0600 /path/to/enrollment-token /etc/flysky/ssbad/secrets/enrollment-token
-docker compose -f deploy/compose.yaml pull
-docker compose -f deploy/compose.yaml up -d
+set -euo pipefail
+
+NODE_UUID='<new-node-uuid>'
+STATE_DIR="/var/lib/flysky/nodes/${NODE_UUID}/state"
+SECRET_DIR="/etc/flysky/nodes/${NODE_UUID}/secrets"
+ENV_FILE="/etc/flysky/nodes/${NODE_UUID}/flysky-node.env"
+CANDIDATE_REVISION='<full-40-character-git-revision>'
+CANDIDATE_TAG="3.3.1-canary.1-g${CANDIDATE_REVISION:0:12}"
+CANDIDATE_VERSION="3.3.1-canary.1+g${CANDIDATE_REVISION:0:12}"
+IMAGE="localhost/flysky-node-canary:${CANDIDATE_TAG}"
+EXPECTED_IMAGE_ID='sha256:<config-digest-from-reviewed-build-manifest>'
+ARTIFACT_DIR='/path/to/reviewed-canary-artifacts'
+PROJECT_NAME="flysky-closure-canary-${NODE_UUID}"
+
+install -d -m 0700 "$STATE_DIR" "$SECRET_DIR" "$(dirname "$ENV_FILE")"
+install -m 0600 /path/to/reviewed-flysky-node.env "$ENV_FILE"
+! grep -Eq 'panel\.example\.com|REPLACE_WITH_NODE_PUBLIC_IP' "$ENV_FILE"
+(cd "$ARTIFACT_DIR" && sha256sum -c SHA256SUMS)
+docker load -i "$ARTIFACT_DIR/flyskynode-3.3.1-canary.1-linux-amd64.docker.tar"
+test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$EXPECTED_IMAGE_ID"
+test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = 'linux/amd64'
+test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "$CANDIDATE_VERSION"
+test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$CANDIDATE_REVISION"
+test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$IMAGE")" = 'https://github.com/SadNoo/sshappy'
+
+SSBAD_IMAGE="$IMAGE" \
+SSBAD_PROJECT_NAME="$PROJECT_NAME" \
+SSBAD_PULL_POLICY=never \
+SSBAD_RESTART_POLICY=no \
+SSBAD_STATE_DIR="$STATE_DIR" \
+SSBAD_SECRET_DIR="$SECRET_DIR" \
+SSBAD_ENV_FILE="$ENV_FILE" \
+docker compose -p "$PROJECT_NAME" -f deploy/compose.yaml create --pull never --no-build
+
+CID="$(SSBAD_IMAGE="$IMAGE" SSBAD_PROJECT_NAME="$PROJECT_NAME" \
+  SSBAD_PULL_POLICY=never SSBAD_RESTART_POLICY=no \
+  SSBAD_STATE_DIR="$STATE_DIR" SSBAD_SECRET_DIR="$SECRET_DIR" SSBAD_ENV_FILE="$ENV_FILE" \
+  docker compose -p "$PROJECT_NAME" -f deploy/compose.yaml ps --all --quiet ssbad)"
+test -n "$CID"
+test "$(docker inspect --format '{{.Image}}' "$CID")" = "$EXPECTED_IMAGE_ID"
+test "$(docker inspect --format '{{.HostConfig.LogConfig.Type}}' "$CID")" = 'json-file'
+test "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-size"}}' "$CID")" = '10m'
+test "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-file"}}' "$CID")" = '3'
+test "$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$CID")" = 'no'
+test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$CID")" = 'true'
+test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$CID")" = 'host'
+install -m 0600 /path/to/enrollment-token "$SECRET_DIR/enrollment-token"
+docker start "$CID"
 ~~~
 
-注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。当前部署模板指向待发布的不可覆盖候选 `sadno/flyskynode:3.3`；镜像只有在提交 SHA 固定后才允许构建和发布，届时必须同步更新本文件、部署模板和 Flysky 的 `dependencies/ssbad.lock.yaml`。
+注册令牌、机器凭据、快照、Outbox 和 SS2022 用户文件都来自宿主机挂载，不进入镜像。删除后重建的节点必须使用新 Node UUID 专属 project、state、secret 与 env 路径；严禁复用旧节点的 Compose project、`machine.json`、`snapshot.json`、`sync.json`、`reports.json` 或 `users.json`。部署模板没有镜像 fallback：必须显式传入已批准、已在本机 `docker load` 的不可变候选和唯一 project name，且默认 `pull_policy=never`、`restart=no`。未设置 `SSBAD_IMAGE` 或 `SSBAD_PROJECT_NAME` 时 Compose 必须失败关闭。先只 `create`，核对容器实际镜像 ID、日志轮转、restart、只读根和 host network 后才 `start`；不得使用 `--remove-orphans`。公开 3.3 已 quarantine；修复候选只有在 clean 提交 SHA 固定、离线 tar 与 SHA-256/OCI provenance 核验后，才允许进入一台已明确指定的 canary。
 
-管理后台生成的安装命令不会嵌入注册令牌。运维在节点终端以隐藏输入提供一次性令牌，命令在 `umask 077` 下写入外置状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`，示例：
+已部署 Panel 2.17 的历史安装命令会嵌入短期注册令牌，但该命令仍指向已 quarantine 的 3.3，禁止使用；本地修复源码已经把该入口设为 fail-closed。单 canary 的离线步骤必须把注册令牌单独写入新 Node UUID 专属 `0600` 外置文件，不能放入命令参数、Docker 环境变量或共享旧状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`。
 
-~~~sh
-install -d -m 0700 /var/lib/flysky/ssbad
-read -rsp 'Flysky enrollment token: ' FLYSKY_ENROLLMENT_TOKEN
-printf '\n'
-umask 077
-printf '%s\n' "$FLYSKY_ENROLLMENT_TOKEN" > /var/lib/flysky/ssbad/enrollment-token
-unset FLYSKY_ENROLLMENT_TOKEN
-docker pull sadno/flyskynode:3.3
-~~~
+3.3 quarantine 期间不得执行管理后台仍可能显示的旧安装命令。单 canary 使用经过审核的离线安装步骤，令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。只允许安装项目所有者明确指定的 `Flysky 3.2 Closure`，安装后必须停止 rollout，等待项目所有者真实客户端反馈；没有项目所有者明确“可以全量”授权时，不得触碰第二台节点。
 
-完整 `docker run` 参数由管理后台按当前控制面地址生成。令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。
-
-当前管理后台安装命令会使用发布记录中的节点域名或 IPv4，在目标主机上解析出当前 IPv4，并自动填入 `FLYSKY_PROTECTED_EGRESS_PREFIXES=<IPv4>/32`；解析失败时命令立即停止，不会启动缺少出口保护的容器。若节点公网地址变化，必须重新生成并执行安装命令或手动更新该值后重启容器。
+事故前已部署管理后台的历史安装命令会使用发布记录中的节点域名或 IPv4，在目标主机上解析出当前 IPv4，并自动填入 `FLYSKY_PROTECTED_EGRESS_PREFIXES=<IPv4>/32`；但该历史命令仍指向已 quarantine 的 3.3，禁止执行。单 canary 必须在独立离线命令中保留相同的出口保护校验；解析失败时立即停止，绝不能启动缺少出口保护的容器。
 
 下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。

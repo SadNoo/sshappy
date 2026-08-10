@@ -5,10 +5,8 @@ package service
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net/netip"
-	"os"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -36,6 +34,7 @@ type sessionUplinkMmsg struct {
 
 // sessionDownlinkMmsg is used for passing information about relay downlink to the relay goroutine.
 type sessionDownlinkMmsg struct {
+	ctx                context.Context
 	csid               uint64
 	clientName         string
 	clientAddrInfop    *sessionClientAddrInfo
@@ -49,6 +48,38 @@ type sessionDownlinkMmsg struct {
 	runtimeSession     RuntimeSession
 	relayBatchSize     int
 	logger             *zap.Logger
+}
+
+type mmsgBatchReader interface {
+	ReadMsgs([]conn.Mmsghdr, int) (int, error)
+}
+
+// readMmsgBatch retries only errors that explicitly identify themselves as
+// temporary. Permanent errors, including a concurrently closed socket, end the
+// read loop immediately. Persistent temporary failures are logged once and
+// exponentially backed off so they cannot turn into a CPU and log busy-loop.
+func readMmsgBatch(
+	ctx context.Context,
+	reader mmsgBatchReader,
+	msgvec []conn.Mmsghdr,
+	logTemporaryOrPermanentError func(error),
+) (int, error) {
+	var failures udpReadErrorBackoff
+	for {
+		n, err := reader.ReadMsgs(msgvec, 0)
+		if err == nil && n > 0 && n <= len(msgvec) {
+			return n, nil
+		}
+		if err == nil {
+			err = io.ErrNoProgress
+		}
+		if !failures.shouldRetry(ctx, err, logTemporaryOrPermanentError) {
+			if ctx != nil && ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, err
+		}
+	}
 }
 
 func (s *UDPSessionRelay) start(ctx context.Context, index int, lnc *udpRelayServerConn) error {
@@ -82,12 +113,12 @@ func (s *UDPSessionRelay) startMmsg(ctx context.Context, index int, lnc *udpRela
 }
 
 func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) {
-	n := lnc.serverRecvBatchSize
-	qpvec := make([]*sessionQueuedPacket, n)
-	namevec := make([]unix.RawSockaddrInet6, n)
-	iovec := make([]unix.Iovec, n)
-	cmsgvec := make([][]byte, n)
-	msgvec := make([]conn.Mmsghdr, n)
+	batchSize := lnc.serverRecvBatchSize
+	qpvec := make([]*sessionQueuedPacket, batchSize)
+	namevec := make([]unix.RawSockaddrInet6, batchSize)
+	iovec := make([]unix.Iovec, batchSize)
+	cmsgvec := make([][]byte, batchSize)
+	msgvec := make([]conn.Mmsghdr, batchSize)
 
 	for i := range msgvec {
 		cmsgBuf := make([]byte, conn.SocketControlMessageBufferSize)
@@ -108,7 +139,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 	)
 
 	for {
-		for i := range iovec[:n] {
+		for i := range batchSize {
 			queuedPacket := s.getQueuedPacket()
 			qpvec[i] = queuedPacket
 			iovec[i].Base = &queuedPacket.buf[s.packetBufFrontHeadroom]
@@ -116,17 +147,19 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 			msgvec[i].Msghdr.SetControllen(conn.SocketControlMessageBufferSize)
 		}
 
-		n, err = serverConn.ReadMsgs(msgvec, 0)
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
-			}
-
+		n, readErr := readMmsgBatch(ctx, serverConn, msgvec, func(err error) {
 			lnc.logger.Warn("Failed to batch read packets from serverConn", zap.Error(err))
-
-			n = 1
-			s.putQueuedPacket(qpvec[0])
-			continue
+		})
+		if readErr != nil {
+			for i := range batchSize {
+				s.putQueuedPacket(qpvec[i])
+				qpvec[i] = nil
+			}
+			break
+		}
+		for i := n; i < batchSize; i++ {
+			s.putQueuedPacket(qpvec[i])
+			qpvec[i] = nil
 		}
 
 		recvmmsgCount++
@@ -449,6 +482,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 					})
 
 					s.relayNatConnToServerConnSendmmsg(sessionDownlinkMmsg{
+						ctx:                relayCtx,
 						csid:               csid,
 						clientName:         clientInfo.Name,
 						clientAddrInfop:    clientAddrInfop,
@@ -676,7 +710,7 @@ main:
 		}
 	}
 
-	uplink.logger.Info("Finished relay serverConn -> natConn",
+	uplink.logger.Debug("Finished relay serverConn -> natConn",
 		zap.String("username", uplink.username),
 		zap.Uint64("clientSessionID", uplink.csid),
 		zap.String("client", uplink.clientName),
@@ -741,12 +775,7 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 	}
 
 	for {
-		nr, err := downlink.natConn.ReadMsgs(rmsgvec, 0)
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
-			}
-
+		nr, err := readMmsgBatch(downlink.ctx, downlink.natConn, rmsgvec, func(err error) {
 			downlink.logger.Warn("Failed to batch read packets from natConn",
 				zap.Stringer("clientAddress", clientAddrPort),
 				zap.String("username", downlink.username),
@@ -754,7 +783,9 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 				zap.String("client", downlink.clientName),
 				zap.Error(err),
 			)
-			continue
+		})
+		if err != nil {
+			break
 		}
 
 		if caip := downlink.clientAddrInfo.Load(); caip != clientAddrInfop {
@@ -893,7 +924,7 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 		}()
 	}
 
-	downlink.logger.Info("Finished relay serverConn <- natConn",
+	downlink.logger.Debug("Finished relay serverConn <- natConn",
 		zap.Stringer("clientAddress", clientAddrPort),
 		zap.String("username", downlink.username),
 		zap.Uint64("clientSessionID", downlink.csid),

@@ -24,6 +24,8 @@ const (
 	defaultHandshakeTimeout             = 10 * time.Second
 	defaultMaxConcurrentHandshakes      = 1024
 	defaultTCPTrafficFlushInterval      = 30 * time.Second
+	tcpAcceptRetryInitialBackoff        = 10 * time.Millisecond
+	tcpAcceptRetryMaxBackoff            = time.Second
 )
 
 // tcpRelayListener configures the TCP listener for a relay service.
@@ -150,6 +152,86 @@ func (s *TCPRelay) releaseUserConnection(username string) {
 
 var _ shadowsocks.Service = (*TCPRelay)(nil)
 
+type tcpAcceptor interface {
+	AcceptTCP() (*net.TCPConn, error)
+}
+
+var _ tcpAcceptor = (*net.TCPListener)(nil)
+
+// runTCPAcceptLoop owns the retry policy for a listener. Closed listeners,
+// expired deadlines, cancellation, and permanent failures terminate the loop.
+// Only errors explicitly marked temporary are retried, with bounded
+// cancellation-aware backoff. A continuous failure incident is reported once;
+// a successful accept resets both the backoff and the reporting guard.
+func runTCPAcceptLoop(
+	ctx context.Context,
+	listener tcpAcceptor,
+	reportFailure func(error),
+	handleConnection func(*net.TCPConn),
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var nextDelay time.Duration
+	failureReported := false
+	reportOnce := func(err error) {
+		if failureReported {
+			return
+		}
+		failureReported = true
+		if reportFailure != nil {
+			reportFailure(err)
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		clientConn, err := listener.AcceptTCP()
+		if err == nil {
+			nextDelay = 0
+			failureReported = false
+			handleConnection(clientConn)
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+
+		var netErr net.Error
+		isNetworkError := errors.As(err, &netErr)
+		if isNetworkError && netErr.Timeout() {
+			return nil
+		}
+		if !isNetworkError || !netErr.Temporary() {
+			reportOnce(err)
+			return err
+		}
+		reportOnce(err)
+		delay := nextDelay
+		if delay == 0 {
+			delay = tcpAcceptRetryInitialBackoff
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		nextDelay = min(delay*2, tcpAcceptRetryMaxBackoff)
+	}
+}
+
 // ZapField implements [shadowsocks.Service.ZapField].
 func (s *TCPRelay) ZapField() zap.Field {
 	return zap.String("serverTCPRelay", s.serverName)
@@ -174,15 +256,11 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 		)
 
 		s.acceptWg.Go(func() {
-			for {
-				clientConn, err := lnc.listener.AcceptTCP()
-				if err != nil {
-					if errors.Is(err, os.ErrDeadlineExceeded) {
-						break
-					}
-					lnc.logger.Error("Failed to accept TCP connection", zap.Error(err))
-					continue
-				}
+			// The loop reports each actionable failure incident through this
+			// callback; its return value only terminates this listener goroutine.
+			_ = runTCPAcceptLoop(ctx, lnc.listener, func(err error) {
+				lnc.logger.Error("TCP listener accept failure", zap.Error(err))
+			}, func(clientConn *net.TCPConn) {
 				s.acceptedConnections.Add(1)
 				select {
 				case lnc.handshakeSlots <- struct{}{}:
@@ -190,19 +268,19 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 				default:
 					s.rejectedCapacity.Add(1)
 					_ = clientConn.Close()
-					continue
+					return
 				}
 				if !s.registerConnection(clientConn) {
 					<-lnc.handshakeSlots
 					s.activeHandshakes.Add(-1)
 					_ = clientConn.Close()
-					continue
+					return
 				}
 				s.activeConnections.Add(1)
 				s.handlerWg.Go(func() {
 					s.handleConn(ctx, lnc, clientConn)
 				})
-			}
+			})
 		})
 
 		lnc.logger.Info("Started TCP relay service listener")

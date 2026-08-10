@@ -1,12 +1,13 @@
-name: flysky-ssbad
+name: ${SSBAD_PROJECT_NAME:?set a unique project name for the explicitly approved node}
 
 services:
   ssbad:
-    image: ${SSBAD_IMAGE:-sadno/flyskynode:3.3}
+    image: ${SSBAD_IMAGE:?set an explicitly approved immutable offline candidate image; Node 3.3 is quarantined}
+    pull_policy: ${SSBAD_PULL_POLICY:-never}
     platform: linux/amd64
     network_mode: host
     env_file:
-      - ${SSBAD_ENV_FILE:-./flysky-node.env}
+      - ${SSBAD_ENV_FILE:?set a node-UUID-specific environment file}
     environment:
       FLYSKY_ENROLLMENT_TOKEN_PATH: /run/secrets/flysky/enrollment-token
       FLYSKY_MACHINE_CREDENTIAL_PATH: /var/lib/flysky/machine.json
@@ -17,8 +18,8 @@ services:
       UDP_MTU: "1600"
       UDP_OUTER_FRAGMENTATION: "true"
     volumes:
-      - ${SSBAD_STATE_DIR:-/var/lib/flysky/ssbad}:/var/lib/flysky:rw
-      - ${SSBAD_SECRET_DIR:-/etc/flysky/ssbad/secrets}:/run/secrets/flysky:rw
+      - ${SSBAD_STATE_DIR:?set a fresh node-UUID-specific state directory}:/var/lib/flysky:rw
+      - ${SSBAD_SECRET_DIR:?set a fresh node-UUID-specific secret directory}:/run/secrets/flysky:rw
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -26,5 +27,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: "${SSBAD_RESTART_POLICY:-no}"
     stop_grace_period: 30s

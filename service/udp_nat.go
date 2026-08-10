@@ -3,10 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +59,7 @@ type natUplinkGeneric struct {
 
 // natDownlinkGeneric is used for passing information about relay downlink to the relay goroutine.
 type natDownlinkGeneric struct {
+	ctx                context.Context
 	clientName         string
 	clientAddrPort     netip.AddrPort
 	clientPktinfo      *atomic.Pointer[[]byte]
@@ -195,6 +194,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 		packetsReceived      uint64
 		payloadBytesReceived uint64
 	)
+	var readFailures udpReadErrorBackoff
 
 	for {
 		queuedPacket := s.getQueuedPacket()
@@ -203,20 +203,20 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 
 		n, cmsgn, flags, clientAddrPort, err := lnc.serverConn.ReadMsgUDPAddrPort(recvBuf, cmsgBuf)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				s.putQueuedPacket(queuedPacket)
+			retry := readFailures.shouldRetry(ctx, err, func(err error) {
+				lnc.logger.Warn("Failed to read packet from serverConn",
+					zap.Stringer("clientAddress", clientAddrPort),
+					zap.Int("packetLength", n),
+					zap.Error(err),
+				)
+			})
+			s.putQueuedPacket(queuedPacket)
+			if !retry {
 				break
 			}
-
-			lnc.logger.Warn("Failed to read packet from serverConn",
-				zap.Stringer("clientAddress", clientAddrPort),
-				zap.Int("packetLength", n),
-				zap.Error(err),
-			)
-
-			s.putQueuedPacket(queuedPacket)
 			continue
 		}
+		readFailures.reset()
 		err = conn.ParseFlagsForError(flags)
 		if err != nil {
 			lnc.logger.Warn("Failed to read packet from serverConn",
@@ -413,6 +413,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 				})
 
 				s.relayNatConnToServerConnGeneric(natDownlinkGeneric{
+					ctx:                ctx,
 					clientName:         clientInfo.Name,
 					clientAddrPort:     clientAddrPort,
 					clientPktinfo:      &entry.clientPktinfo,
@@ -538,23 +539,25 @@ func (s *UDPNATRelay) relayNatConnToServerConnGeneric(downlink natDownlinkGeneri
 
 	packetBuf := make([]byte, headroom.Front+downlink.natConnRecvBufSize+headroom.Rear)
 	recvBuf := packetBuf[headroom.Front : headroom.Front+downlink.natConnRecvBufSize]
+	var readFailures udpReadErrorBackoff
 
 	for {
 		n, _, flags, packetSourceAddrPort, err := downlink.natConn.ReadMsgUDPAddrPort(recvBuf, nil)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
+			if readFailures.shouldRetry(downlink.ctx, err, func(err error) {
+				downlink.logger.Warn("Failed to read packet from natConn",
+					zap.Stringer("clientAddress", downlink.clientAddrPort),
+					zap.Stringer("packetSourceAddress", packetSourceAddrPort),
+					zap.String("client", downlink.clientName),
+					zap.Int("packetLength", n),
+					zap.Error(err),
+				)
+			}) {
+				continue
 			}
-
-			downlink.logger.Warn("Failed to read packet from natConn",
-				zap.Stringer("clientAddress", downlink.clientAddrPort),
-				zap.Stringer("packetSourceAddress", packetSourceAddrPort),
-				zap.String("client", downlink.clientName),
-				zap.Int("packetLength", n),
-				zap.Error(err),
-			)
-			continue
+			break
 		}
+		readFailures.reset()
 		err = conn.ParseFlagsForError(flags)
 		if err != nil {
 			downlink.logger.Warn("Failed to read packet from natConn",

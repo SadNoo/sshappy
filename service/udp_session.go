@@ -3,11 +3,9 @@ package service
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +72,7 @@ type sessionUplinkGeneric struct {
 
 // sessionDownlinkGeneric is used for passing information about relay downlink to the relay goroutine.
 type sessionDownlinkGeneric struct {
+	ctx                context.Context
 	csid               uint64
 	clientName         string
 	clientAddrInfop    *sessionClientAddrInfo
@@ -310,6 +309,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 		packetsReceived      uint64
 		payloadBytesReceived uint64
 	)
+	var readFailures udpReadErrorBackoff
 
 	for {
 		queuedPacket := s.getQueuedPacket()
@@ -317,20 +317,20 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 		n, cmsgn, flags, queuedPacket.clientAddrPort, err = lnc.serverConn.ReadMsgUDPAddrPort(recvBuf, cmsgBuf)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				s.putQueuedPacket(queuedPacket)
+			retry := readFailures.shouldRetry(ctx, err, func(err error) {
+				lnc.logger.Warn("Failed to read packet from serverConn",
+					zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
+					zap.Int("packetLength", n),
+					zap.Error(err),
+				)
+			})
+			s.putQueuedPacket(queuedPacket)
+			if !retry {
 				break
 			}
-
-			lnc.logger.Warn("Failed to read packet from serverConn",
-				zap.Stringer("clientAddress", &queuedPacket.clientAddrPort),
-				zap.Int("packetLength", n),
-				zap.Error(err),
-			)
-
-			s.putQueuedPacket(queuedPacket)
 			continue
 		}
+		readFailures.reset()
 		err = conn.ParseFlagsForError(flags)
 		if err != nil {
 			lnc.logger.Warn("Failed to read packet from serverConn",
@@ -635,6 +635,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 				})
 
 				s.relayNatConnToServerConnGeneric(sessionDownlinkGeneric{
+					ctx:                relayCtx,
 					csid:               csid,
 					clientName:         clientInfo.Name,
 					clientAddrInfop:    clientAddrInfop,
@@ -773,7 +774,7 @@ func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, u
 		payloadBytesSent += uint64(queuedPacket.length)
 	}
 
-	uplink.logger.Info("Finished relay serverConn -> natConn",
+	uplink.logger.Debug("Finished relay serverConn -> natConn",
 		zap.String("username", uplink.username),
 		zap.Uint64("clientSessionID", uplink.csid),
 		zap.String("client", uplink.clientName),
@@ -801,25 +802,27 @@ func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownli
 
 	packetBuf := make([]byte, headroom.Front+downlink.natConnRecvBufSize+headroom.Rear)
 	recvBuf := packetBuf[headroom.Front : headroom.Front+downlink.natConnRecvBufSize]
+	var readFailures udpReadErrorBackoff
 
 	for {
 		n, _, flags, packetSourceAddrPort, err := downlink.natConn.ReadMsgUDPAddrPort(recvBuf, nil)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				break
+			if readFailures.shouldRetry(downlink.ctx, err, func(err error) {
+				downlink.logger.Warn("Failed to read packet from natConn",
+					zap.Stringer("clientAddress", clientAddrPort),
+					zap.String("username", downlink.username),
+					zap.Uint64("clientSessionID", downlink.csid),
+					zap.Stringer("packetSourceAddress", packetSourceAddrPort),
+					zap.String("client", downlink.clientName),
+					zap.Int("packetLength", n),
+					zap.Error(err),
+				)
+			}) {
+				continue
 			}
-
-			downlink.logger.Warn("Failed to read packet from natConn",
-				zap.Stringer("clientAddress", clientAddrPort),
-				zap.String("username", downlink.username),
-				zap.Uint64("clientSessionID", downlink.csid),
-				zap.Stringer("packetSourceAddress", packetSourceAddrPort),
-				zap.String("client", downlink.clientName),
-				zap.Int("packetLength", n),
-				zap.Error(err),
-			)
-			continue
+			break
 		}
+		readFailures.reset()
 		err = conn.ParseFlagsForError(flags)
 		if err != nil {
 			downlink.logger.Warn("Failed to read packet from natConn",
@@ -913,7 +916,7 @@ func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownli
 		payloadBytesSent += uint64(payloadLength)
 	}
 
-	downlink.logger.Info("Finished relay serverConn <- natConn",
+	downlink.logger.Debug("Finished relay serverConn <- natConn",
 		zap.Stringer("clientAddress", clientAddrPort),
 		zap.String("username", downlink.username),
 		zap.Uint64("clientSessionID", downlink.csid),
