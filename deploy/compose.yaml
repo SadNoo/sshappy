@@ -16,7 +16,7 @@ services:
       FLYSKY_SYNC_STATE_PATH: /var/lib/flysky/sync.json
       FLYSKY_REPORT_OUTBOX_PATH: /var/lib/flysky/reports.json
       UPSK_STORE_PATH: /var/lib/flysky/users.json
-      UDP_MTU: "1600"
+      UDP_MTU: "1496"
       UDP_OUTER_FRAGMENTATION: "true"
     volumes:
       - ${SSBAD_STATE_DIR:?set a fresh node-UUID-specific state directory}:/var/lib/flysky:rw

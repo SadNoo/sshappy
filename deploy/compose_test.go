@@ -24,6 +24,20 @@ func TestComposeCapsDockerJSONLogs(t *testing.T) {
 	}
 }
 
+func TestComposeUsesReviewedDefaultUDPMTU(t *testing.T) {
+	content, err := os.ReadFile("compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(content)
+	if !strings.Contains(source, "      UDP_MTU: \"1496\"\n") {
+		t.Fatal("Node compose template must default UDP_MTU to 1496")
+	}
+	if strings.Contains(source, "UDP_MTU: \"1600\"") {
+		t.Fatal("Node compose template still contains the retired 1600 MTU default")
+	}
+}
+
 func TestNodeRuntimeUsesFixedUnprivilegedIdentity(t *testing.T) {
 	composeContent, err := os.ReadFile("compose.yaml")
 	if err != nil {

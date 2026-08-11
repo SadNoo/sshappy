@@ -71,7 +71,7 @@ func LoadConfig() Config {
 		AliveIPReportInterval:    envDurationSeconds("FLYSKY_ALIVE_IP_REPORT_SECONDS", 60),
 		SnapshotRefreshBefore:    envDurationSeconds("FLYSKY_SNAPSHOT_REFRESH_BEFORE_SECONDS", 600),
 		CredentialRotateBefore:   envDurationSeconds("FLYSKY_CREDENTIAL_ROTATE_BEFORE_SECONDS", 7200),
-		UDPMTU:                   envInt("UDP_MTU", 1600),
+		UDPMTU:                   envInt("UDP_MTU", 1496),
 		UDPOuterFragmentation:    udpOuterFragmentation,
 		UDPRelayBatchSize:        envInt("UDP_RELAY_BATCH_SIZE", 8),
 		UDPServerBatchSize:       envInt("UDP_SERVER_RECV_BATCH_SIZE", 64),
