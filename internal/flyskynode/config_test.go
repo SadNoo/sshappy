@@ -78,11 +78,12 @@ func TestLoadConfigRejectsInvalidProtectedEgressPrefixes(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRequiresProtectedEgressPrefix(t *testing.T) {
+func TestLoadConfigAllowsMissingProtectedEgressPrefixes(t *testing.T) {
 	t.Setenv("FLYSKY_CONTROL_PLANE_URL", "https://panel.example")
 	t.Setenv("FLYSKY_PROTECTED_EGRESS_PREFIXES", "")
-	if err := LoadConfig().Validate(); err == nil || !strings.Contains(err.Error(), "must include the node public address") {
-		t.Fatalf("missing protected prefix error = %v", err)
+	config := LoadConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatalf("missing optional protected prefixes rejected: %v", err)
 	}
 }
 

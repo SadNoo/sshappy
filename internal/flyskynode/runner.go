@@ -737,9 +737,6 @@ func newManager(
 		}}
 	}
 	server.SetRuntimeHooks(runtimeHooks, runtimeHooks)
-	// Local interfaces and the exact control-plane target are protected by
-	// default. NAT-only public addresses are supplied explicitly until the Panel
-	// installer can populate this strict configuration field automatically.
 	outboundPolicy, err := newOutboundACL(config.ControlPlaneURL, config.ProtectedEgressPrefixes)
 	if err != nil {
 		return nil, nil, fmt.Errorf("initialize node outbound ACL: %w", err)

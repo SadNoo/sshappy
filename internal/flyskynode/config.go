@@ -97,8 +97,6 @@ func (config Config) Validate() error {
 	switch {
 	case config.ControlPlaneURL == "":
 		return errors.New("FLYSKY_CONTROL_PLANE_URL must be set")
-	case len(config.ProtectedEgressPrefixes) == 0:
-		return errors.New("FLYSKY_PROTECTED_EGRESS_PREFIXES must include the node public address")
 	case !validProtectedEgressPrefixes(config.ProtectedEgressPrefixes):
 		return errors.New("FLYSKY_PROTECTED_EGRESS_PREFIXES contains an invalid prefix")
 	case !config.EnableTCP && !config.EnableUDP:

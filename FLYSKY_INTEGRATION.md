@@ -129,7 +129,7 @@ Panel 显式接受 ACK（或以专用 finalized 终态确认先前 200 响应丢
 | `FLYSKY_SYNC_STATE_PATH` | 授权栅栏与已原子应用的 serving generation/cursor 状态；同目录派生 `.stop-serving` 退役 barrier |
 | `FLYSKY_REPORT_OUTBOX_PATH` | 流量与在线 IP 待确认报告，默认 `/var/lib/sshappy/flysky-reports.json` |
 | `UPSK_STORE_PATH` | SS2022 用户凭据文件 |
-| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 必填的逗号分隔禁止出口 IP/CIDR；必须包含节点实际公网地址，以及任何专用 Panel origin 地址，单个 IPv4 会规范为 `/32`。缺失或格式错误时节点拒绝启动，防止用户经代理回连节点自身；不要加入 Cloudflare 共享 Anycast 网段 |
+| `FLYSKY_PROTECTED_EGRESS_PREFIXES` | 可选的额外禁止出口 IP/CIDR；未设置时正常启动，主动设置时校验格式 |
 | `FLYSKY_CHANGE_POLL_SECONDS` | 增量同步周期 |
 | `FLYSKY_HEARTBEAT_SECONDS` | 状态心跳周期 |
 | `FLYSKY_USAGE_REPORT_SECONDS` | 流量落盘与上报周期，默认 30 秒 |
@@ -148,8 +148,6 @@ Panel 显式接受 ACK（或以专用 finalized 终态确认先前 200 响应丢
 - Flysky 专用镜像以只读根文件系统、`cap_drop: ALL` 和 host 网络分别在 Debian 11/12 通过 TCP/UDP 回归；该次历史验收基线为 `sadno/flyskynode:3.0`。
 
 Docker 部署模板位于 `deploy/compose.yaml`。首次部署前：
-
-先在 `deploy/flysky-node.env` 中将 `FLYSKY_PROTECTED_EGRESS_PREFIXES` 的占位符替换为节点实际公网地址（例如 `203.0.113.10/32` 这一格式；请替换为真实地址）。这是所有部署的必填项；如果 Panel 有不与其他站点共享的专用 origin IP，也必须一并填写，并以英文逗号分隔。缺失或格式错误会让节点启动失败，避免静默失去出口保护。本机网卡地址、控制面精确主机名、私网、metadata、保留地址和首发 IPv6 会自动拒绝，无需重复填写。
 
 控制面使用 Cloudflare 代理时，节点只自动拒绝 `FLYSKY_CONTROL_PLANE_URL` 中的精确主机名。Cloudflare 的公网 A/Anycast 地址由大量无关站点共享，因此不能把整段共享地址加入禁止出口网段，否则会误伤正常代理目标。若需要防止用户绕过主机名直连 Panel，请为 Panel origin 保留专用公网地址并加入 `FLYSKY_PROTECTED_EGRESS_PREFIXES`；没有专用 origin 时，这项共享 Anycast 风险必须作为部署取舍明确记录，不能用全局封禁 Cloudflare 地址替代。
 
@@ -221,7 +219,5 @@ docker start "$CID"
 已部署 Panel 2.17 的历史安装命令会嵌入短期注册令牌，但该命令仍指向已 quarantine 的 3.3，禁止使用；本地修复源码已经把该入口设为 fail-closed。单 canary 的离线步骤必须把注册令牌单独写入新 Node UUID 专属 `0600` 外置文件，不能放入命令参数、Docker 环境变量或共享旧状态目录；容器成功注册并原子保存机器凭据后删除令牌文件。推荐运行边界为 host 网络、固定非 root `65532:65532`、只读根文件系统、临时 `/tmp`、`cap_drop: ALL` 和 `no-new-privileges`。state 与 secret 目录必须保持 `0700`，其中由运行时读取、替换或删除的文件必须保持 `0600` 并归该 UID/GID 所有；已有节点切换前必须先制作 root-only 状态副本，再只调整 live bind 的数值所有权。回滚必须先停止非 root canary，把**当前最新** live state 的所有权恢复为 `root:root` 并保持 `0700/0600`，再启动原样保留的旧 root 容器；不得用新 Compose 重建旧镜像，也不得默认覆盖成旧备份内容，只有确认当前 state 已损坏时才能受控恢复备份。
 
 3.3 quarantine 期间不得执行管理后台仍可能显示的旧安装命令。单 canary 使用经过审核的离线安装步骤，令牌不得粘贴到聊天、Shell 历史、Docker 环境变量或仓库文件。只允许安装项目所有者明确指定的 `Flysky 3.2 Closure`，安装后必须停止 rollout，等待项目所有者真实客户端反馈；没有项目所有者明确“可以全量”授权时，不得触碰第二台节点。
-
-事故前已部署管理后台的历史安装命令会使用发布记录中的节点域名或 IPv4，在目标主机上解析出当前 IPv4，并自动填入 `FLYSKY_PROTECTED_EGRESS_PREFIXES=<IPv4>/32`；但该历史命令仍指向已 quarantine 的 3.3，禁止执行。单 canary 必须在独立离线命令中保留相同的出口保护校验；解析失败时立即停止，绝不能启动缺少出口保护的容器。
 
 下一阶段是固定源码提交与新镜像 digest，并建立与 4.2 的性能基线。旧 MySQL 代码仍留在上游基线，Flysky 正式 `cmd/sstest` 和镜像不再链接该适配；如确需旧面板兼容，必须从 4.2 建立独立的 `compat/legacy-mysql` 分支。
