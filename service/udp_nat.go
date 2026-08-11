@@ -92,6 +92,7 @@ type UDPNATRelay struct {
 	table                  map[netip.AddrPort]*natEntry
 	dropForbidden          atomic.Uint64
 	dropPolicyResolution   atomic.Uint64
+	runtimeFailureReporter
 }
 
 func NewUDPNATRelay(
@@ -121,11 +122,13 @@ func NewUDPNATRelay(
 				}
 			},
 		},
-		table: make(map[netip.AddrPort]*natEntry),
+		table:                  make(map[netip.AddrPort]*natEntry),
+		runtimeFailureReporter: newRuntimeFailureReporter(),
 	}
 }
 
 var _ shadowsocks.Service = (*UDPNATRelay)(nil)
+var _ runtimeFailureSource = (*UDPNATRelay)(nil)
 
 // ZapField implements [shadowsocks.Service.ZapField].
 func (s *UDPNATRelay) ZapField() zap.Field {
@@ -180,14 +183,15 @@ func (s *UDPNATRelay) startGeneric(ctx context.Context, index int, lnc *udpRelay
 	)
 
 	s.mwg.Go(func() {
-		s.recvFromServerConnGeneric(ctx, lnc)
+		err := s.recvFromServerConnGeneric(ctx, lnc)
+		s.reportListenerRuntimeFailure(ctx, "UDP", index, lnc.address, err)
 	})
 
 	lnc.logger.Info("Started UDP NAT relay service listener")
 	return
 }
 
-func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRelayServerConn) {
+func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRelayServerConn) (terminalReadErr error) {
 	cmsgBuf := make([]byte, conn.SocketControlMessageBufferSize)
 
 	var (
@@ -212,6 +216,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 			})
 			s.putQueuedPacket(queuedPacket)
 			if !retry {
+				terminalReadErr = err
 				break
 			}
 			continue
@@ -454,6 +459,7 @@ func (s *UDPNATRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRel
 		zap.Uint64("packetsReceived", packetsReceived),
 		zap.Uint64("payloadBytesReceived", payloadBytesReceived),
 	)
+	return terminalReadErr
 }
 
 func (s *UDPNATRelay) relayServerConnToNatConnGeneric(ctx context.Context, uplink natUplinkGeneric) {

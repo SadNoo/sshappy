@@ -119,6 +119,7 @@ type UDPSessionRelay struct {
 	dropSessionLimit       atomic.Uint64
 	dropUserSessionLimit   atomic.Uint64
 	peakSessions           atomic.Uint64
+	runtimeFailureReporter
 }
 
 func NewUDPSessionRelay(
@@ -151,8 +152,9 @@ func NewUDPSessionRelay(
 				}
 			},
 		},
-		table:          make(map[uint64]*session),
-		sessionsByUser: make(map[string]int),
+		table:                  make(map[uint64]*session),
+		sessionsByUser:         make(map[string]int),
+		runtimeFailureReporter: newRuntimeFailureReporter(),
 	}
 }
 
@@ -191,6 +193,7 @@ func (s *UDPSessionRelay) updatePeakSessions(active int) {
 }
 
 var _ shadowsocks.Service = (*UDPSessionRelay)(nil)
+var _ runtimeFailureSource = (*UDPSessionRelay)(nil)
 
 // ZapField implements [shadowsocks.Service.ZapField].
 func (s *UDPSessionRelay) ZapField() zap.Field {
@@ -291,14 +294,15 @@ func (s *UDPSessionRelay) startGeneric(ctx context.Context, index int, lnc *udpR
 	)
 
 	s.mwg.Go(func() {
-		s.recvFromServerConnGeneric(ctx, lnc)
+		err := s.recvFromServerConnGeneric(ctx, lnc)
+		s.reportListenerRuntimeFailure(ctx, "UDP", index, lnc.address, err)
 	})
 
 	lnc.logger.Info("Started UDP session relay service listener")
 	return
 }
 
-func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRelayServerConn) {
+func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *udpRelayServerConn) (terminalReadErr error) {
 	cmsgBuf := make([]byte, conn.SocketControlMessageBufferSize)
 
 	var (
@@ -326,6 +330,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 			})
 			s.putQueuedPacket(queuedPacket)
 			if !retry {
+				terminalReadErr = err
 				break
 			}
 			continue
@@ -684,6 +689,7 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 		zap.Uint64("packetsReceived", packetsReceived),
 		zap.Uint64("payloadBytesReceived", payloadBytesReceived),
 	)
+	return terminalReadErr
 }
 
 func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, uplink sessionUplinkGeneric) {

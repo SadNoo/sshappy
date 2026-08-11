@@ -89,6 +89,7 @@ type TCPRelay struct {
 	relayErrors              atomic.Uint64
 	uplinkBytes              atomic.Uint64
 	downlinkBytes            atomic.Uint64
+	runtimeFailureReporter
 }
 
 func NewTCPRelay(
@@ -102,17 +103,18 @@ func NewTCPRelay(
 	logger *zap.Logger,
 ) *TCPRelay {
 	return &TCPRelay{
-		serverIndex:       serverIndex,
-		serverName:        serverName,
-		listeners:         listeners,
-		server:            server,
-		collector:         collector,
-		observer:          observer,
-		sessionFactory:    runtimeSessionFactory(observer),
-		router:            router,
-		logger:            logger,
-		connections:       make(map[net.Conn]struct{}),
-		connectionsByUser: make(map[string]int),
+		serverIndex:            serverIndex,
+		serverName:             serverName,
+		listeners:              listeners,
+		server:                 server,
+		collector:              collector,
+		observer:               observer,
+		sessionFactory:         runtimeSessionFactory(observer),
+		router:                 router,
+		logger:                 logger,
+		connections:            make(map[net.Conn]struct{}),
+		connectionsByUser:      make(map[string]int),
+		runtimeFailureReporter: newRuntimeFailureReporter(),
 	}
 }
 
@@ -151,6 +153,7 @@ func (s *TCPRelay) releaseUserConnection(username string) {
 }
 
 var _ shadowsocks.Service = (*TCPRelay)(nil)
+var _ runtimeFailureSource = (*TCPRelay)(nil)
 
 type tcpAcceptor interface {
 	AcceptTCP() (*net.TCPConn, error)
@@ -256,9 +259,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 		)
 
 		s.acceptWg.Go(func() {
-			// The loop reports each actionable failure incident through this
-			// callback; its return value only terminates this listener goroutine.
-			_ = runTCPAcceptLoop(ctx, lnc.listener, func(err error) {
+			err := runTCPAcceptLoop(ctx, lnc.listener, func(err error) {
 				lnc.logger.Error("TCP listener accept failure", zap.Error(err))
 			}, func(clientConn *net.TCPConn) {
 				s.acceptedConnections.Add(1)
@@ -281,6 +282,7 @@ func (s *TCPRelay) Start(ctx context.Context) error {
 					s.handleConn(ctx, lnc, clientConn)
 				})
 			})
+			s.reportListenerRuntimeFailure(ctx, "TCP", index, lnc.address, err)
 		})
 
 		lnc.logger.Info("Started TCP relay service listener")

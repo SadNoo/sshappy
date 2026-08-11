@@ -208,6 +208,33 @@ func TestGenericUDPReadLoopsUseBoundedErrorHandling(t *testing.T) {
 	}
 }
 
+func TestUDPServerReceiveLoopsReportRuntimeFailures(t *testing.T) {
+	tests := []struct {
+		path string
+		call string
+	}{
+		{path: "udp_session.go", call: "err := s.recvFromServerConnGeneric(ctx, lnc)"},
+		{path: "udp_nat.go", call: "err := s.recvFromServerConnGeneric(ctx, lnc)"},
+		{path: "udp_session_mmsg.go", call: "err := s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())"},
+		{path: "udp_nat_mmsg.go", call: "err := s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())"},
+		{path: "udp_transparent_linux.go", call: "err := s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())"},
+	}
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			text := udpRelaySources[test.path]
+			if !strings.Contains(text, test.call) {
+				t.Fatalf("%s discards the server receive loop result", test.path)
+			}
+			if !strings.Contains(text, `s.reportListenerRuntimeFailure(ctx, "UDP", index, lnc.address, err)`) {
+				t.Fatalf("%s does not report an unexpected server receive loop exit", test.path)
+			}
+			if !strings.Contains(text, "(terminalReadErr error)") || !strings.Contains(text, "return terminalReadErr") {
+				t.Fatalf("%s does not preserve the terminal server read error", test.path)
+			}
+		})
+	}
+}
+
 func TestUDPSessionCompletionLogsStayBelowInfo(t *testing.T) {
 	for _, path := range []string{"udp_session.go", "udp_session_mmsg.go"} {
 		t.Run(path, func(t *testing.T) {

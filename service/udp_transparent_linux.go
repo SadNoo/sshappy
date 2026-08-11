@@ -83,6 +83,7 @@ type UDPTransparentRelay struct {
 	wg                          sync.WaitGroup
 	mwg                         sync.WaitGroup
 	table                       map[netip.AddrPort]*transparentNATEntry
+	runtimeFailureReporter
 }
 
 func NewUDPTransparentRelay(
@@ -112,11 +113,13 @@ func NewUDPTransparentRelay(
 				}
 			},
 		},
-		table: make(map[netip.AddrPort]*transparentNATEntry),
+		table:                  make(map[netip.AddrPort]*transparentNATEntry),
+		runtimeFailureReporter: newRuntimeFailureReporter(),
 	}, nil
 }
 
 var _ shadowsocks.Service = (*UDPTransparentRelay)(nil)
+var _ runtimeFailureSource = (*UDPTransparentRelay)(nil)
 
 // ZapField implements [shadowsocks.Service.ZapField].
 func (s *UDPTransparentRelay) ZapField() zap.Field {
@@ -142,7 +145,8 @@ func (s *UDPTransparentRelay) Start(ctx context.Context) error {
 		)
 
 		s.mwg.Go(func() {
-			s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())
+			err := s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())
+			s.reportListenerRuntimeFailure(ctx, "UDP", index, lnc.address, err)
 		})
 
 		lnc.logger.Info("Started UDP transparent relay service listener")
@@ -150,7 +154,7 @@ func (s *UDPTransparentRelay) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) {
+func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) (terminalReadErr error) {
 	batchSize := lnc.serverRecvBatchSize
 	qpvec := make([]*transparentQueuedPacket, batchSize)
 	namevec := make([]unix.RawSockaddrInet6, batchSize)
@@ -188,6 +192,7 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 			lnc.logger.Warn("Failed to batch read packets from serverConn", zap.Error(err))
 		})
 		if readErr != nil {
+			terminalReadErr = readErr
 			for i := range batchSize {
 				s.putQueuedPacket(qpvec[i])
 				qpvec[i] = nil
@@ -406,6 +411,7 @@ func (s *UDPTransparentRelay) recvFromServerConnRecvmmsg(ctx context.Context, ln
 		zap.Uint64("payloadBytesReceived", payloadBytesReceived),
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
+	return terminalReadErr
 }
 
 func (s *UDPTransparentRelay) relayServerConnToNatConnSendmmsg(ctx context.Context, uplink transparentUplink) {

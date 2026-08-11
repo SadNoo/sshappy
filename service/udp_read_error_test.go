@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type temporaryUDPReadError struct{}
@@ -122,5 +124,40 @@ func TestUDPReadErrorBackoffSuccessResetsSamplingAndDelay(t *testing.T) {
 	}
 	if calls := logCalls.Load(); calls != 2 {
 		t.Fatalf("two separate temporary failure incidents logged %d times, want 2", calls)
+	}
+}
+
+func TestGenericUDPServerReceiveLoopsReturnClosedSocketFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *udpRelayServerConn) error
+	}{
+		{
+			name: "NAT",
+			run:  NewUDPNATRelay("test", 0, 1500, 0, 64, 64, nil, nil, nil, nil, zap.NewNop()).recvFromServerConnGeneric,
+		},
+		{
+			name: "session",
+			run:  NewUDPSessionRelay("test", 0, 1500, 0, 64, 64, nil, nil, nil, nil, nil, zap.NewNop()).recvFromServerConnGeneric,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					t.Skipf("socket bind unavailable in this sandbox: %v", err)
+				}
+				t.Fatal(err)
+			}
+			if err := udpConn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			lnc := &udpRelayServerConn{serverConn: udpConn, logger: zap.NewNop()}
+			if err := test.run(context.Background(), lnc); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("receive loop error = %v, want net.ErrClosed", err)
+			}
+		})
 	}
 }

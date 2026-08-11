@@ -105,14 +105,15 @@ func (s *UDPSessionRelay) startMmsg(ctx context.Context, index int, lnc *udpRela
 	)
 
 	s.mwg.Go(func() {
-		s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())
+		err := s.recvFromServerConnRecvmmsg(ctx, lnc, serverConn.NewRConn())
+		s.reportListenerRuntimeFailure(ctx, "UDP", index, lnc.address, err)
 	})
 
 	lnc.logger.Info("Started UDP session relay service listener")
 	return nil
 }
 
-func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) {
+func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *udpRelayServerConn, serverConn *conn.MmsgRConn) (terminalReadErr error) {
 	batchSize := lnc.serverRecvBatchSize
 	qpvec := make([]*sessionQueuedPacket, batchSize)
 	namevec := make([]unix.RawSockaddrInet6, batchSize)
@@ -151,6 +152,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 			lnc.logger.Warn("Failed to batch read packets from serverConn", zap.Error(err))
 		})
 		if readErr != nil {
+			terminalReadErr = readErr
 			for i := range batchSize {
 				s.putQueuedPacket(qpvec[i])
 				qpvec[i] = nil
@@ -539,6 +541,7 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 		zap.Uint64("payloadBytesReceived", payloadBytesReceived),
 		zap.Int("burstBatchSize", burstBatchSize),
 	)
+	return terminalReadErr
 }
 
 func (s *UDPSessionRelay) relayServerConnToNatConnSendmmsg(ctx context.Context, uplink sessionUplinkMmsg) {

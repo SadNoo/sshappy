@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/database64128/shadowsocks-go"
@@ -309,9 +310,51 @@ type Manager struct {
 	logger       *zap.Logger
 }
 
-// Run starts all services. If any service fails to start, it stops all running services
-// and returns false. On success, it blocks until the context is canceled, and then stops
-// all services. It returns true if no errors were encountered.
+// runtimeFailureSource is implemented by services that can fail after Start
+// returns. A runtime failure is fatal to the manager: continuing to run the
+// remaining services would leave the process healthy-looking but incomplete.
+type runtimeFailureSource interface {
+	runtimeFailures() <-chan error
+}
+
+type runtimeFailureReporter struct {
+	failures chan error
+}
+
+func newRuntimeFailureReporter() runtimeFailureReporter {
+	return runtimeFailureReporter{failures: make(chan error, 1)}
+}
+
+func (r *runtimeFailureReporter) runtimeFailures() <-chan error {
+	return r.failures
+}
+
+func (r *runtimeFailureReporter) reportListenerRuntimeFailure(
+	ctx context.Context,
+	network string,
+	listenerIndex int,
+	listenAddress string,
+	err error,
+) {
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	failure := fmt.Errorf("%s listener %d at %s stopped unexpectedly: %w", network, listenerIndex, listenAddress, err)
+	select {
+	case r.failures <- failure:
+	default:
+	}
+}
+
+type serviceRuntimeFailure struct {
+	service shadowsocks.Service
+	err     error
+}
+
+// Run starts all services. If any service fails during startup or reports a
+// runtime failure, Run cancels the shared context, stops all running services,
+// and returns false. Otherwise it blocks until the context is canceled, stops
+// all services, and returns true.
 func (m *Manager) Run(ctx context.Context) bool {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -320,6 +363,31 @@ func (m *Manager) Run(ctx context.Context) bool {
 
 	ok := true
 	runningSvcs := make([]shadowsocks.Service, 0, len(m.services))
+	runtimeFailures := make(chan serviceRuntimeFailure, len(m.services))
+	var runtimeFailureWg sync.WaitGroup
+	watchRuntimeFailures := func(s shadowsocks.Service) {
+		source, ok := s.(runtimeFailureSource)
+		if !ok {
+			return
+		}
+		failures := source.runtimeFailures()
+		if failures == nil {
+			return
+		}
+		runtimeFailureWg.Go(func() {
+			select {
+			case err, open := <-failures:
+				if !open || err == nil {
+					return
+				}
+				select {
+				case runtimeFailures <- serviceRuntimeFailure{service: s, err: err}:
+				case <-ctx.Done():
+				}
+			case <-ctx.Done():
+			}
+		})
+	}
 
 	for _, s := range m.services {
 		if err := s.Start(ctx); err != nil {
@@ -328,13 +396,21 @@ func (m *Manager) Run(ctx context.Context) bool {
 			break
 		}
 		runningSvcs = append(runningSvcs, s)
+		watchRuntimeFailures(s)
 	}
 
 	if ok {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case failure := <-runtimeFailures:
+			m.logger.Error("Service failed while running", failure.service.ZapField(), zap.Error(failure.err))
+			ok = false
+			cancel()
+		}
 	} else {
 		cancel()
 	}
+	runtimeFailureWg.Wait()
 
 	for _, s := range runningSvcs {
 		if err := s.Stop(); err != nil {

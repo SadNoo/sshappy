@@ -219,4 +219,40 @@ func TestTCPRelayStartUsesBoundedAcceptLoop(t *testing.T) {
 	if !strings.Contains(tcpRelaySource, "runTCPAcceptLoop(ctx, lnc.listener") {
 		t.Fatal("TCPRelay.Start does not route listener accepts through runTCPAcceptLoop")
 	}
+	if strings.Contains(tcpRelaySource, "_ = runTCPAcceptLoop") {
+		t.Fatal("TCPRelay.Start discards the accept loop result")
+	}
+	if !strings.Contains(tcpRelaySource, `s.reportListenerRuntimeFailure(ctx, "TCP", index, lnc.address, err)`) {
+		t.Fatal("TCPRelay.Start does not report asynchronous accept loop failures")
+	}
+}
+
+func TestTCPRelayReportsPermanentAcceptFailure(t *testing.T) {
+	relay := &TCPRelay{runtimeFailureReporter: newRuntimeFailureReporter()}
+	relay.reportListenerRuntimeFailure(context.Background(), "TCP", 2, "127.0.0.1:2343", errPermanentTCPAccept)
+
+	select {
+	case err := <-relay.runtimeFailures():
+		if !errors.Is(err, errPermanentTCPAccept) {
+			t.Fatalf("reported error = %v, want wrapped %v", err, errPermanentTCPAccept)
+		}
+		if !strings.Contains(err.Error(), "listener 2") || !strings.Contains(err.Error(), "127.0.0.1:2343") {
+			t.Fatalf("reported error lacks listener context: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permanent accept failure was not reported")
+	}
+}
+
+func TestTCPRelayIgnoresAcceptResultDuringShutdown(t *testing.T) {
+	relay := &TCPRelay{runtimeFailureReporter: newRuntimeFailureReporter()}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	relay.reportListenerRuntimeFailure(ctx, "TCP", 0, "127.0.0.1:2343", context.Canceled)
+
+	select {
+	case err := <-relay.runtimeFailures():
+		t.Fatalf("shutdown result was reported as a runtime failure: %v", err)
+	default:
+	}
 }
