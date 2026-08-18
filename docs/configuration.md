@@ -73,6 +73,14 @@ When an existing database backlog cannot be flushed, 4.5 persists newly captured
 
 Set `TRAFFIC_BATCH_RETENTION_DAYS` above zero only for a single active reporter for that node and only when the retention period exceeds every possible outbox, backup and disaster-recovery replay window. Cleanup is not coordinated with another host's outbox.
 
+## Panel-managed speed limits
+
+Version 4.6 consumes the schema's existing `ss_node.node_speedlimit` and `user.node_speedlimit` values; it adds no table, column or environment variable. Values are Mbps using decimal network units (`1 Mbps = 1,000,000 bits per second`). Zero means unlimited. Negative, NaN or infinite values fail closed: an invalid node value rejects the node, while an invalid user value rejects only that user until corrected.
+
+The node value is one aggregate limit shared by every authenticated user and by TCP and UDP. The user value is one aggregate limit shared by all of that user's TCP connections and UDP sessions on this node. Upload and download are independent, so each direction can reach the configured rate. When both values apply, traffic must satisfy both and therefore the stricter rate controls it.
+
+The existing `SYNC_INTERVAL_SECONDS` refresh applies changed limits without a process restart. Limiters whose values did not change retain their token state. An internal token bucket allows roughly 100 ms of normal-rate burst, clamped between 2 KiB and 256 KiB; this is not a deployment parameter and does not change accounting, which still records only successfully relayed payload bytes.
+
 ## SSPanel data contract
 
 The node must be an SS single-port node (`sort=14`). Its `server` field is parsed as:
@@ -81,6 +89,6 @@ The node must be an SS single-port node (`sort=14`). Its `server` field is parse
 host;port;base64-server-key
 ```
 
-The server and user keys must decode to 32 bytes for `2022-blake3-aes-256-gcm`. The adapter reads users, node limits and restrictions, and writes traffic, heartbeat, online-user, alive-IP and resource information. Run schema changes through a controlled migration and grant the runtime account only the permissions required by the deployed schema.
+The server and user keys must decode to 32 bytes for `2022-blake3-aes-256-gcm`. The adapter reads users, node limits and restrictions, and writes traffic, heartbeat, online-user, alive-IP and resource information. Version 4.6 requires no schema migration. Run any independent schema changes through a controlled migration and grant the runtime account only the permissions required by the deployed schema.
 
 Version 4.3.1 compiles `forbidden_ip`, `forbidden_port` and `disconnect_ip` rules before installing a refreshed user policy. Invalid IPs, CIDRs, ports or ranges reject only the affected user; the user is removed from the runtime policy and credential snapshot until corrected, while unrelated valid users remain available. For domain targets, both TCP and UDP validate the final resolved address selected for the outbound connection, so a domain cannot bypass an IP or CIDR restriction merely by being supplied in name form. Each UDP session pins the first resolved IP for at most 64 distinct domains; later packets recheck the pinned literal IP against the current policy without another DNS lookup, and additional new domains are rejected until a new session is created. User removal, a newly invalid policy, a security-policy change or a key/password change also cancels that user's registered TCP and UDP sessions after the successful refresh.

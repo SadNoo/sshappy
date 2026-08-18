@@ -3,6 +3,7 @@ package panel
 import (
 	"context"
 	"errors"
+	"math"
 	"net/netip"
 	"strings"
 	"testing"
@@ -126,6 +127,9 @@ func TestInvalidPolicySyntaxFailsClosed(t *testing.T) {
 		{name: "trailing port data", user: User{ID: 7, ForbiddenPort: "25junk"}, field: "forbidden_port"},
 		{name: "disconnect CIDR", user: User{ID: 7, DisconnectIP: "203.0.113.0/24"}, field: "disconnect_ip"},
 		{name: "nonpositive user ID", user: User{ID: 0}, field: "id"},
+		{name: "negative speed limit", user: User{ID: 7, NodeSpeedLimit: -1}, field: "node_speedlimit"},
+		{name: "NaN speed limit", user: User{ID: 7, NodeSpeedLimit: math.NaN()}, field: "node_speedlimit"},
+		{name: "infinite speed limit", user: User{ID: 7, NodeSpeedLimit: math.Inf(1)}, field: "node_speedlimit"},
 	}
 
 	for _, test := range tests {

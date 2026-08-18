@@ -114,6 +114,21 @@ type RuntimeSessionController interface {
 	BeginSession(parent context.Context, network, username string, source netip.AddrPort, target conn.Addr) (sessionCtx context.Context, end func(), accepted bool)
 }
 
+// RuntimeTrafficDirection identifies the payload direction at the server.
+type RuntimeTrafficDirection uint8
+
+const (
+	RuntimeTrafficUplink RuntimeTrafficDirection = iota
+	RuntimeTrafficDownlink
+)
+
+// RuntimeTrafficLimiter is an optional extension for deployments that apply
+// live per-node or per-user bandwidth limits. Implementations should return
+// promptly when ctx is canceled.
+type RuntimeTrafficLimiter interface {
+	WaitTraffic(ctx context.Context, network, username string, direction RuntimeTrafficDirection, bytes int) error
+}
+
 func resolveRuntimeTarget(ctx context.Context, observer RuntimeObserver, network, username string, source netip.AddrPort, target conn.Addr) (conn.Addr, bool, error) {
 	resolver, ok := observer.(RuntimeTargetResolver)
 	if !ok {
@@ -128,6 +143,17 @@ func beginRuntimeSession(parent context.Context, observer RuntimeObserver, netwo
 		return parent, nil, true
 	}
 	return controller.BeginSession(parent, network, username, source, target)
+}
+
+func waitRuntimeTraffic(ctx context.Context, observer RuntimeObserver, network, username string, direction RuntimeTrafficDirection, bytes int) error {
+	if observer == nil || bytes <= 0 {
+		return nil
+	}
+	limiter, ok := observer.(RuntimeTrafficLimiter)
+	if !ok {
+		return nil
+	}
+	return limiter.WaitTraffic(ctx, network, username, direction, bytes)
 }
 
 // SetRuntimeHooks injects deployment-specific statistics and policy hooks.

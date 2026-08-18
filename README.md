@@ -1,8 +1,16 @@
-# sshappy 4.5
+# sshappy 4.6
 
 `sshappy` is a Go implementation of a Shadowsocks 2022 node with an SSPanel-compatible runtime. This repository keeps the upstream `shadowsocks-go` server and domain-set converter, and adds `sstest`, which loads node/user policy from MySQL, enforces runtime limits, reports traffic and online state, and persists unreported traffic locally for retry.
 
-Version 4.5 is based directly on immutable `v4.3.1` and intentionally does not inherit the `v4.4.0` or `v4.4.1` release lines. The `v4.3.1` tag and `sadno/sstest:4.3.1` image remain the first rollback references. The traffic-outbox JSON remains byte-shape compatible with 4.3.1 and 4.2 for both its single- and multi-batch forms.
+Version 4.6 is based on 4.5, which was based directly on immutable `v4.3.1` and intentionally did not inherit the `v4.4.0` or `v4.4.1` release lines. Preserve `sadno/sstest:4.5` as the immediate rollback image. The traffic-outbox JSON remains byte-shape compatible with 4.5, 4.3.1 and 4.2 for both its single- and multi-batch forms.
+
+## 4.6 panel speed limits
+
+- The existing `ss_node.node_speedlimit` value limits aggregate node traffic, shared by all users and both TCP and UDP.
+- The existing `user.node_speedlimit` value limits that user's aggregate traffic on the node, shared by all of the user's TCP connections and UDP sessions.
+- Upload and download use independent buckets. When both node and user limits are non-zero, the stricter available rate wins. Zero remains unlimited.
+- Limits are refreshed with the existing user synchronization cycle without restarting the service. Unchanged token buckets are preserved across refreshes.
+- Active TCP transfers and UDP sessions refresh their existing alive-IP observation while traffic continues.
 
 ## 4.5 database resilience
 
@@ -58,7 +66,7 @@ MYSQL_PASS='replace-with-a-secret' \
 MySQL TLS is disabled by default for this deployment. This sends database credentials and queries in plaintext; use it only on a trusted private network, an encrypted tunnel such as WireGuard, and firewall rules that prevent public access. Deployments with database TLS can still opt into `MYSQL_TLS_MODE=verify` with a trusted CA.
 
 See [configuration](docs/configuration.md) for all environment variables and [operations](docs/operations.md) for data durability, shutdown and rollback guidance.
-See the [4.5 release notes](docs/4.5-release-notes.md) and the inherited [4.3.1 remaining work](docs/4.3.1-remaining-work.md).
+See the [4.6 release notes](docs/4.6-release-notes.md), the inherited [4.5 release notes](docs/4.5-release-notes.md), and the inherited [4.3.1 remaining work](docs/4.3.1-remaining-work.md).
 
 Automatic traffic-marker cleanup is disabled by default. Do not enable it without first reading the single-instance and recovery-window requirements in the operations guide.
 
@@ -100,11 +108,11 @@ The reviewed container build is intentionally limited to `linux/amd64`. It uses 
 ```sh
 docker buildx build \
   --platform linux/amd64 \
-  --build-arg VERSION=4.5 \
+  --build-arg VERSION=4.6 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load -f Dockerfile.sstest \
-  -t sadno/sstest:4.5 .
+  -t sadno/sstest:4.6 .
 ```
 
 See [Docker deployment](docs/docker.md) for persistent state, privileged relay ports, optional non-root execution, TCP/UDP publication, MySQL and shutdown requirements.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -514,6 +515,10 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	}
 
 	// Create remote connection.
+	if err := waitRuntimeTraffic(ctx, s.observer, "tcp", req.Username, RuntimeTrafficUplink, len(req.Payload)); err != nil {
+		logger.Debug("Stopped while waiting for initial payload bandwidth", zap.Error(err))
+		return
+	}
 	dialStartedAt := time.Now()
 	s.targetDialAttempts.Add(1)
 	remoteConn, err := dialer.DialStream(ctx, dialTarget, req.Payload)
@@ -556,13 +561,27 @@ func (s *TCPRelay) handleConn(ctx context.Context, lnc *tcpRelayListener, client
 	)
 	s.collector.CollectTCPSessionStart(req.Username)
 
-	accounting := newTCPSessionAccounting(s, req.Username, uint64(len(req.Payload)))
+	accounting := newTCPSessionAccounting(s, req.Username, clientAddrPort, uint64(len(req.Payload)))
 	stopAccounting := accounting.start(lnc.trafficFlushInterval)
 	defer stopAccounting()
 
 	// Count bytes only after a successful write to each side.
-	meteredClientConn := meteredTCPConn{Conn: clientConn, written: &accounting.downlink}
-	meteredRemoteConn := meteredTCPConn{Conn: remoteConn, written: &accounting.uplink}
+	meteredClientConn := meteredTCPConn{
+		Conn:      clientConn,
+		ctx:       ctx,
+		observer:  s.observer,
+		username:  req.Username,
+		direction: RuntimeTrafficDownlink,
+		written:   &accounting.downlink,
+	}
+	meteredRemoteConn := meteredTCPConn{
+		Conn:      remoteConn,
+		ctx:       ctx,
+		observer:  s.observer,
+		username:  req.Username,
+		direction: RuntimeTrafficUplink,
+		written:   &accounting.uplink,
+	}
 	nl2r, nr2l, err := netio.BidirectionalCopy(&meteredClientConn, &meteredRemoteConn)
 	nl2r += int64(len(req.Payload))
 	if err != nil {
@@ -589,10 +608,17 @@ func closeTCPConnectionOnSessionCancel(ctx context.Context, connection net.Conn)
 
 type meteredTCPConn struct {
 	netio.Conn
-	written *atomic.Uint64
+	ctx       context.Context
+	observer  RuntimeObserver
+	username  string
+	direction RuntimeTrafficDirection
+	written   *atomic.Uint64
 }
 
 func (c *meteredTCPConn) Write(p []byte) (int, error) {
+	if err := waitRuntimeTraffic(c.ctx, c.observer, "tcp", c.username, c.direction, len(p)); err != nil {
+		return 0, err
+	}
 	n, err := c.Conn.Write(p)
 	c.written.Add(uint64(n))
 	return n, err
@@ -601,12 +627,13 @@ func (c *meteredTCPConn) Write(p []byte) (int, error) {
 type tcpSessionAccounting struct {
 	relay    *TCPRelay
 	username string
+	source   netip.AddrPort
 	uplink   atomic.Uint64
 	downlink atomic.Uint64
 }
 
-func newTCPSessionAccounting(relay *TCPRelay, username string, initialUplink uint64) *tcpSessionAccounting {
-	a := &tcpSessionAccounting{relay: relay, username: username}
+func newTCPSessionAccounting(relay *TCPRelay, username string, source netip.AddrPort, initialUplink uint64) *tcpSessionAccounting {
+	a := &tcpSessionAccounting{relay: relay, username: username, source: source}
 	a.uplink.Store(initialUplink)
 	return a
 }
@@ -642,6 +669,9 @@ func (a *tcpSessionAccounting) flush() {
 	a.relay.uplinkBytes.Add(uplink)
 	a.relay.downlinkBytes.Add(downlink)
 	a.relay.collector.CollectTCPSession(a.username, downlink, uplink)
+	if a.relay.observer != nil {
+		a.relay.observer.Observe("tcp", a.username, a.source)
+	}
 }
 
 func (s *TCPRelay) registerConnection(connection net.Conn) bool {

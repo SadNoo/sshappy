@@ -236,9 +236,10 @@ func (s *UDPSessionRelay) recvFromServerConnRecvmmsg(ctx context.Context, lnc *u
 
 			if updateClientAddrPort {
 				entry.clientAddrPortCache = queuedPacket.clientAddrPort
-				if s.observer != nil {
-					s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
-				}
+			}
+			if s.observer != nil && (updateClientAddrPort || time.Since(entry.lastObserved) >= 30*time.Second) {
+				s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
+				entry.lastObserved = time.Now()
 			}
 
 			if updateClientPktinfo {
@@ -600,6 +601,17 @@ main:
 			}
 		}
 
+		var batchPayloadBytes int
+		for _, packet := range qpvec[:count] {
+			batchPayloadBytes += packet.length
+		}
+		if err := waitRuntimeTraffic(ctx, s.observer, "udp", uplink.username, RuntimeTrafficUplink, batchPayloadBytes); err != nil {
+			for _, packet := range qpvec[:count] {
+				s.putQueuedPacket(packet)
+			}
+			return
+		}
+
 		for start := 0; start < count; {
 			batchStart := start
 			n, err := uplink.natConn.WriteMsgs(msgvec[start:count], 0)
@@ -818,6 +830,13 @@ func (s *UDPSessionRelay) relayNatConnToServerConnSendmmsg(downlink sessionDownl
 
 		if ns == 0 {
 			continue
+		}
+		var batchPayloadBytes int
+		for _, payloadLength := range payloadLengthVec[:ns] {
+			batchPayloadBytes += payloadLength
+		}
+		if err := waitRuntimeTraffic(downlink.ctx, s.observer, "udp", downlink.username, RuntimeTrafficDownlink, batchPayloadBytes); err != nil {
+			return
 		}
 
 		for start := 0; start < ns; {

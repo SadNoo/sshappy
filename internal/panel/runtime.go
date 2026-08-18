@@ -20,6 +20,7 @@ type Runtime struct {
 	state         *State
 	base          stats.Collector
 	policies      atomic.Pointer[policySet]
+	trafficLimits atomic.Pointer[trafficLimitSet]
 	resolveIPPort func(context.Context, conn.Addr) (netip.AddrPort, error)
 	sessionsMu    sync.Mutex
 	sessions      map[int]map[uint64]context.CancelFunc
@@ -36,6 +37,7 @@ func NewRuntime(state *State) *Runtime {
 		sessions: make(map[int]map[uint64]context.CancelFunc),
 	}
 	r.policies.Store(&policySet{users: make(map[int]userPolicy)})
+	r.trafficLimits.Store(&trafficLimitSet{users: make(map[int]*directionalTrafficLimiter)})
 	return r
 }
 

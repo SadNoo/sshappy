@@ -212,6 +212,9 @@ func validateLoadedNode(node Node, bandwidth, bandwidthLimit int64) (Node, error
 	if node.TrafficRate < 0 || math.IsNaN(node.TrafficRate) || math.IsInf(node.TrafficRate, 0) {
 		return node, fmt.Errorf("%w: node %d has invalid traffic rate", ErrNodeNotAuthorized, node.ID)
 	}
+	if node.SpeedLimit < 0 || math.IsNaN(node.SpeedLimit) || math.IsInf(node.SpeedLimit, 0) {
+		return node, fmt.Errorf("%w: node %d has invalid speed limit", ErrNodeNotAuthorized, node.ID)
+	}
 	return node, nil
 }
 

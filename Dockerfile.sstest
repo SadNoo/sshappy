@@ -2,7 +2,7 @@
 
 ARG GO_IMAGE=golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
 ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:latest@sha256:a9fcaedd4c9b59e12dd65d954f0b5044f19b0647a8a3712e77205df9e7b102cd
-ARG VERSION=4.5-dev
+ARG VERSION=4.6-dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=1970-01-01T00:00:00Z
 
@@ -17,7 +17,7 @@ ARG COMMIT
 ARG BUILD_TIME
 
 # This Dockerfile intentionally produces only the deployment platform reviewed
-# for 4.5. The guard prevents an Apple Silicon `docker build` from creating an
+# for 4.6. The guard prevents an Apple Silicon `docker build` from creating an
 # arm64 manifest that contains an amd64 executable.
 RUN test "${TARGETOS}/${TARGETARCH}" = "linux/amd64"
 

@@ -1,28 +1,28 @@
-# sshappy 4.5 Docker image for Debian 11+ hosts
+# sshappy 4.6 Docker image for Debian 11+ hosts
 
-The 4.5 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime is Debian 12 distroless/static, which can run on supported Docker Engine installations on Debian 11 and newer hosts.
+The 4.6 Dockerfile intentionally builds one platform: `linux/amd64`. Its runtime is Debian 12 distroless/static, which can run on supported Docker Engine installations on Debian 11 and newer hosts.
 
 The image does not contain a shell, package manager, database credentials, node keys, user credentials or a MySQL CA. It retains the Debian CA bundle and timezone data needed by a static Go service.
 
 ## Build
 
-Run this from the 4.5 repository root:
+Run this from the 4.6 repository root:
 
 ```sh
 docker buildx build \
   --platform linux/amd64 \
   --pull \
-  --build-arg VERSION=4.5 \
+  --build-arg VERSION=4.6 \
   --build-arg COMMIT="$(git rev-parse --short=12 HEAD)" \
   --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --load \
   -f Dockerfile.sstest \
-  -t sadno/sstest:4.5 .
+  -t sadno/sstest:4.6 .
 ```
 
 The base images are pinned by digest. Updating either digest is a reviewed dependency change, not an automatic tag refresh.
 
-Version 4.5 is based directly on `v4.3.1`; it does not inherit either `v4.4.x` tag. Preserve `sadno/sstest:4.3.1` as the first rollback image and record the 4.5 registry digest before deployment.
+Version 4.6 is based directly on 4.5, whose base remains `v4.3.1` and does not inherit either `v4.4.x` tag. Preserve `sadno/sstest:4.5` as the immediate rollback image and record the 4.6 registry digest before deployment.
 
 ## Runtime state, user and secrets
 
@@ -56,7 +56,7 @@ docker run -d \
   --mount type=volume,src=sshappy-node,dst=/var/lib/sshappy \
   -p 1023:1023/tcp \
   -p 1023:1023/udp \
-  sadno/sstest:4.5
+  sadno/sstest:4.6
 ```
 
 The default root user already supports ports below 1024; the image does not require `--privileged`, `NET_ADMIN` or `NET_RAW`. A deployment may optionally reduce capabilities while retaining a privileged port with `--cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true`. If it uses only ports 1024 or higher, it may instead add `--user 65532:65532`.
@@ -68,7 +68,7 @@ The application handles `SIGTERM` and persists/retries final accounting during s
 ## Verification
 
 ```sh
-docker image inspect sadno/sstest:4.5 \
+docker image inspect sadno/sstest:4.6 \
   --format 'platform={{.Os}}/{{.Architecture}} user={{.Config.User}} entrypoint={{json .Config.Entrypoint}}'
 ```
 

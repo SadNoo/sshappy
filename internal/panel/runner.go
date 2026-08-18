@@ -76,6 +76,7 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 	state := NewState()
 	runtime := NewRuntime(state)
 	users = replaceRuntimeUsers(runtime, users, logger)
+	limitedUsers := runtime.ReplaceTrafficLimits(node.SpeedLimit, users)
 	if err := writeCredentialFile(config.CredentialPath, users); err != nil {
 		return err
 	}
@@ -105,6 +106,8 @@ func Run(ctx context.Context, config Config, logger *zap.Logger) error {
 		zap.Int("trafficSQLBatchSize", trafficSQLBatchSize),
 		zap.Int("resourceReportSeconds", config.ResourceReportSeconds),
 		zap.Int64("outboxMinFreeBytes", config.OutboxMinFreeBytes),
+		zap.Float64("nodeSpeedLimitMbps", node.SpeedLimit),
+		zap.Int("speedLimitedUsers", limitedUsers),
 	}
 	if config.EnableTCP {
 		startupFields = append(startupFields,
@@ -231,8 +234,13 @@ runLoop:
 				continue
 			}
 			failures.RecordSuccess("credential refresh", time.Now())
+			limitedUsers = runtime.ReplaceTrafficLimits(loadedNode.SpeedLimit, loadedUsers)
 			node = loadedNode
-			logger.Info("Runtime users synchronized", zap.Int("users", len(loadedUsers)))
+			logger.Info("Runtime users synchronized",
+				zap.Int("users", len(loadedUsers)),
+				zap.Float64("nodeSpeedLimitMbps", loadedNode.SpeedLimit),
+				zap.Int("speedLimitedUsers", limitedUsers),
+			)
 		case <-trafficTicker.C:
 			startedAt := time.Now()
 			_, err := reportTraffic(db, node, state, trafficReporter, dbHealth)

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -57,6 +58,13 @@ func compileUserPolicy(user User) (userPolicy, error) {
 			field:     "id",
 			ruleIndex: 0,
 			err:       errors.New("user ID must be positive"),
+		}
+	}
+	if user.NodeSpeedLimit < 0 || math.IsNaN(user.NodeSpeedLimit) || math.IsInf(user.NodeSpeedLimit, 0) {
+		return userPolicy{}, &policyRuleError{
+			field:     "node_speedlimit",
+			ruleIndex: 0,
+			err:       errors.New("speed limit must be zero or a finite positive number"),
 		}
 	}
 

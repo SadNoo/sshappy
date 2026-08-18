@@ -32,17 +32,24 @@ Before replacing a node, check that the outbox is either empty or stored on pers
 
 Automatic idempotency-marker cleanup is disabled by default. It is safe to enable only when exactly one active reporter owns the node and the configured retention exceeds the oldest outbox, backup and disaster-recovery image that could ever be replayed. Cleanup is not protected by the per-batch advisory lock against another host's old outbox. If those conditions cannot be guaranteed, leave `TRAFFIC_BATCH_RETENTION_DAYS=0` and manage marker archival with an externally coordinated procedure.
 
-## 4.5 rollout
+## 4.6 rollout
 
-1. Preserve the existing `v4.3.1` deployment, image digest and configuration as the direct rollback target.
+1. Preserve the existing 4.5 deployment, image digest and configuration as the immediate rollback target.
 2. Back up the durable state directory and database schema.
-3. Deploy `sadno/sstest:4.5` to a canary node with the same schema but an isolated node ID when possible.
-4. On port 1023, verify authentication, strict forbidden-target parsing, final resolved-IP checks, active TCP/UDP session revocation, durable accounting during a database backlog, aggregated UDP rejection logs, online state and graceful restart.
-5. Expand gradually while watching outbox age, traffic totals and database errors.
+3. Deploy `sadno/sstest:4.6` to a canary node with the same schema but an isolated node ID when possible.
+4. Verify unlimited operation with both existing speed-limit fields set to zero, then verify node-only, user-only and combined TCP/UDP limits. Confirm that billing still matches successfully relayed payload bytes.
+5. Expand gradually while watching latency, outbox age, traffic totals, database errors and alive-IP freshness.
+
+## Rollback to 4.5
+
+1. Stop 4.6 gracefully and ensure it is the only writer using the state directory.
+2. Preserve the state directory, then start the recorded `sadno/sstest:4.5` image.
+3. Reuse the durable outbox only after 4.6 has fully stopped; its format and billing rule are unchanged.
+4. Verify heartbeat, user synchronization, TCP/UDP relay and traffic replay before restoring full load.
 
 ## Rollback to the 4.3.1 baseline
 
-1. Stop 4.5 gracefully and ensure it is the only writer using the state directory.
+1. Stop 4.6 or 4.5 gracefully and ensure it is the only writer using the state directory.
 2. Preserve the state directory, then start the image recorded for `sadno/sstest:4.3.1` or the binary from `v4.3.1`.
 3. Reuse the durable outbox only after 4.5 has fully stopped. Its JSON shape and flush-time billing rule remain compatible.
 4. Verify heartbeat, user synchronization, TCP/UDP relay and traffic replay before restoring full load.

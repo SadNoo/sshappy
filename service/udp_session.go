@@ -64,6 +64,7 @@ type session struct {
 	clientAddrInfo      atomic.Pointer[sessionClientAddrInfo]
 	clientAddrPortCache netip.AddrPort
 	clientPktinfoCache  []byte
+	lastObserved        time.Time
 	natConnSendCh       chan<- *sessionQueuedPacket
 	serverConn          *net.UDPConn
 	serverConnUnpacker  zerocopy.ServerUnpacker
@@ -471,9 +472,10 @@ func (s *UDPSessionRelay) recvFromServerConnGeneric(ctx context.Context, lnc *ud
 
 		if updateClientAddrPort {
 			entry.clientAddrPortCache = queuedPacket.clientAddrPort
-			if s.observer != nil {
-				s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
-			}
+		}
+		if s.observer != nil && (updateClientAddrPort || time.Since(entry.lastObserved) >= 30*time.Second) {
+			s.observer.Observe("udp", entry.username, queuedPacket.clientAddrPort)
+			entry.lastObserved = time.Now()
 		}
 
 		if updateClientPktinfo {
@@ -755,6 +757,10 @@ func (s *UDPSessionRelay) relayServerConnToNatConnGeneric(ctx context.Context, u
 			continue
 		}
 		queuedPacket.targetAddr = resolvedTarget
+		if err := waitRuntimeTraffic(ctx, s.observer, "udp", uplink.username, RuntimeTrafficUplink, queuedPacket.length); err != nil {
+			s.putQueuedPacket(queuedPacket)
+			return
+		}
 
 		destAddrPort, packetStart, packetLength, err = uplink.natConnPacker.PackInPlace(ctx, queuedPacket.buf, queuedPacket.targetAddr, queuedPacket.start, queuedPacket.length)
 		if err != nil {
@@ -885,6 +891,9 @@ func (s *UDPSessionRelay) relayNatConnToServerConnGeneric(downlink sessionDownli
 			clientAddrPort = caip.addrPort
 			clientPktinfo = caip.pktinfo
 			maxClientPacketSize = zerocopy.MaxPacketSizeForAddr(s.mtu, clientAddrPort.Addr())
+		}
+		if err := waitRuntimeTraffic(downlink.ctx, s.observer, "udp", downlink.username, RuntimeTrafficDownlink, payloadLength); err != nil {
+			return
 		}
 
 		packetStart, packetLength, err := downlink.serverConnPacker.PackInPlace(packetBuf, payloadSourceAddrPort, payloadStart, payloadLength, maxClientPacketSize)

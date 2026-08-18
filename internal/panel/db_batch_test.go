@@ -70,6 +70,15 @@ func TestNodeAuthorizationErrorsAreClassified(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotAuthorized) || strings.Contains(err.Error(), "sensitive-server-key") {
 		t.Fatalf("invalid server key error was not safely classified: %v", err)
 	}
+	_, err = validateLoadedNode(Node{
+		ID:         116,
+		Sort:       14,
+		Server:     "example.com;2336;AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		SpeedLimit: -1,
+	}, 0, 0)
+	if !errors.Is(err, ErrNodeNotAuthorized) {
+		t.Fatalf("invalid speed limit error was not authoritative: %v", err)
+	}
 }
 
 func TestParseSSSinglePortRejectsInvalidPorts(t *testing.T) {
